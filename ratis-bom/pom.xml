@@ -87,6 +87,16 @@
       </dependency>
       <dependency>
         <groupId>org.apache.ratis</groupId>
+        <artifactId>ratis-metadata-client</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.ratis</groupId>
+        <artifactId>ratis-metadata-server</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.apache.ratis</groupId>
         <artifactId>ratis-metrics-api</artifactId>
         <version>${project.version}</version>
       </dependency>

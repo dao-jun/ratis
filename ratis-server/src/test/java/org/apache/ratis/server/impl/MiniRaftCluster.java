@@ -308,6 +308,10 @@ public abstract class MiniRaftCluster implements Closeable {
     return properties;
   }
 
+  public Parameters getParameters() {
+    return parameters;
+  }
+
   public MiniRaftCluster initServers() {
     LOG.info("servers = {}", servers);
     if (servers.isEmpty()) {

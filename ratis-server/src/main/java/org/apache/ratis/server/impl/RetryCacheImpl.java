@@ -24,15 +24,19 @@ import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.RetryCache;
+import org.apache.ratis.server.protocol.TermIndex;
+import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.thirdparty.com.google.common.cache.Cache;
 import org.apache.ratis.thirdparty.com.google.common.cache.CacheBuilder;
 import org.apache.ratis.thirdparty.com.google.common.cache.CacheStats;
 import org.apache.ratis.util.CollectionUtils;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.MemoizedSupplier;
+import org.apache.ratis.util.Preconditions;
 import org.apache.ratis.util.TimeDuration;
 import org.apache.ratis.util.Timestamp;
 
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -43,6 +47,9 @@ class RetryCacheImpl implements RetryCache {
   static class CacheEntry implements Entry {
     private final ClientInvocationId key;
     private final CompletableFuture<RaftClientReply> replyFuture = new CompletableFuture<>();
+    private TermIndex termIndex;
+    /** Reply received while unbound; delivered by {@link #bind(TermIndex)} if the index matches, discarded otherwise. */
+    private RaftClientReply deferredReply;
 
     /**
      * "failed" means we failed to commit the request into the raft group, or
@@ -57,9 +64,31 @@ class RetryCacheImpl implements RetryCache {
       this.key = key;
     }
 
+    CacheEntry(ClientInvocationId key, TermIndex termIndex) {
+      this(key);
+      this.termIndex = Objects.requireNonNull(termIndex);
+    }
+
     @Override
     public String toString() {
       return key + ":" + (isDone() ? "done" : "pending");
+    }
+
+    synchronized long getLogIndex() {
+      return termIndex == null ? RaftLog.INVALID_LOG_INDEX : termIndex.getIndex();
+    }
+
+    synchronized void bind(TermIndex termIndex) {
+      Preconditions.assertTrue(this.termIndex == null);
+      this.termIndex = Objects.requireNonNull(termIndex);
+      if (deferredReply != null) {
+        final RaftClientReply reply = deferredReply;
+        deferredReply = null;
+        if (reply.getLogIndex() == termIndex.getIndex()) {
+          assert !replyFuture.isDone() && !replyFuture.isCancelled();
+          replyFuture.complete(reply);
+        }
+      }
     }
 
     boolean isDone() {
@@ -70,13 +99,27 @@ class RetryCacheImpl implements RetryCache {
       return !failed && JavaUtils.isCompletedNormally(replyFuture);
     }
 
-    void updateResult(RaftClientReply reply) {
+    synchronized void updateResult(RaftClientReply reply) {
+      if (termIndex == null) {
+        // Not yet bound: defer delivery until bind() matches the index.
+        this.deferredReply = reply;
+        return;
+      }
+      if (termIndex.getIndex() != reply.getLogIndex()) {
+        return;
+      }
       assert !replyFuture.isDone() && !replyFuture.isCancelled();
       replyFuture.complete(reply);
     }
 
     boolean isFailed() {
       return failed || replyFuture.isCompletedExceptionally();
+    }
+
+    synchronized void failWithReply(TermIndex termIndex, RaftClientReply reply) {
+      if (this.termIndex != null && this.termIndex.equals(termIndex)) {
+        failWithReply(reply);
+      }
     }
 
     void failWithReply(RaftClientReply reply) {
@@ -198,6 +241,33 @@ class RetryCacheImpl implements RetryCache {
     }
   }
 
+  CacheEntry getOrCreateEntry(ClientInvocationId key, TermIndex applying) {
+    Objects.requireNonNull(applying);
+    return cache.asMap().compute(key, (k, current) -> {
+      if (current == null) {
+        return new CacheEntry(key, applying);
+      }
+      final long currentIndex = current.getLogIndex();
+      if (!current.isDone() && currentIndex == RaftLog.INVALID_LOG_INDEX) {
+        return current;
+      }
+      if (current.isFailed()) {
+        // A failed entry is terminal: its reply future is already completed
+        // with the failure, and a bound failure can only point at a truncated
+        // log position which can never commit.  Whatever its index, replace
+        // it with the position being applied so the committed reply is
+        // recorded instead of being swallowed by the index check in
+        // CacheEntry#updateResult.
+        return new CacheEntry(key, applying);
+      }
+      if (currentIndex > applying.getIndex()) {
+        return current;
+      }
+      return currentIndex == applying.getIndex()
+          ? current : new CacheEntry(key, applying);
+    });
+  }
+
   CacheEntry refreshEntry(CacheEntry newEntry) {
     cache.put(newEntry.getKey(), newEntry);
     return newEntry;
@@ -215,20 +285,11 @@ class RetryCacheImpl implements RetryCache {
       return new CacheQueryResult(cacheEntry, true);
     }
 
-    // the previous attempt failed, replace it with a new one.
-    synchronized (this) {
-      // need to recheck, since there may be other retry attempts being
-      // processed at the same time. The recheck+replacement should be protected
-      // by lock.
-      final CacheEntry currentEntry = cache.getIfPresent(key);
-      if (currentEntry == cacheEntry || currentEntry == null) {
-        // if the failed entry has not got replaced by another retry, or the
-        // failed entry got invalidated, we add a new cache entry
-        return new CacheQueryResult(refreshEntry(newEntry.get()), false);
-      } else {
-        return new CacheQueryResult(currentEntry, true);
-      }
-    }
+    // The previous attempt failed. Recheck and replace it atomically per key,
+    // since another retry or a cache invalidation may have changed the current entry.
+    final CacheEntry currentEntry = cache.asMap().compute(key,
+        (k, current) -> current == cacheEntry || current == null ? newEntry.get() : current);
+    return new CacheQueryResult(currentEntry, !newEntry.isInitialized());
   }
 
   void invalidateRepliedRequests(RaftClientRequest request) {

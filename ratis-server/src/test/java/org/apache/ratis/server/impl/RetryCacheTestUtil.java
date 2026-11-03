@@ -24,6 +24,7 @@ import org.apache.ratis.protocol.ClientInvocationId;
 import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RetryCache;
+import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.segmented.SegmentedRaftLog;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.util.TimeDuration;
@@ -48,7 +49,7 @@ public final class RetryCacheTestUtil {
   public static void createEntry(RetryCache cache, LogEntryProto logEntry){
     if(logEntry.hasStateMachineLogEntry()) {
       final ClientInvocationId invocationId = ClientInvocationId.valueOf(logEntry.getStateMachineLogEntry());
-      getOrCreateEntry(cache, invocationId);
+      getOrCreateEntry(cache, invocationId, TermIndex.valueOf(logEntry));
     }
   }
 
@@ -69,6 +70,11 @@ public final class RetryCacheTestUtil {
 
   private static RetryCache.Entry getOrCreateEntry(RetryCache cache, ClientInvocationId invocationId) {
     return ((RetryCacheImpl)cache).getOrCreateEntry(invocationId);
+  }
+
+  private static RetryCache.Entry getOrCreateEntry(RetryCache cache, ClientInvocationId invocationId,
+      TermIndex termIndex) {
+    return ((RetryCacheImpl)cache).getOrCreateEntry(invocationId, termIndex);
   }
 
   public static RetryCache.Entry get(RaftServer.Division server, ClientId clientId, long callId) {
