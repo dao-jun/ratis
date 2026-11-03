@@ -17,22 +17,20 @@
 package org.apache.ratis.metadata.lock;
 
 import org.apache.ratis.metadata.client.LeaseSession;
-import org.apache.ratis.metadata.client.MetadataTransportException;
 import org.apache.ratis.metadata.client.MetadataWatcher;
 import org.apache.ratis.metadata.client.RaftMetadataClient;
 import org.apache.ratis.metadata.client.RaftMetadataException;
 import org.apache.ratis.metadata.statemachine.ChangeEvent;
 import org.apache.ratis.metadata.statemachine.RaftResult;
-import org.apache.ratis.metadata.util.NamedThreadFactory;
+import org.apache.ratis.metadata.util.AsyncDriver;
+import org.apache.ratis.metadata.util.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeoutException;
 
 import static org.apache.ratis.metadata.util.Preconditions.checkArgument;
@@ -61,9 +59,11 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  *
  * <p>The lock is neither reentrant nor fair: all waiters wake on every release and one create
  * wins. One acquire per {@link MetadataLock} instance; the record at the path and the counter of
- * the same name belong to the lock exclusively. {@link #acquireAsync()} never throws - every
- * failure lands in the future as {@link RaftMetadataException} (misconfiguration),
- * {@link MetadataTransportException} (the request never went through), or {@link TimeoutException}.
+ * the same name belong to the lock exclusively. {@link #acquireAsync()} never throws and never
+ * blocks - the acquire is an event-driven state machine on the client's asynchronous calls, and
+ * every failure lands in the future as {@link RaftMetadataException} (misconfiguration), a
+ * {@code MetadataTransportException} (the request never went through), or a {@link
+ * TimeoutException}.
  */
 public final class MetadataLock implements AutoCloseable {
 
@@ -72,26 +72,27 @@ public final class MetadataLock implements AutoCloseable {
     /** The longest gap between two watchdog wake-ups, whatever the ttl. */
     private static final long MIN_WATCHDOG_MS = 1000;
 
-    /** One shared daemon scheduler for acquire timeouts; Java 8 futures have none built in. */
-    private static final ScheduledExecutorService TIMEOUT_SCHEDULER =
-            Executors.newSingleThreadScheduledExecutor(
-                    new NamedThreadFactory("metadata-lock-timeout", true));
-
     private static final byte[] EMPTY = new byte[0];
 
     private final RaftMetadataClient client;
     private final String path;
     private final long ttlMs;
 
-    /** Guards the lifecycle flags; the waiter sleeps on it until a matching change or a stop. */
-    private final Object signal = new Object();
-    private boolean wakeSignalled;
-    private boolean stopped;
-    private boolean acquireAttempted;
+    /** The acquire state machine; every field below runs under this lock. */
+    private final Object state = new Object();
     private CompletableFuture<Hold> pending;
-
-    /** Set by the waiter before the watcher starts; the listener callbacks read it after. */
+    private boolean acquireAttempted;
+    private boolean stopped;
+    /** True while parked on the change stream; a wake or the watchdog un-parks an attempt. */
+    private boolean waiting;
+    /** True once this contender's create committed; only then may the undo delete the record. */
+    private boolean held;
+    /** True while a create may have committed without its outcome being known. */
+    private boolean ambiguous;
+    private LeaseSession session;
     private MetadataWatcher watcher;
+    private ScheduledFuture<?> watchdog;
+    private ScheduledFuture<?> timeoutTask;
 
     private MetadataLock(RaftMetadataClient client, String path, long ttlMs) {
         this.client = client;
@@ -157,29 +158,29 @@ public final class MetadataLock implements AutoCloseable {
 
     /**
      * Acquires the lock with a deadline; on expiry the future completes with {@link
-     * TimeoutException} and the waiter unwinds - a create that committed anyway is undone, so a
-     * timed-out contender never leaks the lock.
+     * TimeoutException} and the contender unwinds - a create that committed anyway is undone, so
+     * a timed-out contender never leaks the lock.
      */
     public CompletableFuture<Hold> acquireAsync(Duration timeout) {
+        if (timeout != null) {
+            long ms = timeout.toMillis();
+            checkArgument(ms > 0, "timeout must be positive, got %s", timeout);
+        }
         final CompletableFuture<Hold> future;
-        synchronized (signal) {
+        synchronized (state) {
             if (acquireAttempted) {
                 throw new IllegalStateException("acquire was already attempted on this lock");
             }
             acquireAttempted = true;
             pending = future = new CompletableFuture<>();
+            if (timeout != null) {
+                timeoutTask =
+                        AsyncDriver.schedule(
+                                () -> fail(new TimeoutException("Acquiring " + path + " timed out")),
+                                timeout.toMillis());
+            }
         }
-        if (timeout != null) {
-            long ms = timeout.toMillis();
-            checkArgument(ms > 0, "timeout must be positive, got %s", timeout);
-            TIMEOUT_SCHEDULER.schedule(
-                    () -> stop(future, new TimeoutException("Acquiring " + path + " timed out")),
-                    ms,
-                    TimeUnit.MILLISECONDS);
-        }
-        final Thread waiter = new Thread(() -> runAcquire(future), "metadata-lock:" + path);
-        waiter.setDaemon(true);
-        waiter.start();
+        AsyncDriver.schedule(this::begin, 0);
         return future;
     }
 
@@ -219,105 +220,84 @@ public final class MetadataLock implements AutoCloseable {
      */
     @Override
     public void close() {
-        stop(pendingFuture(), new IllegalStateException("The lock was closed while acquiring"));
+        fail(new IllegalStateException("The lock was closed while acquiring"));
     }
 
-    private CompletableFuture<Hold> pendingFuture() {
-        synchronized (signal) {
-            return pending;
+    // ------------------------------------------------------------------
+    // the acquire state machine - event driven, on no thread of its own
+    // ------------------------------------------------------------------
+
+    /** Whether the acquire already settled - success, failure or cancellation. */
+    private boolean settled() {
+        synchronized (state) {
+            return stopped || pending.isDone();
         }
     }
 
     /**
-     * Settles the future with {@code failure} and stops the waiter, unless the future is already
-     * settled - a waiter that nonetheless ends up holding the record undoes itself.
+     * The client's async twins wrap their failures; the statuses and exception types the state
+     * machine decides on live on the cause underneath.
      */
-    private void stop(CompletableFuture<Hold> future, Throwable failure) {
-        if (future == null || !future.completeExceptionally(failure)) {
+    private static Throwable unwrap(Throwable failure) {
+        return ExceptionUtils.stripCompletionException(failure);
+    }
+
+    /**
+     * Materializes the parent chain once, then fixes the watch position; {@code NODE_EXISTS}
+     * just means the parent is already there.
+     */
+    private void begin() {
+        if (settled()) {
             return;
         }
-        synchronized (signal) {
-            stopped = true;
-            signal.notifyAll();
+        final int slash = path.lastIndexOf('/');
+        final String parent = slash <= 0 ? "/" : path.substring(0, slash);
+        if (parent.equals("/")) {
+            takeWatchPosition();
+            return;
         }
-    }
-
-    // ------------------------------------------------------------------
-    // the waiter state machine - one daemon thread per acquiring lock
-    // ------------------------------------------------------------------
-
-    private void runAcquire(CompletableFuture<Hold> future) {
-        LeaseSession session = null;
-        boolean held = false;
-        // True while a create may have committed without its outcome being known: only then may
-        // the undo delete the record - a contender that never created must never delete the
-        // holder's record.
-        boolean ambiguous = false;
-        // True once the future took the session; the hold owns the lease from there on.
-        boolean handed = false;
-        try {
-            ensureParent();
-            startWatcher();
-            while (!isStopped()) {
-                if (session == null) {
-                    session = client.openLease(Duration.ofMillis(ttlMs));
-                }
-                try {
-                    ambiguous = true;
-                    client.create(path, EMPTY, session);
-                    ambiguous = false;
-                    held = true;
-                    break;
-                } catch (RaftMetadataException e) {
-                    ambiguous = false;
-                    if (e.getStatus() == RaftResult.Status.NODE_EXISTS) {
-                        awaitWake();
-                    } else if (e.getStatus() == RaftResult.Status.UNKNOWN_LEASE) {
-                        // The contender's own lease died (a partition outlasted the ttl); a new
-                        // one keeps it in the race.
-                        session.close();
-                        session = null;
-                    } else {
-                        throw e;
-                    }
-                }
-            }
-            if (held) {
-                final long token = client.increment(path, 1);
-                handed = future.complete(new HoldImpl(session, token));
-            }
-        } catch (RuntimeException failure) {
-            future.completeExceptionally(failure);
-        } finally {
-            if (!handed) {
-                // The record may exist only when this waiter created it or a create's outcome is
-                // unknown; a waiting contender must leave the holder's record alone.
-                if (held || ambiguous) {
-                    undoRecord();
-                }
-                if (session != null) {
-                    session.close();
-                }
-            }
-            if (watcher != null) {
-                watcher.close();
-            }
-        }
-    }
-
-    private boolean isStopped() {
-        synchronized (signal) {
-            return stopped;
-        }
+        client.createAsync(parent, EMPTY, true)
+                .whenComplete(
+                        (ignored, failure) -> {
+                            if (settled()) {
+                                return;
+                            }
+                            // The parent being there already and being created are one state.
+                            if (failure == null
+                                    || isRejectionOf(
+                                            unwrap(failure), RaftResult.Status.NODE_EXISTS)) {
+                                takeWatchPosition();
+                                return;
+                            }
+                            fail(unwrap(failure));
+                        });
     }
 
     /**
      * The watch position is taken before the first create attempt: any delete at or after that
-     * revision is delivered by the poll loop, so no release can slip between attempt and watch.
+     * revision is delivered by the watcher, so no release can slip between attempt and watch.
      */
-    private void startWatcher() {
-        final long head = client.revision();
-        watcher =
+    private void takeWatchPosition() {
+        if (settled()) {
+            return;
+        }
+        client.revisionAsync()
+                .whenComplete(
+                        (head, failure) -> {
+                            if (settled()) {
+                                return;
+                            }
+                            if (failure != null) {
+                                fail(unwrap(failure));
+                                return;
+                            }
+                            startWatcher(head);
+                            attempt();
+                        });
+    }
+
+    private void startWatcher(long head) {
+        final MetadataWatcher started =
                 MetadataWatcher.newBuilder(
                                 client,
                                 new MetadataWatcher.Listener() {
@@ -326,7 +306,7 @@ public final class MetadataLock implements AutoCloseable {
                                         for (ChangeEvent.Change change : event.getChanges()) {
                                             if (change.getOp() == ChangeEvent.ChangeOp.DELETE
                                                     && path.equals(change.getPath())) {
-                                                wake();
+                                                onWake();
                                                 return;
                                             }
                                         }
@@ -335,79 +315,245 @@ public final class MetadataLock implements AutoCloseable {
                                     @Override
                                     public void onNeedSnapshot(long oldestRetainedRevision) {
                                         // The wait position fell below the retention line and the
-                                        // loop stopped; resume from the line - the waiter's next
-                                        // create attempt covers the gap.
-                                        if (watcher != null) {
-                                            watcher.restartFrom(oldestRetainedRevision);
+                                        // watcher stopped; resume from the line - the next create
+                                        // attempt covers the gap.
+                                        final MetadataWatcher current;
+                                        synchronized (state) {
+                                            current = watcher;
                                         }
-                                        wake();
+                                        if (current != null) {
+                                            current.restartFrom(oldestRetainedRevision);
+                                        }
+                                        onWake();
                                     }
                                 })
                         .setSinceRevision(head)
                         .build();
-        watcher.start();
+        synchronized (state) {
+            watcher = started;
+        }
+        started.start();
     }
 
-    private void wake() {
-        synchronized (signal) {
-            wakeSignalled = true;
-            signal.notifyAll();
+    /** One acquisition round: a session when lacking one, then one create attempt. */
+    private void attempt() {
+        final LeaseSession current;
+        synchronized (state) {
+            if (settled()) {
+                return;
+            }
+            current = session;
         }
+        if (current != null) {
+            tryCreate(current);
+            return;
+        }
+        client.openLeaseAsync(Duration.ofMillis(ttlMs))
+                .whenComplete(
+                        (opened, failure) -> {
+                            if (failure != null) {
+                                fail(unwrap(failure));
+                                return;
+                            }
+                            synchronized (state) {
+                                if (settled()) {
+                                    // The winner of the settle owns the cleanup; this lease just
+                                    // opened and belongs to no one - close it here.
+                                    opened.close();
+                                    return;
+                                }
+                                session = opened;
+                            }
+                            tryCreate(opened);
+                        });
+    }
+
+    private void tryCreate(final LeaseSession current) {
+        synchronized (state) {
+            if (settled()) {
+                return;
+            }
+            ambiguous = true;
+        }
+        client.createAsync(path, EMPTY, current)
+                .whenComplete(
+                        (ignored, failure) -> onCreateOutcome(current, unwrap(failure)));
+    }
+
+    private void onCreateOutcome(LeaseSession current, Throwable failure) {
+        if (failure == null) {
+            synchronized (state) {
+                ambiguous = false;
+                held = true;
+                if (settled()) {
+                    // The settle path saw the create in flight and issued its undo; the client's
+                    // ordered pipeline runs that delete after this committed create.
+                    return;
+                }
+            }
+            takeToken(current);
+            return;
+        }
+        if (isRejectionOf(failure, RaftResult.Status.NODE_EXISTS)) {
+            synchronized (state) {
+                ambiguous = false;
+                if (settled()) {
+                    return;
+                }
+                waiting = true;
+                watchdog =
+                        AsyncDriver.schedule(
+                                this::onWatchdog, Math.max(MIN_WATCHDOG_MS, ttlMs / 3));
+            }
+            return;
+        }
+        if (isRejectionOf(failure, RaftResult.Status.UNKNOWN_LEASE)) {
+            // The contender's own lease died (a partition outlasted the ttl); a new one keeps it
+            // in the race. This create was rejected, not committed: nothing to undo.
+            synchronized (state) {
+                ambiguous = false;
+                if (settled()) {
+                    return;
+                }
+                session = null;
+            }
+            current.close();
+            AsyncDriver.schedule(this::attempt, 0);
+            return;
+        }
+        if (!(failure instanceof RaftMetadataException)) {
+            // Transport trouble or a closed client: the create's outcome is unknown - leave
+            // {@code ambiguous} set so the undo covers a create that committed anyway.
+            fail(failure);
+            return;
+        }
+        synchronized (state) {
+            // A definitive rejection: this contender's create never committed, nothing to undo.
+            ambiguous = false;
+        }
+        fail(failure);
+    }
+
+    /** The record exists; the counter bump of the same name yields the fencing token. */
+    private void takeToken(final LeaseSession current) {
+        client.incrementAsync(path, 1)
+                .whenComplete(
+                        (token, failure) -> {
+                            if (failure != null) {
+                                fail(unwrap(failure));
+                                return;
+                            }
+                            final MetadataWatcher toClose;
+                            final ScheduledFuture<?> toCancel;
+                            synchronized (state) {
+                                if (!pending.complete(new HoldImpl(current, token))) {
+                                    // A timeout undid this contender mid-token; its cleanup ran.
+                                    return;
+                                }
+                                toClose = watcher;
+                                watcher = null;
+                                toCancel = timeoutTask;
+                                timeoutTask = null;
+                            }
+                            if (toClose != null) {
+                                toClose.close();
+                            }
+                            if (toCancel != null) {
+                                toCancel.cancel(false);
+                            }
+                        });
+    }
+
+    /** A delete of the lock record arrived (or the retention line tripped): try again now. */
+    private void onWake() {
+        synchronized (state) {
+            if (stopped || !waiting) {
+                return;
+            }
+            waiting = false;
+            if (watchdog != null) {
+                watchdog.cancel(false);
+                watchdog = null;
+            }
+        }
+        AsyncDriver.schedule(this::attempt, 0);
+    }
+
+    /** The wait's insurance tick: re-attempt whatever the change stream delivered. */
+    private void onWatchdog() {
+        synchronized (state) {
+            if (stopped || !waiting) {
+                return;
+            }
+            waiting = false;
+            watchdog = null;
+        }
+        attempt();
     }
 
     /**
-     * Sleeps until the record's delete arrives, the watchdog tick fires (a re-attempt whatever
-     * the events), or the acquire is stopped.
+     * Settles the acquire with {@code failure} and unwinds it, unless it already settled - the
+     * first settler owns the unwind. The undo delete runs only when this contender created the
+     * record or a create's outcome is unknown: a waiting contender must leave the holder's
+     * record alone.
      */
-    private void awaitWake() {
-        final long deadline = System.currentTimeMillis() + Math.max(MIN_WATCHDOG_MS, ttlMs / 3);
-        synchronized (signal) {
-            while (!wakeSignalled && !stopped) {
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    return;
-                }
-                try {
-                    signal.wait(remaining);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
+    private void fail(Throwable failure) {
+        final boolean undo;
+        final LeaseSession toClose;
+        final MetadataWatcher watcherToClose;
+        synchronized (state) {
+            if (pending == null || !pending.completeExceptionally(failure)) {
+                return;
             }
-            wakeSignalled = false;
+            stopped = true;
+            waiting = false;
+            if (watchdog != null) {
+                watchdog.cancel(false);
+                watchdog = null;
+            }
+            if (timeoutTask != null) {
+                timeoutTask.cancel(false);
+                timeoutTask = null;
+            }
+            undo = held || ambiguous;
+            toClose = session;
+            session = null;
+            watcherToClose = watcher;
+            watcher = null;
+        }
+        if (undo) {
+            undoRecord();
+        }
+        if (toClose != null) {
+            toClose.close();
+        }
+        if (watcherToClose != null) {
+            watcherToClose.close();
         }
     }
 
-    /** Materializes the parent chain once; {@code NODE_EXISTS} just means it is already there. */
-    private void ensureParent() {
-        int slash = path.lastIndexOf('/');
-        final String parent = slash <= 0 ? "/" : path.substring(0, slash);
-        if (parent.equals("/")) {
-            return;
-        }
-        try {
-            client.create(parent, EMPTY, true);
-        } catch (RaftMetadataException alreadyThere) {
-            if (alreadyThere.getStatus() != RaftResult.Status.NODE_EXISTS) {
-                throw alreadyThere;
-            }
-        }
-    }
-
-    /** The best-effort record undo of a failed or overtaken acquire; never throws. */
+    /** The best-effort record undo of a failed or overtaken acquire; failures only log. */
     private void undoRecord() {
-        try {
-            client.delete(path);
-        } catch (RaftMetadataException e) {
-            if (e.getStatus() != RaftResult.Status.NOT_FOUND) {
-                LOG.warn("Undoing the lock record {} failed with {}", path, e.getStatus());
-            }
-        } catch (MetadataTransportException | IllegalStateException e) {
-            LOG.warn(
-                    "Undoing the lock record {} failed; the closed lease frees it within one ttl",
-                    path,
-                    e);
-        }
+        client.deleteAsync(path)
+                .whenComplete(
+                        (ignored, failure) -> {
+                            if (failure == null) {
+                                return;
+                            }
+                            if (isRejectionOf(unwrap(failure), RaftResult.Status.NOT_FOUND)) {
+                                return;
+                            }
+                            LOG.warn(
+                                    "Undoing the lock record {} failed; the closed lease frees"
+                                            + " it within one ttl",
+                                    path,
+                                    unwrap(failure));
+                        });
+    }
+
+    private static boolean isRejectionOf(Throwable failure, RaftResult.Status status) {
+        return failure instanceof RaftMetadataException
+                && ((RaftMetadataException) failure).getStatus() == status;
     }
 
     // ------------------------------------------------------------------
@@ -467,18 +613,21 @@ public final class MetadataLock implements AutoCloseable {
                 }
                 released = true;
             }
-            try {
-                client.delete(path);
-            } catch (RaftMetadataException e) {
-                if (e.getStatus() != RaftResult.Status.NOT_FOUND) {
-                    LOG.warn("Releasing {} failed with {}", path, e.getStatus());
-                }
-            } catch (MetadataTransportException | IllegalStateException e) {
-                LOG.warn(
-                        "Releasing {} did not reach the cluster; the lease frees it within one ttl",
-                        path,
-                        e);
-            }
+            client.deleteAsync(path)
+                    .whenComplete(
+                            (ignored, failure) -> {
+                                if (failure == null) {
+                                    return;
+                                }
+                                if (isRejectionOf(unwrap(failure), RaftResult.Status.NOT_FOUND)) {
+                                    return;
+                                }
+                                LOG.warn(
+                                        "Releasing {} did not reach the cluster; the lease frees it"
+                                                + " within one ttl",
+                                        path,
+                                        unwrap(failure));
+                            });
             session.close();
         }
 

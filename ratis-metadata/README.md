@@ -31,15 +31,18 @@ org.apache.ratis.metadata
 │                           snapshot = RocksDB checkpoint + atomic publish + identity manifest,
 │                           POLL_CHANGES change stream with retention
 ├── client/                 RaftMetadataClient (sync surface + never-throwing async twins),
-│                           LeaseSession (background renewal), MetadataWatcher (poll loop),
-│                           exception family: RaftMetadataException (rejection),
-│                           NeedSnapshotException (retention line), MetadataTransportException
+│                           LeaseSession (scheduler-driven renewal), MetadataWatcher (a strictly
+│                           sequential async poll chain), exception family: RaftMetadataException
+│                           (rejection), NeedSnapshotException (retention line),
+│                           MetadataTransportException
 ├── lease/                  LeaseExpiryScheduler - the leader proposes one expiry command per
 │                           due lease through submitClientRequestAsync
 ├── lock/                   MetadataLock - a mutual-exclusion lock recipe (builder-based): an
 │                           ephemeral record guards the path, waiters follow the change stream,
 │                           and per-acquire tokens fence stale holders
-└── util/                   self-contained helpers (Preconditions, files, clock, threads)
+└── util/                   self-contained helpers (Preconditions, files, clock) and
+                           AsyncDriver - the one shared daemon scheduler behind every periodic
+                           background step (lease renewals, watcher poll pacing, lock watchdogs)
 ```
 
 ## Dependencies
@@ -81,6 +84,16 @@ Notes:
 - `NeedSnapshotException` - polled change records were garbage collected; resynchronize.
 - `MetadataTransportException` - the request never went through (retries exhausted, transport
   broke, or the reply was undecodable).
+
+## Threading model
+
+No component owns a blocking thread. One JVM-wide daemon scheduler (`util/AsyncDriver`) drives
+every periodic step, and each step runs on the client's asynchronous twins: lease sessions renew
+from 50 ms due-check ticks, the watcher keeps at most one poll in flight and schedules the next
+poll from each completion, and a lock's acquire is an event-driven state machine (wake, watchdog
+and timeout events) - any number of sessions, watchers or lock contenders costs no extra threads.
+`close()` on a session, watcher or lock never blocks. Listener callbacks run inline on the
+client's small completion executor: keep them short, or hand the watcher an explicit executor.
 
 ## Tests
 

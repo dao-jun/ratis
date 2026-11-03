@@ -18,12 +18,12 @@ package org.apache.ratis.metadata.client;
 
 import org.apache.ratis.metadata.statemachine.RaftResult;
 import org.apache.ratis.metadata.util.Clock;
+import org.apache.ratis.metadata.util.ExceptionUtils;
 import org.apache.ratis.protocol.exceptions.AlreadyClosedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
-import java.util.concurrent.TimeUnit;
 
 /**
  * A client-side handle keeping one registered lease alive - the ephemeral-record half of the
@@ -31,50 +31,45 @@ import java.util.concurrent.TimeUnit;
  * LeaseSession} overloads of {@link RaftMetadataClient#put}/{@code create}) live exactly as long
  * as the lease does.
  *
- * <p>The session renews the lease in a background daemon thread every third of its ttl.
- * Transient transport trouble is retried, and any renewal landing within one ttl keeps the
- * lease alive - so a leader failover resolving inside the ttl is transparent. When renewals
- * stop - the holder crashed, the partition outlasted the ttl, or {@link #close()} ran - the
- * leader's expiry scheduler deletes every record bound to the lease after the ttl and emits
- * {@code LEASE_EXPIRE} change events for watchers.
+ * <p>The session renews the lease every third of its ttl. Renewals run on the module's shared
+ * scheduler and the client's asynchronous machinery - a session owns no thread of its own, so
+ * any number of them costs no extra threads. Transient transport trouble is retried, and any
+ * renewal landing within one ttl keeps the lease alive - so a leader failover resolving inside
+ * the ttl is transparent. When renewals stop - the holder crashed, the partition outlasted the
+ * ttl, or {@link #close()} ran - the leader's expiry scheduler deletes every record bound to
+ * the lease after the ttl and emits {@code LEASE_EXPIRE} change events for watchers.
  *
  * <p>Lifecycle: obtained from {@link RaftMetadataClient#openLease(Duration)} or its async twin,
- * never constructed directly. {@link #close()} is idempotent, stops the renewals and detaches
- * from the client; the bound records then die through the scheduler, at most one ttl later -
- * closing does not delete them outright. {@link #isAlive()} is the holder's checkpoint: false
- * after {@link #close()} or once a renewal returned {@code UNKNOWN_LEASE} (the lease expired
- * underneath and cannot be resurrected). {@link #close()} and {@link #isAlive()} may be called
- * from any thread.
+ * never constructed directly. {@link #close()} is idempotent and never blocks: it stops the
+ * renewals and detaches from the client; a renewal still in flight completes and is ignored.
+ * The bound records then die through the scheduler, at most one ttl later - closing does not
+ * delete them outright. {@link #isAlive()} is the holder's checkpoint: false after {@link
+ * #close()} or once a renewal returned {@code UNKNOWN_LEASE} (the lease expired underneath and
+ * cannot be resurrected). {@link #close()} and {@link #isAlive()} may be called from any thread.
  */
 public final class LeaseSession implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(LeaseSession.class);
-
-    /** The longest gap between two due-ness checks, whatever the ttl. */
-    private static final long MAX_TICK_MS = 200;
-
-    /** The shortest gap between two due-ness checks, so short ttls still poll often enough. */
-    private static final long MIN_TICK_MS = 10;
-
-    /** How long {@link #close()} waits for an in-flight renewal proposal to settle. */
-    private static final long CLOSE_JOIN_MS = TimeUnit.SECONDS.toMillis(2);
 
     private final RaftMetadataClient client;
     private final long leaseId;
     private final long ttlMs;
     private final Clock clock;
 
-    /** The clock reading the last accepted renewal (or the registration) happened at. */
+    /**
+     * The clock reading the last accepted renewal (or the registration) happened at; guarded by
+     * {@link #lock}.
+     */
     private long renewBaseMs;
 
     private final Object lock = new Object();
     private boolean started;
     private boolean stopped;
-    private Thread renewalThread;
+    private boolean renewing;
 
     /**
-     * Set once a renewal came back {@code UNKNOWN_LEASE}; volatile - the renewal thread writes,
-     * {@link #isAlive()} reads.
+     * Set once a renewal came back {@code UNKNOWN_LEASE}; volatile - the renewal completion
+     * writes it, {@link #isAlive()} reads it.
      */
     private volatile boolean expired;
 
@@ -102,96 +97,96 @@ public final class LeaseSession implements AutoCloseable {
         }
     }
 
-    /** Starts the renewal thread; called by {@link RaftMetadataClient#openLease(Duration)}. */
+    /** Attaches to the client's renewal ticks; called by {@link RaftMetadataClient#openLease}. */
     void start() {
         synchronized (lock) {
             if (started) {
                 return;
             }
             started = true;
-            renewalThread = new Thread(this::run, "raft-lease-session-" + leaseId);
-            renewalThread.setDaemon(true);
-            renewalThread.start();
+        }
+        client.registerSession(this);
+    }
+
+    /** Marks the session dead without renewals: its client was already closed when it attached. */
+    void onDeadClient() {
+        synchronized (lock) {
+            stopped = true;
         }
     }
 
     /**
      * Stops the renewals - the lease then dies through the leader's scheduler - and detaches from
-     * the client; idempotent.
+     * the client; idempotent, never blocks: a renewal still in flight completes and is ignored.
      */
     @Override
     public void close() {
-        final Thread thread;
         synchronized (lock) {
             if (stopped) {
                 return;
             }
             stopped = true;
-            thread = renewalThread;
-            lock.notifyAll();
         }
-        client.sessions.remove(this);
-        if (thread != null) {
-            try {
-                thread.join(CLOSE_JOIN_MS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-        }
+        client.unregisterSession(this);
     }
 
-    private void run() {
-        final long renewIntervalMs = Math.max(1, ttlMs / 3);
-        final long tickMs = Math.max(MIN_TICK_MS, Math.min(MAX_TICK_MS, renewIntervalMs / 8));
-        while (true) {
-            final boolean due;
-            synchronized (lock) {
-                if (stopped) {
-                    return;
-                }
-                due = clock.milliseconds() - renewBaseMs >= renewIntervalMs;
-                if (!due) {
-                    try {
-                        lock.wait(tickMs);
-                    } catch (InterruptedException e) {
-                        // close() interrupted us; re-check the stop flag.
-                        Thread.currentThread().interrupt();
-                    }
-                }
-            }
-            if (due && !renew()) {
+    /**
+     * One scheduler tick: renews when a third of the ttl has elapsed and no renewal is in
+     * flight. Overlap suppression matters - the previous renewal may sit out its whole retry
+     * budget during an outage, and a second one on top could complete out of order.
+     */
+    void tick() {
+        synchronized (lock) {
+            if (stopped || renewing) {
                 return;
             }
+            if (clock.milliseconds() - renewBaseMs < Math.max(1, ttlMs / 3)) {
+                return;
+            }
+            renewing = true;
         }
+        client.renewLeaseAsync(leaseId, Duration.ofMillis(ttlMs))
+                .whenComplete(
+                        (ignored, failure) -> {
+                            if (failure == null) {
+                                synchronized (lock) {
+                                    renewing = false;
+                                    renewBaseMs = clock.milliseconds();
+                                }
+                                return;
+                            }
+                            // The client's async twins wrap their failures; the statuses the
+                            // session decides on live on the cause underneath.
+                            onRenewalFailure(ExceptionUtils.stripCompletionException(failure));
+                        });
     }
 
-    private boolean renew() {
-        try {
-            client.renewLease(leaseId, Duration.ofMillis(ttlMs));
-            renewBaseMs = clock.milliseconds();
-            return true;
-        } catch (RaftMetadataException e) {
-            if (e.getStatus() == RaftResult.Status.UNKNOWN_LEASE) {
+    private void onRenewalFailure(Throwable failure) {
+        synchronized (lock) {
+            renewing = false;
+            if (stopped) {
+                return;
+            }
+            if (failure instanceof RaftMetadataException
+                    && ((RaftMetadataException) failure).getStatus()
+                            == RaftResult.Status.UNKNOWN_LEASE) {
                 // The lease expired underneath and renewing cannot resurrect it - stop quietly.
                 expired = true;
+                stopped = true;
                 LOG.warn(
                         "Lease {} expired before its session could renew it; stopping renewals",
                         leaseId);
-                return false;
+                return;
             }
-            // No other protocol failure is expected from a renewal; retry on the next tick.
-            LOG.debug("Renewing lease {} failed with {}; retrying", leaseId, e.getStatus(), e);
-            return true;
-        } catch (MetadataTransportException | IllegalStateException e) {
             // The client closed under us (IllegalStateException, or ratis AlreadyClosed) - stop.
-            if (e instanceof IllegalStateException
-                    || e.getCause() instanceof AlreadyClosedException) {
-                return false;
+            if (failure instanceof IllegalStateException
+                    || failure.getCause() instanceof AlreadyClosedException) {
+                stopped = true;
+                return;
             }
-            // Transport trouble: retry on the next tick - a renewal within one ttl keeps the lease
-            // alive.
-            LOG.debug("Renewing lease {} failed; retrying", leaseId, e);
-            return true;
+            // Transport trouble: the due-ness stands, the next tick retries - a renewal within
+            // one ttl keeps the lease alive. No other protocol failure is expected either.
+            LOG.debug("Renewing lease {} failed; retrying", leaseId, failure);
         }
     }
 

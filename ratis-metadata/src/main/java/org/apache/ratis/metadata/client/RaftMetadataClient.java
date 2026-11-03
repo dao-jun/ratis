@@ -20,6 +20,7 @@ import org.apache.ratis.metadata.statemachine.ChangeEvent;
 import org.apache.ratis.metadata.statemachine.RaftCommand;
 import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.statemachine.RaftResult;
+import org.apache.ratis.metadata.util.AsyncDriver;
 import org.apache.ratis.metadata.util.Clock;
 import org.apache.ratis.metadata.util.ExceptionUtils;
 import org.apache.ratis.metadata.util.FutureUtils;
@@ -58,6 +59,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
@@ -99,6 +101,50 @@ public final class RaftMetadataClient implements AutoCloseable {
      */
     @SuppressWarnings("checkstyle:VisibilityModifier")
     final CopyOnWriteArrayList<LeaseSession> sessions = new CopyOnWriteArrayList<>();
+
+    /** How often the renewal ticks look for due sessions. */
+    private static final long SESSION_TICK_MS = 50;
+
+    /** Guards {@link #sessionTick} and the closed-check of session registration. */
+    private final Object sessionState = new Object();
+
+    /** The shared-scheduler tick driving due-session renewals; live while any session is here. */
+    private ScheduledFuture<?> sessionTick;
+
+    /**
+     * Attaches the session to the renewal ticks and takes it into {@link #sessions}; a session
+     * of an already-closed client is marked dead instead - nothing of it will ever renew.
+     */
+    void registerSession(LeaseSession session) {
+        synchronized (sessionState) {
+            if (closed) {
+                session.onDeadClient();
+                return;
+            }
+            sessions.add(session);
+            if (sessionTick == null) {
+                sessionTick = AsyncDriver.scheduleAtFixedRate(this::tickSessions, SESSION_TICK_MS);
+            }
+        }
+    }
+
+    /** Detaches the session; the ticks stop once the last one is gone. */
+    void unregisterSession(LeaseSession session) {
+        synchronized (sessionState) {
+            sessions.remove(session);
+            if (sessions.isEmpty() && sessionTick != null) {
+                sessionTick.cancel(false);
+                sessionTick = null;
+            }
+        }
+    }
+
+    private void tickSessions() {
+        // A snapshot iteration: a session detaching mid-tick is at worst one wasted due-check.
+        for (LeaseSession session : sessions) {
+            session.tick();
+        }
+    }
 
     private volatile boolean closed;
 
@@ -468,7 +514,6 @@ public final class RaftMetadataClient implements AutoCloseable {
 
     private LeaseSession startSession(long leaseId, long ttlMs) {
         LeaseSession session = new LeaseSession(this, leaseId, ttlMs, clock);
-        sessions.add(session);
         session.start();
         return session;
     }
@@ -506,17 +551,30 @@ public final class RaftMetadataClient implements AutoCloseable {
         return session.getLeaseId();
     }
 
-    /** Closes the lease sessions, then the raft client; close watchers and in-flight ops first. */
+    /**
+     * Closes the lease sessions, then the raft client; close watchers and in-flight ops first.
+     * The closed flag flips under {@link #sessionState} - a session registering concurrently
+     * either joins before the sweep or is turned away dead, never left attached to a closed
+     * client with the tick already cancelled.
+     */
     @Override
     public void close() {
-        if (closed) {
-            return;
+        List<LeaseSession> toClose;
+        synchronized (sessionState) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            toClose = new ArrayList<>(sessions);
+            sessions.clear();
+            if (sessionTick != null) {
+                sessionTick.cancel(false);
+                sessionTick = null;
+            }
         }
-        closed = true;
-        for (LeaseSession session : sessions) {
+        for (LeaseSession session : toClose) {
             session.close();
         }
-        sessions.clear();
         try {
             raftClient.close();
         } catch (IOException e) {

@@ -17,24 +17,34 @@
 package org.apache.ratis.metadata.client;
 
 import org.apache.ratis.metadata.statemachine.ChangeEvent;
+import org.apache.ratis.metadata.util.AsyncDriver;
+import org.apache.ratis.metadata.util.ExceptionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
 import java.util.concurrent.Executor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ScheduledFuture;
 
 import static org.apache.ratis.metadata.util.Preconditions.checkArgument;
 import static org.apache.ratis.metadata.util.Preconditions.checkNotNull;
 import static org.apache.ratis.metadata.util.Preconditions.checkState;
 
-/** Continuously polls changes, delivering an ordered, gap-explained stream to {@link Listener}. */
+/**
+ * Continuously polls changes, delivering an ordered, gap-explained stream to {@link Listener}.
+ *
+ * <p>The watcher owns no thread: one poll at a time runs on the client's asynchronous machinery,
+ * and each completion schedules the next step on the module's shared scheduler. At most one poll
+ * is outstanding, so the records of consecutive polls arrive in revision order. While records
+ * flow the next poll leaves immediately; an empty poll waits the interval first.
+ *
+ * <p>Callbacks run inline on the client's completion executor (or on the {@link Builder#setExecutor
+ * executor} supplied instead) - keep them short: a blocking callback parks a thread that settles
+ * the client's other asynchronous calls. Callbacks of one watcher never overlap.
+ */
 public final class MetadataWatcher implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(MetadataWatcher.class);
-
-    /** How long {@link #close()} waits for the fetch loop to settle. */
-    private static final long CLOSE_JOIN_MS = TimeUnit.SECONDS.toMillis(2);
 
     /** Receives the watcher's stream; see {@link MetadataWatcher}'s javadoc for the contract. */
     public interface Listener {
@@ -52,14 +62,16 @@ public final class MetadataWatcher implements AutoCloseable {
     private final long pollIntervalMs;
     private final long maxPollBytes;
 
-    /** The poll position, owned by the fetch thread alone; the cross-thread fields are volatile. */
+    /** The poll position; owned by the poll chain alone - only it runs while {@code running}. */
     private long checkpoint;
 
     private volatile long lastDeliveredRevision;
     private volatile boolean running;
     private volatile boolean closed;
     private volatile Throwable failure;
-    private Thread fetchThread;
+
+    /** The scheduler step that will fire the next poll; guarded by {@code this}. */
+    private ScheduledFuture<?> nextStep;
 
     private MetadataWatcher(
             RaftMetadataClient client,
@@ -121,7 +133,10 @@ public final class MetadataWatcher implements AutoCloseable {
             return this;
         }
 
-        /** Where {@link Listener} callbacks run; default is the watcher's own thread. */
+        /**
+         * Where {@link Listener} callbacks run; default is inline on the client's completion
+         * executor - the poll chain waits for each callback to return.
+         */
         public Builder setExecutor(Executor executor) {
             this.executor = checkNotNull(executor, "executor");
             return this;
@@ -134,18 +149,16 @@ public final class MetadataWatcher implements AutoCloseable {
         }
     }
 
-    /** Starts the fetch loop; at most one loop runs per watcher. */
+    /** Starts the poll chain; at most one chain runs per watcher. */
     public synchronized void start() {
         checkState(!closed, "MetadataWatcher is closed");
         checkState(!running, "MetadataWatcher is already running");
         running = true;
         failure = null;
-        fetchThread = new Thread(this::run, "raft-metadata-watcher");
-        fetchThread.setDaemon(true);
-        fetchThread.start();
+        scheduleNext(0);
     }
 
-    /** Resumes the fetch loop from {@code sinceRevision} (exclusive) after it stopped. */
+    /** Resumes the poll chain from {@code sinceRevision} (exclusive) after it stopped. */
     public synchronized void restartFrom(long sinceRevision) {
         checkArgument(sinceRevision >= 0, "sinceRevision must be >= 0, got %s", sinceRevision);
         checkState(!closed, "MetadataWatcher is closed");
@@ -155,12 +168,12 @@ public final class MetadataWatcher implements AutoCloseable {
         start();
     }
 
-    /** Whether a fetch loop is running (false after a NEED_SNAPSHOT stop, a failure or a close). */
+    /** Whether a poll chain is running (false after a NEED_SNAPSHOT stop, a failure or a close). */
     public synchronized boolean isRunning() {
         return running;
     }
 
-    /** Failure that stopped the loop, or null; checkpoint in {@link #lastDeliveredRevision()}. */
+    /** Failure that stopped the chain, or null; checkpoint in {@link #lastDeliveredRevision()}. */
     public synchronized Throwable getFailure() {
         return failure;
     }
@@ -170,84 +183,95 @@ public final class MetadataWatcher implements AutoCloseable {
         return lastDeliveredRevision;
     }
 
-    /** Stops the fetch loop (bounded) and with it the deliveries; idempotent. */
+    /**
+     * Cancels the next poll and stops the deliveries; idempotent, never blocks. A poll already
+     * in flight completes and its records are dropped - the listener sees nothing more.
+     */
     @Override
-    public void close() {
-        final Thread thread;
-        synchronized (this) {
-            if (closed) {
-                return;
-            }
-            closed = true;
-            running = false;
-            thread = fetchThread;
-            notifyAll();
+    public synchronized void close() {
+        if (closed) {
+            return;
         }
-        if (thread != null) {
-            thread.interrupt();
-            try {
-                thread.join(CLOSE_JOIN_MS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+        closed = true;
+        running = false;
+        if (nextStep != null) {
+            nextStep.cancel(false);
+            nextStep = null;
         }
     }
 
-    private void run() {
-        while (isRunning()) {
-            final RaftMetadataClient.PollResult polled;
-            try {
-                polled = client.poll(checkpoint, maxPollBytes);
-            } catch (NeedSnapshotException e) {
-                stopAfterNeedSnapshot(e.getOldestRetainedRevision());
-                return;
-            } catch (RaftMetadataException e) {
-                // No protocol failure mode besides NEED_SNAPSHOT; log and idle rather than die.
-                LOG.warn("Polling for changes failed with {}; retrying", e.getStatus(), e);
-                idle();
-                continue;
-            } catch (UndecodableReplyException e) {
-                stopAfterFailure(
-                        e,
-                        "poll replies are undecodable by this build, no further records will be"
-                                + " delivered until the process speaks the leader's protocol");
-                return;
-            } catch (MetadataTransportException | IllegalStateException e) {
-                if (!isRunning()) {
-                    return;
-                }
-                // Client closed; idling would loop forever - close watchers before their client.
-                if (e instanceof IllegalStateException && client.isClosed()) {
-                    stopAfterFailure(
-                            e,
-                            "the metadata client closed underneath the watcher; close watchers"
-                                    + " before their client");
-                    return;
-                }
-                // Longer outage: ratis already retried in-call; keep looping after the interval.
-                LOG.debug("Polling for changes failed; retrying", e);
-                idle();
-                continue;
-            }
+    /**
+     * Fires one poll on the shared scheduler's thread - never on a poll's own completion thread:
+     * under ratis' async backpressure (the outstanding-requests semaphore) the send can block its
+     * issuer, and blocking a completion thread risks wedging the very replies that free the
+     * permits. The scheduler stalling instead only delays ticks, never deadlocks.
+     */
+    private void pollNow() {
+        if (closed || !running) {
+            return;
+        }
+        client.pollAsync(checkpoint, maxPollBytes).whenComplete(this::onPoll);
+    }
 
-            if (polled.getRecords().isEmpty()) {
-                // Advance past record-less revisions; max() - a leader change cannot regress it.
-                checkpoint = Math.max(checkpoint, polled.getWatermark());
-                idle();
-            } else {
-                deliver(polled);
+    private void onPoll(RaftMetadataClient.PollResult polled, Throwable pollFailure) {
+        if (closed) {
+            if (pollFailure == null && !polled.getRecords().isEmpty()) {
+                LOG.warn(
+                        "Dropping the {} change record(s) of a poll that returned after the watcher"
+                                + " closed; no further records will be delivered",
+                        polled.getRecords().size());
             }
+            return;
+        }
+        if (pollFailure != null) {
+            // The client's async twins wrap their failures; classify the cause underneath.
+            onFailure(ExceptionUtils.stripCompletionException(pollFailure));
+            return;
+        }
+        if (polled.getRecords().isEmpty()) {
+            // Advance past record-less revisions; max() - a leader change cannot regress it.
+            checkpoint = Math.max(checkpoint, polled.getWatermark());
+            scheduleNext(pollIntervalMs);
+        } else {
+            deliver(polled);
+        }
+    }
+
+    private void onFailure(Throwable cause) {
+        if (cause instanceof NeedSnapshotException) {
+            stopAfterNeedSnapshot(((NeedSnapshotException) cause).getOldestRetainedRevision());
+        } else if (cause instanceof UndecodableReplyException) {
+            stopAfterFailure(
+                    cause,
+                    "poll replies are undecodable by this build, no further records will be"
+                            + " delivered until the process speaks the leader's protocol");
+        } else if (cause instanceof RaftMetadataException) {
+            // No protocol failure mode besides NEED_SNAPSHOT; log and idle rather than die.
+            LOG.warn(
+                    "Polling for changes failed with {}; retrying",
+                    ((RaftMetadataException) cause).getStatus(),
+                    cause);
+            scheduleNext(pollIntervalMs);
+        } else if (cause instanceof MetadataTransportException
+                || cause instanceof IllegalStateException) {
+            // Client closed; idling would loop forever - close watchers before their client.
+            if (cause instanceof IllegalStateException && client.isClosed()) {
+                stopAfterFailure(
+                        cause,
+                        "the metadata client closed underneath the watcher; close watchers before"
+                                + " their client");
+                return;
+            }
+            // Longer outage: ratis already retried in-call; keep polling after the interval.
+            LOG.debug("Polling for changes failed; retrying", cause);
+            scheduleNext(pollIntervalMs);
+        } else {
+            // Nothing else is expected off the client's future; stopping beats a hot loop.
+            stopAfterFailure(cause, "the poll failed unexpectedly");
         }
     }
 
     private void deliver(final RaftMetadataClient.PollResult polled) {
-        if (closed) {
-            LOG.warn(
-                    "Dropping the {} change record(s) of a poll that returned after the watcher"
-                            + " closed; no further records will be delivered",
-                    polled.getRecords().size());
-            return;
-        }
         final long lastRecordRevision =
                 polled.getRecords().get(polled.getRecords().size() - 1).getRevision();
         final Runnable deliverBatch =
@@ -270,6 +294,8 @@ public final class MetadataWatcher implements AutoCloseable {
         }
         lastDeliveredRevision = lastRecordRevision;
         checkpoint = lastRecordRevision;
+        // Records flowed: the next poll leaves immediately, keeping up with a busy stream.
+        scheduleNext(0);
     }
 
     private void stopAfterNeedSnapshot(final long oldestRetainedRevision) {
@@ -301,23 +327,17 @@ public final class MetadataWatcher implements AutoCloseable {
     }
 
     private void stopAfterFailure(final Throwable cause, final String why) {
-        // Failure first: a caller observing the stopped loop must already see the cause.
+        // Failure first: a caller observing the stopped chain must already see the cause.
         failure = cause;
         running = false;
         LOG.warn("Metadata watcher stopped at checkpoint {}: {}", checkpoint, why, cause);
     }
 
-    /** Waives the poll interval, unless the watcher got stopped in the meantime. */
-    private void idle() {
-        synchronized (this) {
-            if (!running) {
-                return;
-            }
-            try {
-                wait(pollIntervalMs);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+    /** Schedules the next poll from the shared scheduler; a no-op once stopped or closed. */
+    private synchronized void scheduleNext(long delayMs) {
+        if (closed || !running) {
+            return;
         }
+        nextStep = AsyncDriver.schedule(this::pollNow, delayMs);
     }
 }

@@ -23,6 +23,7 @@ import org.apache.ratis.metadata.statemachine.RaftCommand;
 import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.statemachine.RaftResult;
 import org.apache.ratis.metadata.util.ExceptionUtils;
+import org.apache.ratis.metadata.util.FutureUtils;
 import org.apache.ratis.metadata.util.ManualClock;
 import org.apache.ratis.metadata.util.SystemClock;
 import org.apache.ratis.client.RaftClient;
@@ -56,14 +57,12 @@ import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.Queue;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -80,7 +79,6 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.apache.ratis.metadata.util.TestWait.waitUntil;
-import static org.apache.ratis.metadata.util.TestWait.waitValue;
 
 /**
  * Unit tests of {@link RaftMetadataClient}, {@link LeaseSession} and {@link MetadataWatcher} on
@@ -237,27 +235,27 @@ public class TestRaftMetadataClient {
                             .build();
             watcher.start();
             waitUntil(
+                    rpc::firstPollInFlight,
+                    OPERATION_TIMEOUT,
+                    "The watcher never issued its first poll");
+            rpc.answerFirstPoll();
+            waitUntil(
                     () -> executor.submitted.size() == 1,
                     OPERATION_TIMEOUT,
                     "The watcher never queued its first NEED_SNAPSHOT report");
 
             watcher.restartFrom(1);
-            final Thread parkedFetchLoop =
-                    waitValue(
-                            rpc::parkedPollingThread,
-                            OPERATION_TIMEOUT,
-                            "The restarted watcher never entered its second poll");
-            watcher.close();
             waitUntil(
-                    () -> !parkedFetchLoop.isAlive(),
+                    rpc::secondPollInFlight,
                     OPERATION_TIMEOUT,
-                    "The fetch loop did not settle after close");
-            rpc.release();
+                    "The restarted watcher never issued its second poll");
+            watcher.close();
+            rpc.answerSecondPoll();
 
-            assertEquals(
-                    1,
-                    executor.submitted.size(),
-                    "the report owed by the closed loop is dropped, not submitted");
+            // The report owed by the closed chain is dropped, not submitted. The chain settles
+            // through the client's own completion executor within moments of the reply above;
+            // a submission would land there too.
+            assertEquals(1, executor.submitted.size(), "the closed watcher must not report");
         } finally {
             client.close();
         }
@@ -301,18 +299,15 @@ public class TestRaftMetadataClient {
 
     @Test
     void testLeaseSessionStopsRenewingWhenTheClientCloses() throws Exception {
-        final ManualClock clock = new ManualClock(0L);
         final RaftMetadataClient client = newStubClient(new FailingTransportRpc(), null);
         client.close();
-        // Constructed directly: openLease() needs a live client; here the loop faces a closed one.
-        final LeaseSession session = new LeaseSession(client, 77L, 30_000L, clock);
+        // Constructed directly: openLease() needs a live client; here the attach faces a closed
+        // client.
+        final LeaseSession session = new LeaseSession(client, 77L, 30_000L, new ManualClock(0L));
         session.start();
-        // The due renewal hits the closed-state exception; a transport failure would retry.
-        clock.advanceTime(11, TimeUnit.SECONDS);
-        waitUntil(
-                () -> leaseSessionThread(77L) == null,
-                OPERATION_TIMEOUT,
-                "The renewal thread kept running against the closed client");
+        // The registration on a closed client turns the session away dead: no renewal is ever
+        // due on the shared scheduler, and the holder's checkpoint reports it.
+        assertFalse(session.isAlive(), "A session of a closed client must report dead");
     }
 
     // ------------------------------------------------------------------
@@ -1009,17 +1004,6 @@ public class TestRaftMetadataClient {
         return failure.get();
     }
 
-    /** The live renewal thread of the given lease id, or {@code null} once it has exited. */
-    private static Thread leaseSessionThread(long leaseId) {
-        final String name = "raft-lease-session-" + leaseId;
-        for (Thread thread : Thread.getAllStackTraces().keySet()) {
-            if (thread.getName().equals(name)) {
-                return thread;
-            }
-        }
-        return null;
-    }
-
     private static byte[] bytes(String value) {
         return value.getBytes(StandardCharsets.UTF_8);
     }
@@ -1150,28 +1134,49 @@ public class TestRaftMetadataClient {
         }
     }
 
+    /** Serves one async poll at a time; the test decides when each reply arrives. */
     private static final class GatedNeedSnapshotRpc implements RaftClientRpc {
 
         private final byte[] reply =
                 RaftCommandCodec.encodeResult(
                         RaftResult.error(
                                 RaftCommand.Op.POLL_CHANGES, RaftResult.Status.NEED_SNAPSHOT));
-        private final AtomicInteger polls = new AtomicInteger();
-        private final CountDownLatch release = new CountDownLatch(1);
-        private volatile Thread pollingThread;
+        private RaftClientRequest firstRequest;
+        private RaftClientRequest secondRequest;
+        private CompletableFuture<RaftClientReply> firstReply;
+        private CompletableFuture<RaftClientReply> secondReply;
 
         @Override
-        public RaftClientReply sendRequest(RaftClientRequest request) throws IOException {
-            // Recorded before the count: a reader seeing the count already sees this thread.
-            pollingThread = Thread.currentThread();
-            if (polls.incrementAndGet() > 1) {
-                try {
-                    release.await();
-                } catch (InterruptedException e) {
-                    // Interrupted by close(); answer anyway so the loop reaches code under test.
-                    Thread.currentThread().interrupt();
-                }
+        public synchronized CompletableFuture<RaftClientReply> sendRequestAsync(
+                RaftClientRequest request) {
+            final CompletableFuture<RaftClientReply> reply = new CompletableFuture<>();
+            if (firstReply == null) {
+                firstRequest = request;
+                firstReply = reply;
+            } else {
+                secondRequest = request;
+                secondReply = reply;
             }
+            return reply;
+        }
+
+        synchronized boolean firstPollInFlight() {
+            return firstReply != null;
+        }
+
+        synchronized boolean secondPollInFlight() {
+            return secondReply != null;
+        }
+
+        synchronized void answerFirstPoll() {
+            firstReply.complete(replyOf(firstRequest));
+        }
+
+        synchronized void answerSecondPoll() {
+            secondReply.complete(replyOf(secondRequest));
+        }
+
+        private RaftClientReply replyOf(RaftClientRequest request) {
             return RaftClientReply.newBuilder()
                     .setRequest(request)
                     .setSuccess()
@@ -1179,15 +1184,9 @@ public class TestRaftMetadataClient {
                     .build();
         }
 
-        /** The thread of the second and later polls, once one has started. */
-        synchronized Optional<Thread> parkedPollingThread() {
-            return polls.get() >= 2 && pollingThread != null
-                    ? Optional.of(pollingThread)
-                    : Optional.empty();
-        }
-
-        void release() {
-            release.countDown();
+        @Override
+        public RaftClientReply sendRequest(RaftClientRequest request) {
+            throw new UnsupportedOperationException("This stub speaks async only");
         }
 
         @Override
@@ -1205,6 +1204,13 @@ public class TestRaftMetadataClient {
         public RaftClientReply sendRequest(RaftClientRequest request) throws IOException {
             attempts.incrementAndGet();
             throw new IOException("stub transport failure");
+        }
+
+        @Override
+        public CompletableFuture<RaftClientReply> sendRequestAsync(RaftClientRequest request) {
+            attempts.incrementAndGet();
+            return FutureUtils.completedExceptionally(
+                    new IOException("stub transport failure"));
         }
 
         @Override
