@@ -25,7 +25,28 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
 
-final class LeaseSession implements AutoCloseable {
+/**
+ * A client-side handle keeping one registered lease alive - the ephemeral-record half of the
+ * ZooKeeper session semantics this layer ports. Records written through a session (the {@code
+ * LeaseSession} overloads of {@link RaftMetadataClient#put}/{@code create}) live exactly as long
+ * as the lease does.
+ *
+ * <p>The session renews the lease in a background daemon thread every third of its ttl.
+ * Transient transport trouble is retried, and any renewal landing within one ttl keeps the
+ * lease alive - so a leader failover resolving inside the ttl is transparent. When renewals
+ * stop - the holder crashed, the partition outlasted the ttl, or {@link #close()} ran - the
+ * leader's expiry scheduler deletes every record bound to the lease after the ttl and emits
+ * {@code LEASE_EXPIRE} change events for watchers.
+ *
+ * <p>Lifecycle: obtained from {@link RaftMetadataClient#openLease(Duration)} or its async twin,
+ * never constructed directly. {@link #close()} is idempotent, stops the renewals and detaches
+ * from the client; the bound records then die through the scheduler, at most one ttl later -
+ * closing does not delete them outright. {@link #isAlive()} is the holder's checkpoint: false
+ * after {@link #close()} or once a renewal returned {@code UNKNOWN_LEASE} (the lease expired
+ * underneath and cannot be resurrected). {@link #close()} and {@link #isAlive()} may be called
+ * from any thread.
+ */
+public final class LeaseSession implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(LeaseSession.class);
 
