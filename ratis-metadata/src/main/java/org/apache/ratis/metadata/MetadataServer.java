@@ -88,8 +88,11 @@ public final class MetadataServer implements AutoCloseable {
     private MetadataStateMachine stateMachine;
     private LeaseExpiryScheduler leaseScheduler;
     private RaftMetadataClient client;
+    /** Injected instead of built when the embedder (tests) owns the state machine. */
+    private final MetadataStateMachine injectedStateMachine;
 
     private MetadataServer(Builder builder) {
+        this.injectedStateMachine = builder.stateMachine;
         this.selfId = RaftPeerId.valueOf(builder.selfId);
         this.peers =
                 parseQuorumPeers(
@@ -148,7 +151,10 @@ public final class MetadataServer implements AutoCloseable {
 
         final RaftProperties properties = raftProperties();
 
-        this.stateMachine = new MetadataStateMachine(rocksdbDir);
+        this.stateMachine =
+                injectedStateMachine != null
+                        ? injectedStateMachine
+                        : new MetadataStateMachine(rocksdbDir);
 
         final RaftServer.Builder builder =
                 RaftServer.newBuilder()
@@ -205,6 +211,11 @@ public final class MetadataServer implements AutoCloseable {
     /** The metadata client; null until start() finished. */
     public synchronized RaftMetadataClient getClient() {
         return client;
+    }
+
+    /** The state machine this server applies commands on; null until start(). */
+    public synchronized MetadataStateMachine getStateMachine() {
+        return stateMachine;
     }
 
     /** This member's raft term; a read failure is loud. */
@@ -319,6 +330,7 @@ public final class MetadataServer implements AutoCloseable {
         private long snapshotAutoTriggerThreshold = 400_000L;
         private int snapshotRetentionFileNum = 2;
         private UUID groupId;
+        private MetadataStateMachine stateMachine;
         private java.util.function.Consumer<RaftProperties> propertiesCustomizer;
         /**
          * The concrete port this member binds when its quorum entry carries port 0; probed by
@@ -423,6 +435,16 @@ public final class MetadataServer implements AutoCloseable {
          */
         public Builder setGroupId(UUID groupId) {
             this.groupId = checkNotNull(groupId, "groupId");
+            return this;
+        }
+
+        /**
+         * Injects the state machine instead of building one on the internal {@code rocksdb}
+         * directory - for tests that tune the machine (retention) or query it directly. The
+         * raft server owns its lifecycle from {@link MetadataServer#start()} on.
+         */
+        public Builder setStateMachine(MetadataStateMachine stateMachine) {
+            this.stateMachine = checkNotNull(stateMachine, "stateMachine");
             return this;
         }
 

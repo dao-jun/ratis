@@ -19,7 +19,6 @@ package org.apache.ratis.metadata.util;
 import java.time.Duration;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -28,13 +27,18 @@ public final class TestWait {
 
     private TestWait() {}
 
+    /** A supplier whose evaluation may fail with a checked exception. */
+    public interface ThrowingSupplier<T> {
+        T get() throws Exception;
+    }
+
     /**
      * Waits until the condition holds, polling every millisecond. A condition whose evaluation
      * throws fails the wait with that throwable; a condition never holding fails the test with
      * {@code what}.
      */
     public static void waitUntil(
-            Supplier<Boolean> condition, Duration timeout, String what) {
+            ThrowingSupplier<Boolean> condition, Duration timeout, String what) {
         final long timeoutMs = timeout.toMillis();
         if (timeoutMs <= 0) {
             throw new IllegalArgumentException("The timeout must be positive.");
@@ -66,7 +70,7 @@ public final class TestWait {
      * it; never holding fails the test with {@code what}.
      */
     public static <T> T waitValue(
-            Supplier<Optional<T>> supplier, Duration timeout, String what) {
+            ThrowingSupplier<Optional<T>> supplier, Duration timeout, String what) {
         final AtomicReference<T> result = new AtomicReference<>();
         waitUntil(
                 () -> {
