@@ -16,7 +16,9 @@
  */
 package org.apache.ratis.metadata.client;
 
+import org.apache.ratis.metadata.MetadataCluster;
 import org.apache.ratis.metadata.statemachine.ChangeEvent;
+import org.apache.ratis.metadata.statemachine.MetadataStateMachine;
 import org.apache.ratis.metadata.statemachine.RaftCommand;
 import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.statemachine.RaftResult;
@@ -33,11 +35,14 @@ import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
+import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.retry.RetryPolicy;
 import org.apache.ratis.util.TimeDuration;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -45,20 +50,31 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.Queue;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -69,12 +85,19 @@ import static org.apache.ratis.metadata.util.TestWait.waitValue;
 /**
  * Unit tests of {@link RaftMetadataClient}, {@link LeaseSession} and {@link MetadataWatcher} on
  * hand-written rpc stubs: async-settlement semantics, failure translation and watcher lifecycle
- * without a live quorum.
+ * without a live quorum - plus the cluster-dependent end-to-end suites that run the same surface
+ * against a live in-process quorum via {@link MetadataCluster}.
  */
 public class TestRaftMetadataClient {
 
     private static final String GROUP_UUID = "7e4c1d2a-9b3f-4a58-8c6e-2f1d5a7b9c34";
     private static final Duration OPERATION_TIMEOUT = Duration.ofSeconds(30);
+    private static final long POLL_BUDGET_BYTES = 4 * 1024 * 1024;
+    private static final String SEQUENTIAL_PATH_PATTERN = "/\\w+/task-\\d{10}";
+
+    private static final int FAILOVER_WRITES = 60;
+
+    @TempDir File tempDir;
 
     @Test
     void testAsyncCallEndsWhenTheClientClosesUnderneath() throws Exception {
@@ -293,6 +316,658 @@ public class TestRaftMetadataClient {
     }
 
     // ------------------------------------------------------------------
+    // Cluster tests
+    // ------------------------------------------------------------------
+
+    @Test
+    void testWriteReadRoundtripAndConflictMapping() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                // A creating put requires the parent record (as ZooKeeper's setData fails NoNode).
+                assertEquals("/a", client.create("/a", bytes("dir")));
+
+                assertEquals(1L, client.put("/a/b", bytes("v1")));
+                assertEquals(2L, client.put("/a/b", bytes("v2")));
+                final RaftMetadataClient.MetadataRecord record = client.get("/a/b");
+                assertArrayEquals(bytes("v2"), record.getData());
+                assertEquals(2L, record.getVersion());
+                assertEquals(
+                        0L, record.getLeaseId(), "an unbound record carries no lease");
+
+                assertEquals("/a/c", client.create("/a/c", bytes("c")));
+                assertEquals(
+                        RaftResult.Status.NODE_EXISTS,
+                        expectMetadataFailure(() -> client.create("/a/c", bytes("x"))));
+                assertEquals(
+                        RaftResult.Status.NO_PARENT,
+                        expectMetadataFailure(() -> client.create("/no/parent", bytes("x"))));
+
+                // compare-and-swap: the matching version wins, a stale one loses, 0 means create.
+                assertEquals(3L, client.compareAndPut("/a/b", bytes("v3"), 2L));
+                assertArrayEquals(bytes("v3"), client.get("/a/b").getData());
+                assertEquals(
+                        RaftResult.Status.VERSION_MISMATCH,
+                        expectMetadataFailure(
+                                () -> client.compareAndPut("/a/b", bytes("v4"), 2L)));
+                assertEquals(1L, client.compareAndPut("/a/fresh", bytes("f"), 0L));
+
+                // Zero-padded numbers: lexicographic equals numeric at fixed width, never
+                // colliding.
+                client.create("/seq", bytes("dir"));
+                final String first = client.createSequential("/seq/task-", bytes("1"));
+                final String second = client.createSequential("/seq/task-", bytes("2"));
+                final String third = client.createSequential("/seq/task-", bytes("3"));
+                assertTrue(first.matches(SEQUENTIAL_PATH_PATTERN));
+                assertTrue(
+                        first.compareTo(second) < 0,
+                        "sequential numbers grow monotonically");
+                assertTrue(second.compareTo(third) < 0);
+
+                // listing is a prefix scan in lexicographic order (the prefix record included).
+                assertEquals(
+                        Arrays.asList("/a", "/a/b", "/a/c", "/a/fresh"),
+                        pathsOf(client.list("/a")));
+                assertEquals(
+                        Arrays.asList(first, second, third), pathsOf(client.list("/seq/task-")));
+
+                assertTrue(client.exists("/a/b"));
+                assertFalse(client.exists("/missing"));
+                assertEquals(
+                        RaftResult.Status.NOT_FOUND,
+                        expectMetadataFailure(() -> client.get("/missing")));
+
+                assertEquals(
+                        RaftResult.Status.NOT_FOUND,
+                        expectMetadataFailure(() -> client.delete("/never")));
+                assertEquals(
+                        RaftResult.Status.HAS_CHILDREN,
+                        expectMetadataFailure(() -> client.delete("/a")));
+                assertEquals(
+                        4L,
+                        client.deleteRecursive("/a"),
+                        "the recursive delete removes the subtree and its root record");
+                assertFalse(client.exists("/a"));
+                assertFalse(client.exists("/a/b"));
+
+                client.create("/m", bytes("dir"));
+                final List<RaftResult> applied =
+                        client.multi(
+                                Arrays.asList(
+                                        RaftCommand.put("/m/x", bytes("x"), 0L, 0L),
+                                        RaftCommand.put("/m/y", bytes("y"), 0L, 0L)));
+                assertEquals(2, applied.size());
+                assertEquals(RaftResult.Status.OK, applied.get(0).getStatus());
+                assertEquals(RaftResult.Status.OK, applied.get(1).getStatus());
+                try {
+                    client.multi(
+                            Arrays.asList(
+                                    RaftCommand.put("/m/z", bytes("z"), 0L, 0L),
+                                    RaftCommand.cas("/m/x", bytes("clash"), 99L, 0L, 0L)));
+                    throw new AssertionError("The failing MULTI was expected to throw");
+                } catch (RaftMetadataException e) {
+                    assertEquals(RaftResult.Status.MULTI_FAILED, e.getStatus());
+                    assertEquals(1, e.getFailIndex());
+                    assertEquals(
+                            RaftResult.Status.VERSION_MISMATCH,
+                            e.getFailStatus(),
+                            "/m/x holds version 1, so the stale expected version loses");
+                }
+                assertFalse(
+                        client.exists("/m/z"),
+                        "a failed MULTI applies none of its sub-commands");
+                assertTrue(client.exists("/m/x"));
+
+                assertEquals(5L, client.increment("rounds", 5));
+                assertEquals(3L, client.increment("rounds", -2));
+
+                final RaftMetadataClient.PollResult everything = client.poll(0, POLL_BUDGET_BYTES);
+                assertTrue(
+                        everything.getWatermark() >= client.revision() - 1L,
+                        "the watermark covers every write this test made");
+                assertStrictlyIncreasing(revisionsOf(everything.getRecords()));
+                assertEquals(
+                        1L,
+                        everything.getOldestRetainedRevision(),
+                        "no snapshot was taken, so nothing was collected");
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testAsyncRoundtripAndConcurrentWrites() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                assertEquals("/async", client.createAsync("/async", bytes("dir")).join());
+                assertEquals(1L, client.putAsync("/async/b", bytes("v1")).join());
+                assertEquals(2L, client.putAsync("/async/b", bytes("v2")).join());
+                final RaftMetadataClient.MetadataRecord record =
+                        client.getAsync("/async/b").join();
+                assertArrayEquals(bytes("v2"), record.getData());
+                assertEquals(2L, record.getVersion());
+
+                // Concurrent async writes share one ordered pipeline but apply as separate
+                // entries.
+                client.createAsync("/async/p", bytes("dir")).join();
+                final List<CompletableFuture<Long>> writes = new ArrayList<>();
+                for (int i = 0; i < 10; i++) {
+                    writes.add(client.putAsync("/async/p/" + i, bytes("v" + i)));
+                }
+                CompletableFuture.allOf(writes.toArray(new CompletableFuture[0])).join();
+                for (CompletableFuture<Long> write : writes) {
+                    assertEquals(1L, write.join());
+                }
+
+                final List<String> expected = new ArrayList<>();
+                expected.add("/async");
+                expected.add("/async/b");
+                expected.add("/async/p");
+                for (int i = 0; i < 10; i++) {
+                    expected.add("/async/p/" + i);
+                    assertTrue(client.existsAsync("/async/p/" + i).join());
+                }
+                assertEquals(expected, pathsOf(client.listAsync("/async").join()));
+
+                // The status mapping of the sync surface holds in the async one.
+                final RaftMetadataException conflict =
+                        (RaftMetadataException)
+                                awaitFailureOf(
+                                        client.compareAndPutAsync("/async/b", bytes("v3"), 99L),
+                                        "The stale compare-and-put never completed");
+                assertEquals(RaftResult.Status.VERSION_MISMATCH, conflict.getStatus());
+
+                assertEquals(5L, client.incrementAsync("async-rounds", 5).join());
+                assertEquals(3L, client.incrementAsync("async-rounds", -2).join());
+
+                // The async-opened session is a live session: renewable, and closed with the
+                // client.
+                final LeaseSession asyncLease = client.openLeaseAsync(Duration.ofSeconds(30)).join();
+                assertTrue(
+                        client.renewLeaseAsync(asyncLease.getLeaseId(), Duration.ofSeconds(30))
+                                .join()
+                                > 0);
+
+                final long revisionBefore = client.revisionAsync().join();
+                client.putAsync("/async/watermark", bytes("w")).join();
+                final RaftMetadataClient.PollResult polled =
+                        client.pollAsync(0L, POLL_BUDGET_BYTES).join();
+                assertTrue(
+                        polled.getWatermark() > revisionBefore,
+                        "the async write is committed and applied");
+                assertStrictlyIncreasing(revisionsOf(polled.getRecords()));
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testConcurrentSequentialCreatesAreUnique() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                client.create("/jobs", bytes("dir"));
+
+                final int threads = 4;
+                final int createsPerThread = 25;
+                final ExecutorService pool = Executors.newFixedThreadPool(threads);
+                try {
+                    final List<Future<List<String>>> futures = new ArrayList<>();
+                    for (int t = 0; t < threads; t++) {
+                        futures.add(
+                                pool.submit(
+                                        () -> {
+                                            final List<String> created = new ArrayList<>();
+                                            for (int i = 0; i < createsPerThread; i++) {
+                                                created.add(
+                                                        client.createSequential(
+                                                                "/jobs/task-",
+                                                                bytes("payload-" + i)));
+                                            }
+                                            return created;
+                                        }));
+                    }
+                    final Set<String> unique = new HashSet<>();
+                    for (Future<List<String>> future : futures) {
+                        unique.addAll(
+                                future.get(OPERATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS));
+                    }
+                    assertEquals(
+                            threads * createsPerThread,
+                            unique.size(),
+                            "every concurrent create got its own sequence number");
+                    for (String path : unique) {
+                        assertTrue(path.matches(SEQUENTIAL_PATH_PATTERN));
+                    }
+                    assertEquals(
+                            new ArrayList<>(new TreeSet<>(unique)),
+                            pathsOf(client.list("/jobs/task-")),
+                            "the store lists exactly the acknowledged creates, in order");
+                } finally {
+                    pool.shutdownNow();
+                }
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testListPagesBeyondOneResultCap() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                client.create("/pages", bytes("dir"));
+
+                // one MULTI is capped at RaftCommand.MAX_MULTI_OPS, so seed in batches
+                final List<String> expected = new ArrayList<>();
+                for (int batch = 0; batch < 2; batch++) {
+                    final List<RaftCommand> puts = new ArrayList<>();
+                    for (int i = 0; i < 600; i++) {
+                        final String path =
+                                String.format(Locale.ROOT, "/pages/%04d", batch * 600 + i);
+                        expected.add(path);
+                        puts.add(RaftCommand.put(path, new byte[0], 0L, 1L));
+                    }
+                    client.multi(puts);
+                }
+
+                final RaftMetadataClient.ListPage firstPage =
+                        client.listPage("/pages/", "", 128);
+                assertEquals(expected.subList(0, 128), pathsOf(firstPage.getEntries()));
+                assertTrue(firstPage.hasMore());
+                assertEquals(
+                        expected,
+                        pathsOf(client.list("/pages/")),
+                        "the paging client enumerates the whole prefix");
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testListEnumeratesOnePointInTimeCommand() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                client.create("/pit", bytes("dir"));
+
+                final List<String> expected = new ArrayList<>();
+                for (int batch = 0; batch < 2; batch++) {
+                    final List<RaftCommand> puts = new ArrayList<>();
+                    for (int i = 0; i < 600; i++) {
+                        final String path =
+                                String.format(Locale.ROOT, "/pit/%04d", batch * 600 + i);
+                        expected.add(path);
+                        puts.add(RaftCommand.put(path, new byte[0], 0L, 1L));
+                    }
+                    client.multi(puts);
+                }
+                // Sorts inside what a first 1024-cap page consumes; a resumed later page would
+                // skip it.
+                final String late = "/pit/0500x";
+                final List<String> expectedWithLate = new ArrayList<>(expected);
+                expectedWithLate.add(late);
+                Collections.sort(expectedWithLate);
+
+                // The prototype observed the single LIST request through a forwarding client
+                // rpc; the stock transports admit no such seam, so the same write now races the
+                // enumeration from a second thread and the outcome is asserted directly:
+                // whatever the interleaving, the result is exactly one consistent view.
+                final AtomicReference<Throwable> lateFailure = new AtomicReference<>();
+                final Thread lateWriter =
+                        new Thread(
+                                () -> {
+                                    try {
+                                        client.put(late, bytes("late"));
+                                    } catch (Throwable t) {
+                                        lateFailure.set(t);
+                                    }
+                                },
+                                "late-metadata-writer");
+                lateWriter.start();
+                final List<String> listed = pathsOf(client.list("/pit/"));
+                lateWriter.join(OPERATION_TIMEOUT.toMillis());
+                assertFalse(lateWriter.isAlive());
+                assertNull(lateFailure.get());
+                assertTrue(
+                        expectedWithLate.containsAll(listed),
+                        "the one-command enumeration is exactly one consistent view");
+                assertTrue(
+                        listed.containsAll(expected),
+                        "the enumeration never misses a pre-existing record");
+                assertArrayEquals(bytes("late"), client.get(late).getData());
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testTransparentLeaderFailoverDuringWrites() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                // Cached once up front: leaderId() may return null while an election runs.
+                final RaftPeerId leaderId = cluster.awaitLeader();
+                final int leaderIndex = cluster.indexOf(leaderId);
+                client.create("/fo", bytes("dir"));
+
+                final ConcurrentLinkedQueue<String> created = new ConcurrentLinkedQueue<>();
+                final AtomicReference<Throwable> writerFailure = new AtomicReference<>();
+                final Thread writer =
+                        new Thread(
+                                () -> {
+                                    try {
+                                        for (int i = 0; i < FAILOVER_WRITES; i++) {
+                                            created.add(
+                                                    client.createSequential(
+                                                            "/fo/item-", bytes("item-" + i)));
+                                        }
+                                    } catch (Throwable t) {
+                                        writerFailure.set(t);
+                                    }
+                                },
+                                "failover-writer");
+                writer.start();
+
+                waitUntil(
+                        () -> created.size() >= 5,
+                        OPERATION_TIMEOUT,
+                        "The writer did not start producing through the first leader");
+                final List<RaftPeerId> survivors = cluster.peerIds();
+                survivors.remove(leaderId);
+                cluster.killServer(leaderIndex);
+                cluster.awaitLeader(survivors);
+
+                writer.join(OPERATION_TIMEOUT.toMillis());
+                assertFalse(writer.isAlive(), "the writer completed after the failover");
+                assertNull(
+                        writerFailure.get(),
+                        "no exception may leak: the failover is transparent");
+                assertEquals(FAILOVER_WRITES, created.size());
+                assertEquals(
+                        FAILOVER_WRITES,
+                        new HashSet<>(created).size(),
+                        "no sequential number was handed out twice");
+
+                for (String path : created) {
+                    assertTrue(client.exists(path));
+                }
+                assertEquals(
+                        new ArrayList<>(new TreeSet<>(created)),
+                        pathsOf(client.list("/fo/item-")));
+
+                client.put("/fo/after-failover", bytes("ok"));
+                assertArrayEquals(bytes("ok"), client.get("/fo/after-failover").getData());
+
+                cluster.restartServer(leaderIndex);
+                final MetadataStateMachine rejoined = cluster.stateMachine(leaderIndex);
+                final long targetRevision = client.revision();
+                waitUntil(
+                        () ->
+                                MetadataCluster.directQuery(rejoined, RaftCommand.revision())
+                                                .getRevision()
+                                        >= targetRevision,
+                        OPERATION_TIMEOUT,
+                        "The rejoined node did not catch up to revision " + targetRevision);
+                assertArrayEquals(
+                        bytes("ok"),
+                        MetadataCluster.directQuery(rejoined, RaftCommand.get("/fo/after-failover"))
+                                .getData());
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testLeaseSessionLifecycleFromTheClientView() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                final long ttlMs = TimeUnit.SECONDS.toMillis(30);
+
+                final LeaseSession session = client.openLease(Duration.ofSeconds(30));
+                final long leaseId = session.getLeaseId();
+                final long originalExpireAt = cluster.clock.milliseconds() + ttlMs;
+
+                client.create("/eph", bytes("dir"));
+                assertEquals("/eph/a", client.create("/eph/a", bytes("a"), session));
+                client.put("/eph/b", bytes("b"), session);
+                client.create("/eph/keep", bytes("keep"));
+                assertEquals(leaseId, client.get("/eph/a").getLeaseId());
+
+                for (int round = 1; round <= 4; round++) {
+                    cluster.clock.advanceTime(10, TimeUnit.SECONDS);
+                    final long expectedExpireAt = cluster.clock.milliseconds() + ttlMs;
+                    MetadataCluster.waitThroughTransientFailure(
+                            () -> {
+                                final RaftResult.Lease lease =
+                                        leaseOf(
+                                                adminSendReadOnly(cluster, RaftCommand.leaseList()),
+                                                leaseId);
+                                return lease != null
+                                        && lease.getExpireAtMs() == expectedExpireAt;
+                            },
+                            OPERATION_TIMEOUT,
+                            "round "
+                                    + round
+                                    + ": the session did not renew to "
+                                    + expectedExpireAt);
+                }
+                assertTrue(
+                        cluster.clock.milliseconds() > originalExpireAt,
+                        "the session outlived the lease's original expiry");
+                assertTrue(client.exists("/eph/a"));
+                assertTrue(client.exists("/eph/b"));
+
+                // Past the last expiry plus the clock-domain grace (ttl/3), the scheduler takes
+                // over.
+                session.close();
+                cluster.clock.advanceTime(45, TimeUnit.SECONDS);
+                waitUntil(
+                        () ->
+                                !client.exists("/eph/a")
+                                        && !client.exists("/eph/b")
+                                        && client.exists("/eph/keep"),
+                        OPERATION_TIMEOUT,
+                        "The closed session's lease and ephemeral records were not expired");
+                final RaftPeerId expiringLeader = cluster.awaitLeader(cluster.peerIds());
+                // The harness exposes no per-server scheduler proposal counter; the lease
+                // vanishing from the new leader's listing is the same expiry, observed from the
+                // client side instead of the leader's scheduler metrics.
+                MetadataCluster.waitThroughTransientFailure(
+                        () ->
+                                leaseOf(adminSendReadOnly(cluster, RaftCommand.leaseList()), leaseId)
+                                        == null,
+                        OPERATION_TIMEOUT,
+                        "The leader "
+                                + expiringLeader
+                                + " did not process the expiry of the closed session");
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testLeaseSessionLivenessSurfacesTheLeasesDeath() throws Exception {
+        try (MetadataCluster cluster = newCluster(false)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                final long ttlMs = TimeUnit.SECONDS.toMillis(30);
+                final long now = cluster.clock.milliseconds();
+                // A lease with a ttl long enough that no clock advance of this test can make it
+                // due.
+                final long quietLeaseId = 801L;
+                final long deadLeaseId = 802L;
+                assertEquals(
+                        RaftResult.Status.OK,
+                        adminSend(
+                                        cluster,
+                                        RaftCommand.leaseRegister(
+                                                quietLeaseId, 10 * ttlMs, now + 10 * ttlMs))
+                                .getStatus());
+                assertEquals(
+                        RaftResult.Status.OK,
+                        adminSend(
+                                        cluster,
+                                        RaftCommand.leaseRegister(deadLeaseId, ttlMs, now + ttlMs))
+                                .getStatus());
+
+                final LeaseSession quiet =
+                        new LeaseSession(client, quietLeaseId, 10 * ttlMs, cluster.clock);
+                quiet.start();
+                assertTrue(quiet.isAlive(), "a started session on a live lease is alive");
+                quiet.close();
+                assertFalse(quiet.isAlive(), "closing the session ends its liveness");
+
+                final LeaseSession paused =
+                        new LeaseSession(client, deadLeaseId, ttlMs, cluster.clock);
+                assertFalse(
+                        paused.isAlive(), "a session that was never started is not alive");
+                cluster.clock.advanceTime(45, TimeUnit.SECONDS);
+                MetadataCluster.waitThroughTransientFailure(
+                        () ->
+                                leaseOf(adminSendReadOnly(cluster, RaftCommand.leaseList()), deadLeaseId)
+                                        == null,
+                        OPERATION_TIMEOUT,
+                        "The paused holder's lease was not expired underneath it");
+                paused.start();
+                assertTrue(
+                        paused.isAlive(),
+                        "the session is alive until its renewal is rejected");
+                waitUntil(
+                        () -> !paused.isAlive(),
+                        OPERATION_TIMEOUT,
+                        "The session did not surface its lease's death through isAlive()");
+                paused.close();
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    @Test
+    void testWatcherCheckpointResumeAndNeedSnapshot() throws Exception {
+        try (MetadataCluster cluster = newCluster(true)) {
+            cluster.start();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            try {
+                client.put("/wa", bytes("a"));
+                client.put("/wb", bytes("b"));
+                client.put("/wc", bytes("c"));
+
+                final Recorder liveRecorder = new Recorder();
+                final MetadataWatcher live =
+                        MetadataWatcher.newBuilder(client, liveRecorder)
+                                .setSinceRevision(0)
+                                .setPollInterval(Duration.ofMillis(100))
+                                .build();
+                live.start();
+                waitUntil(
+                        () ->
+                                createsUnder(liveRecorder.deliveredEvents())
+                                        .equals(Arrays.asList("/wa", "/wb", "/wc")),
+                        OPERATION_TIMEOUT,
+                        "The live watcher did not receive the first three writes in order");
+                assertTrue(live.lastDeliveredRevision() > 0L);
+
+                client.put("/wd", bytes("d"));
+                client.put("/we", bytes("e"));
+                waitUntil(
+                        () ->
+                                createsUnder(liveRecorder.deliveredEvents())
+                                        .equals(
+                                                Arrays.asList(
+                                                        "/wa", "/wb", "/wc", "/wd", "/we")),
+                        OPERATION_TIMEOUT,
+                        "The live watcher did not receive the pre-snapshot writes in order");
+
+                // Snapshot + purge: the retention line becomes snapshotIndex + 1, seen via
+                // admin first.
+                final long snapshotIndex = cluster.takeSnapshotOnLeader();
+                final long retentionLine = snapshotIndex + 1;
+                MetadataCluster.waitThroughTransientFailure(
+                        () -> {
+                            final RaftResult probe =
+                                    adminSendReadOnly(
+                                            cluster,
+                                            RaftCommand.pollChanges(0, POLL_BUDGET_BYTES));
+                            return probe.getStatus() == RaftResult.Status.NEED_SNAPSHOT
+                                    && probe.getOldestRetainedRevision() == retentionLine;
+                        },
+                        OPERATION_TIMEOUT,
+                        "The retention line did not advance to " + retentionLine);
+
+                final Recorder resyncRecorder = new Recorder();
+                final MetadataWatcher resync =
+                        MetadataWatcher.newBuilder(client, resyncRecorder)
+                                .setSinceRevision(0)
+                                .setPollInterval(Duration.ofMillis(100))
+                                .build();
+                resync.start();
+                waitUntil(
+                        () ->
+                                resyncRecorder.needSnapshotLine() != null
+                                        && !resync.isRunning(),
+                        OPERATION_TIMEOUT,
+                        "The watcher below the retention line did not stop with NEED_SNAPSHOT");
+                assertEquals(
+                        Long.valueOf(retentionLine), resyncRecorder.needSnapshotLine());
+                assertTrue(
+                        resyncRecorder.deliveredEvents().isEmpty(),
+                        "a watcher below the line delivers nothing before stopping");
+
+                resync.restartFrom(retentionLine - 1);
+                assertTrue(resync.isRunning());
+                client.put("/wf", bytes("f"));
+                waitUntil(
+                        () -> createsUnder(resyncRecorder.deliveredEvents()).contains("/wf"),
+                        OPERATION_TIMEOUT,
+                        "The resumed watcher did not receive the post-resume write");
+                assertTrue(resync.lastDeliveredRevision() > snapshotIndex);
+                assertEquals(
+                        Long.valueOf(retentionLine),
+                        resyncRecorder.needSnapshotLine(),
+                        "resuming at the line does not re-trigger NEED_SNAPSHOT");
+                assertStrictlyIncreasing(revisionsOf(resyncRecorder.deliveredEvents()));
+
+                waitUntil(
+                        () ->
+                                !live.isRunning()
+                                        || createsUnder(liveRecorder.deliveredEvents())
+                                                .contains("/wf"),
+                        OPERATION_TIMEOUT,
+                        "The live watcher neither stopped at the line nor kept streaming");
+                if (live.isRunning()) {
+                    assertTrue(createsUnder(liveRecorder.deliveredEvents()).contains("/wf"));
+                } else {
+                    assertEquals(
+                            Long.valueOf(retentionLine), liveRecorder.needSnapshotLine());
+                }
+                live.close();
+                resync.close();
+            } finally {
+                client.close();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
@@ -354,6 +1029,100 @@ public class TestRaftMetadataClient {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster-suite helpers
+    // ------------------------------------------------------------------
+
+    /** The 3-member in-process cluster on the stock transport, under the suite's group uuid. */
+    private MetadataCluster newCluster(boolean purgeForSnapshot) {
+        return MetadataCluster.newBuilder(tempDir)
+                .setNumServers(3)
+                .setPurgeForSnapshot(purgeForSnapshot)
+                .setGroupUuid(UUID.fromString(GROUP_UUID))
+                .build();
+    }
+
+    private static RaftResult adminSend(MetadataCluster cluster, RaftCommand command)
+            throws IOException {
+        return decodeReply(cluster.adminClient().io().send(toMessage(command)), command);
+    }
+
+    private static RaftResult adminSendReadOnly(MetadataCluster cluster, RaftCommand command)
+            throws IOException {
+        return decodeReply(cluster.adminClient().io().sendReadOnly(toMessage(command)), command);
+    }
+
+    private static RaftResult.Status expectMetadataFailure(Runnable action) {
+        try {
+            action.run();
+        } catch (RaftMetadataException e) {
+            return e.getStatus();
+        }
+        throw new AssertionError("The action was expected to fail with RaftMetadataException");
+    }
+
+    /** The ordered CREATE paths a watcher delivered (all events, in delivery order). */
+    private static List<String> createsUnder(List<ChangeEvent> events) {
+        final List<String> creates = new ArrayList<>();
+        for (ChangeEvent event : events) {
+            for (ChangeEvent.Change change : event.getChanges()) {
+                if (change.getOp() == ChangeEvent.ChangeOp.CREATE && !change.getPath().isEmpty()) {
+                    creates.add(change.getPath());
+                }
+            }
+        }
+        return creates;
+    }
+
+    private static List<String> pathsOf(List<RaftResult.Entry> entries) {
+        final List<String> paths = new ArrayList<>();
+        for (RaftResult.Entry entry : entries) {
+            paths.add(entry.getPath());
+        }
+        return paths;
+    }
+
+    private static List<Long> revisionsOf(List<ChangeEvent> records) {
+        final List<Long> revisions = new ArrayList<>();
+        for (ChangeEvent record : records) {
+            revisions.add(record.getRevision());
+        }
+        return revisions;
+    }
+
+    /** Adjacent revisions must strictly grow: sorted, with no duplicate checkpoint. */
+    private static void assertStrictlyIncreasing(List<Long> values) {
+        for (int i = 1; i < values.size(); i++) {
+            assertTrue(
+                    values.get(i - 1) < values.get(i),
+                    "revisions must be strictly increasing: " + values);
+        }
+    }
+
+    /** The lease entry of the given id, or null when the listing does not contain it. */
+    private static RaftResult.Lease leaseOf(RaftResult listing, long leaseId) {
+        assertEquals(RaftResult.Status.OK, listing.getStatus());
+        for (RaftResult.Lease lease : listing.getLeases()) {
+            if (lease.getLeaseId() == leaseId) {
+                return lease;
+            }
+        }
+        return null;
+    }
+
+    private static RaftResult decodeReply(RaftClientReply reply, RaftCommand command) {
+        final RaftResult result =
+                RaftCommandCodec.decodeResult(reply.getMessage().getContent().toByteArray());
+        assertNotNull(
+                result, "reply of " + command.getOp() + " decodes (op echo must match)");
+        assertEquals(command.getOp(), result.getOp());
+        return result;
+    }
+
+    private static Message toMessage(RaftCommand command) {
+        return Message.valueOf(ByteBuffer.wrap(RaftCommandCodec.encodeCommand(command)));
     }
 
     /** Collects a watcher's stream: every record, plus the retention line if hit. */

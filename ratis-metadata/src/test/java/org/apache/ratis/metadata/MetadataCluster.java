@@ -243,9 +243,24 @@ public final class MetadataCluster implements AutoCloseable {
         return ids;
     }
 
+    /**
+     * The ids of members whose server is still up. Leadership polls must never address a killed
+     * member: grpc fails the connect fast, but a netty connect to a dead endpoint parks in the
+     * client's retry loop for far longer than any election.
+     */
+    public List<RaftPeerId> livePeerIds() {
+        final List<RaftPeerId> ids = new ArrayList<>(numServers);
+        for (int i = 0; i < numServers; i++) {
+            if (servers[i] != null) {
+                ids.add(RaftPeerId.valueOf("n" + i));
+            }
+        }
+        return ids;
+    }
+
     /** Waits for a leader among the live members only (a killed member never gets asked). */
     public RaftPeerId awaitLeader() {
-        return awaitLeader(peerIds());
+        return awaitLeader(livePeerIds());
     }
 
     /** Waits for a leader among the given peers only (dead peers must never be queried). */
@@ -258,7 +273,7 @@ public final class MetadataCluster implements AutoCloseable {
 
     /** The current leader among the live members, or null while an election is in flight. */
     public RaftPeerId leaderId() {
-        return findLeader(peerIds()).orElse(null);
+        return findLeader(livePeerIds()).orElse(null);
     }
 
     private Optional<RaftPeerId> findLeader(List<RaftPeerId> candidates) {
