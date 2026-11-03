@@ -36,6 +36,9 @@ org.apache.ratis.metadata
 │                           NeedSnapshotException (retention line), MetadataTransportException
 ├── lease/                  LeaseExpiryScheduler - the leader proposes one expiry command per
 │                           due lease through submitClientRequestAsync
+├── lock/                   MetadataLock - a mutual-exclusion lock recipe (builder-based): an
+│                           ephemeral record guards the path, waiters follow the change stream,
+│                           and per-acquire tokens fence stale holders
 └── util/                   self-contained helpers (Preconditions, files, clock, threads)
 ```
 
