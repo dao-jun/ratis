@@ -89,7 +89,7 @@ class PendingRequest {
 
   synchronized void setReply(RaftClientReply r) {
     Preconditions.assertTrue(r != null);
-    futureToComplete.complete(r);
+    Preconditions.assertTrue(futureToComplete.complete(r), () -> "PendingRequest already completed: " + this);
   }
 
   TransactionContext setNotLeaderException(NotLeaderException nle, Collection<CommitInfoProto> commitInfos) {

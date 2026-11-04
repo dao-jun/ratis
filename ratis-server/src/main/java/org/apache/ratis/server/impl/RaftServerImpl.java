@@ -982,6 +982,7 @@ class RaftServerImpl implements RaftServer.Division,
       if (pending == null) {
         return getResourceUnavailableReply("add a pending write request", request, cacheEntry, context);
       }
+      cacheEntry.bind(pending.getTermIndex());
     }
     leaderState.notifySenders();
     return pending.getFuture();
@@ -1556,13 +1557,11 @@ class RaftServerImpl implements RaftServer.Division,
   private CompletableFuture<Message> replyPendingRequest(
       ClientInvocationId invocationId, TermIndex termIndex, CompletableFuture<Message> stateMachineFuture) {
     // update the retry cache
-    final CacheEntry cacheEntry = retryCache.getOrCreateEntry(invocationId);
+    final CacheEntry cacheEntry = retryCache.getOrCreateEntry(invocationId, termIndex);
     Objects.requireNonNull(cacheEntry , "cacheEntry == null");
-    if (getInfo().isLeader() && cacheEntry.isCompletedNormally()) {
+    if (getInfo().isLeader() && cacheEntry.getLogIndex() == termIndex.getIndex()
+        && cacheEntry.isCompletedNormally()) {
       LOG.warn("{} retry cache entry of leader should be pending: {}", this, cacheEntry);
-    }
-    if (cacheEntry.isFailed()) {
-      retryCache.refreshEntry(new CacheEntry(cacheEntry.getKey()));
     }
 
     return stateMachineFuture.whenComplete((reply, exception) -> {
@@ -1677,7 +1676,7 @@ class RaftServerImpl implements RaftServer.Division,
       final ClientInvocationId invocationId = ClientInvocationId.valueOf(logEntry.getStateMachineLogEntry());
       final CacheEntry cacheEntry = getRetryCache().getIfPresent(invocationId);
       if (cacheEntry != null) {
-        cacheEntry.failWithReply(newReplyBuilder(invocationId, logEntry.getIndex())
+        cacheEntry.failWithReply(TermIndex.valueOf(logEntry), newReplyBuilder(invocationId, logEntry.getIndex())
             .setException(newNotLeaderException())
             .build());
       }
