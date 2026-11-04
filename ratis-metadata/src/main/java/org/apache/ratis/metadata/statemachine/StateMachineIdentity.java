@@ -34,7 +34,7 @@ final class StateMachineIdentity {
      * Covers the family set, per-family key/value encodings, and default-family markers; bump on
      * any incompatible change - foreign layout versions are refused, not misinterpreted.
      */
-    static final int LAYOUT_VERSION = 1;
+    static final int LAYOUT_VERSION = 2;
 
     /** Default-column-family key of the working database's identity record. */
     static final byte[] DB_KEY = "identity".getBytes(StandardCharsets.UTF_8);

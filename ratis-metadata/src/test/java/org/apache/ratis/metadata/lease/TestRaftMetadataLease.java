@@ -126,7 +126,7 @@ public class TestRaftMetadataLease {
                 final long renewedExpireAt = cluster.clock.milliseconds() + ttlMs;
                 assertEquals(
                         RaftResult.Status.OK,
-                        send(cluster, RaftCommand.leaseRenew(leaseId, renewedExpireAt))
+                        send(cluster, RaftCommand.leaseRenew(leaseId, ttlMs, renewedExpireAt))
                                 .getStatus());
                 final long expectedRenewIndex = renewIndexOf(cluster, leaseId, renewedExpireAt);
                 assertTrue(
@@ -249,10 +249,14 @@ public class TestRaftMetadataLease {
                     RaftResult.Status.OK,
                     send(cluster, RaftCommand.put("/race/protected", bytes("p"), leaseId, start))
                             .getStatus());
-            final long renewedExpireAt = start + TimeUnit.SECONDS.toMillis(60);
+            final long renewTtlMs = TimeUnit.SECONDS.toMillis(60);
+            final long renewedExpireAt = start + renewTtlMs;
             assertEquals(
                     RaftResult.Status.OK,
-                    send(cluster, RaftCommand.leaseRenew(leaseId, renewedExpireAt)).getStatus());
+                    send(
+                                    cluster,
+                                    RaftCommand.leaseRenew(leaseId, renewTtlMs, renewedExpireAt))
+                            .getStatus());
 
             cluster.clock.advanceTime(10, TimeUnit.SECONDS);
             // The source waited for the leader scheduler to complete three further scans and
@@ -271,8 +275,11 @@ public class TestRaftMetadataLease {
                     "the renewed lease is still listed");
             assertEquals(RaftResult.Status.OK, statusOf(cluster, "/race/protected"));
 
-            // side 2: past the renewed expiry plus the ttl/3 grace, the scheduler does propose
-            cluster.clock.advanceTime(55, TimeUnit.SECONDS);
+            // side 2: the renewed TTL is persisted, so its (larger) grace is renewed TTL / 3.
+            cluster.clock.advanceTime(
+                    renewTtlMs + renewTtlMs / 3 - TimeUnit.SECONDS.toMillis(10)
+                            + TimeUnit.SECONDS.toMillis(5),
+                    TimeUnit.MILLISECONDS);
             MetadataCluster.waitThroughTransientFailure(
                     () ->
                             leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null
@@ -312,7 +319,12 @@ public class TestRaftMetadataLease {
                 final long racingRenewExpireAt =
                         cluster.clock.milliseconds() + TimeUnit.SECONDS.toMillis(60);
                 final RaftResult renewal =
-                        send(cluster, RaftCommand.leaseRenew(racingLeaseId, racingRenewExpireAt));
+                        send(
+                                cluster,
+                                RaftCommand.leaseRenew(
+                                        racingLeaseId,
+                                        TimeUnit.SECONDS.toMillis(60),
+                                        racingRenewExpireAt));
 
                 if (renewal.getStatus() == RaftResult.Status.OK) {
                     // the in-flight pre-renew expiry proposal now loses its renew-index guard
@@ -337,6 +349,7 @@ public class TestRaftMetadataLease {
                                             cluster,
                                             RaftCommand.leaseRenew(
                                                     racingLeaseId,
+                                                    TimeUnit.SECONDS.toMillis(60),
                                                     cluster.clock.milliseconds()
                                                             + TimeUnit.SECONDS.toMillis(60)))
                                     .getStatus(),
@@ -366,6 +379,7 @@ public class TestRaftMetadataLease {
                                             cluster,
                                             RaftCommand.leaseRenew(
                                                     racingLeaseId,
+                                                    TimeUnit.SECONDS.toMillis(60),
                                                     cluster.clock.milliseconds()
                                                             + TimeUnit.SECONDS.toMillis(60)))
                                     .getStatus(),
@@ -447,7 +461,10 @@ public class TestRaftMetadataLease {
             final long liveRenewExpireAt = cluster.clock.milliseconds() + 2 * ttlMs;
             assertEquals(
                     RaftResult.Status.OK,
-                    send(cluster, RaftCommand.leaseRenew(liveLeaseId, liveRenewExpireAt))
+                    send(
+                                    cluster,
+                                    RaftCommand.leaseRenew(
+                                            liveLeaseId, 2 * ttlMs, liveRenewExpireAt))
                             .getStatus(),
                     "the live session renews through the new leader");
             final List<Mutation> expectedTail = new ArrayList<>();
@@ -698,6 +715,72 @@ public class TestRaftMetadataLease {
             final RaftResult after = sendReadOnly(cluster, RaftCommand.leaseList(1L, 1024L));
             assertEquals(1023, after.getLeases().size());
             assertNull(leaseOf(after, shadowedLeaseId));
+        }
+    }
+
+    /**
+     * Server-side expiry decisions use only the replicated leader time sample, never the
+     * proposer's stamps: a MULTI registering two leases with deliberately wrong proposer expiries
+     * (one ancient, one far future) stores ONE shared expiry - the leader's own sample plus the
+     * ttl - and after that sample lapses both leases cascade, each deleting only its own records.
+     */
+    @Test
+    void testMultiRegisteredLeasesExpireByTheReplicatedLeaderSampleNotProposerStamps()
+            throws Exception {
+        try (MetadataCluster cluster = newCluster()) {
+            cluster.start();
+            final long leaseA = 9101L;
+            final long leaseB = 9102L;
+            final long ttlMs = TimeUnit.SECONDS.toMillis(5);
+
+            final long before = cluster.clock.milliseconds();
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.put("/mx", bytes(""), 0L, before)).getStatus());
+            final List<RaftCommand> batch =
+                    Arrays.asList(
+                            // proposer expiries are garbage on purpose: the leader must overwrite
+                            RaftCommand.leaseRegister(leaseA, ttlMs, 0L),
+                            RaftCommand.leaseRegister(leaseB, ttlMs, Long.MAX_VALUE / 2),
+                            RaftCommand.put("/mx/a", bytes("a"), leaseA, before),
+                            RaftCommand.put("/mx/b", bytes("b"), leaseB, before),
+                            RaftCommand.put("/mx/keep", bytes("k"), 0L, before));
+            assertEquals(
+                    RaftResult.Status.OK, send(cluster, RaftCommand.multi(batch)).getStatus());
+            final long after = cluster.clock.milliseconds();
+
+            final RaftResult.Lease first =
+                    leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseA);
+            final RaftResult.Lease second =
+                    leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseB);
+            assertNotNull(first, "lease A is listed");
+            assertNotNull(second, "lease B is listed");
+            assertEquals(
+                    first.getExpireAtMs(),
+                    second.getExpireAtMs(),
+                    "MULTI children share the single replicated leader time sample");
+            assertTrue(
+                    first.getExpireAtMs() >= before + ttlMs
+                            && first.getExpireAtMs() <= after + ttlMs,
+                    "the stored expiry is the leader sample plus the ttl, not either proposer"
+                            + " stamp (got " + first.getExpireAtMs() + ")");
+            assertEquals(RaftResult.Status.OK, statusOf(cluster, "/mx/a"));
+            assertEquals(RaftResult.Status.OK, statusOf(cluster, "/mx/b"));
+
+            // Past the replicated expiry plus the grace, the leader expires both leases; the
+            // cascade of each deletes only its own bound record.
+            cluster.clock.advanceTime(
+                    ttlMs + ttlMs / 3 + TimeUnit.SECONDS.toMillis(2), TimeUnit.MILLISECONDS);
+            MetadataCluster.waitThroughTransientFailure(
+                    () ->
+                            leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseA) == null
+                                    && leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseB)
+                                            == null
+                                    && statusOf(cluster, "/mx/a") == RaftResult.Status.NOT_FOUND
+                                    && statusOf(cluster, "/mx/b") == RaftResult.Status.NOT_FOUND
+                                    && statusOf(cluster, "/mx/keep") == RaftResult.Status.OK,
+                    OPERATION_TIMEOUT,
+                    "The leases did not expire by the replicated sample and cascade per lease");
         }
     }
 

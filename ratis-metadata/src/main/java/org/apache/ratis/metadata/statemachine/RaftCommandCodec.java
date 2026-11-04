@@ -26,7 +26,7 @@ import java.util.List;
 public final class RaftCommandCodec {
 
     /** The format version every payload starts with; any other version is malformed. */
-    public static final int CURRENT_FORMAT_VERSION = 1;
+    public static final int CURRENT_FORMAT_VERSION = 2;
 
     /** Default cap of LIST results when the command passes 0. */
     public static final long DEFAULT_MAX_LIST_RESULTS = 1024;
@@ -97,6 +97,7 @@ public final class RaftCommandCodec {
                 break;
             case LEASE_RENEW:
                 out.writeVarlong(command.getLeaseId());
+                out.writeVarlong(command.getTtlMs());
                 out.writeVarlong(command.getExpireAtMs());
                 break;
             case LEASE_EXPIRE:
@@ -199,7 +200,9 @@ public final class RaftCommandCodec {
                         .ttlMs(in.readVarlong())
                         .expireAtMs(in.readVarlong());
             case LEASE_RENEW:
-                return command.leaseId(in.readVarlong()).expireAtMs(in.readVarlong());
+                return command.leaseId(in.readVarlong())
+                        .ttlMs(in.readVarlong())
+                        .expireAtMs(in.readVarlong());
             case LEASE_EXPIRE:
                 return command.leaseId(in.readVarlong()).expectedLastRenewIndex(in.readZigzag());
             case GET:

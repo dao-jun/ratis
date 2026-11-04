@@ -48,9 +48,12 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  * contender loops - open a lease, create the lock record bound to it, and on {@code NODE_EXISTS}
  * wait for the record's {@code DELETE} change (a watchdog tick re-attempts regardless, so a
  * missed event can never wedge a waiter). A contender whose own lease expired underneath
- * ({@code UNKNOWN_LEASE} from the create) reopens one and keeps waiting. Releasing deletes the
- * record for a prompt handover; a crashed holder's record is deleted by the leader's expiry
- * scheduler within roughly one ttl.
+ * ({@code UNKNOWN_LEASE} from the create) reopens one and keeps waiting. Releasing - and every
+ * acquire-failure unwind - stops the contender's renewals and revokes its private lease: the
+ * server's lease-checked expiry cascade deletes the lock record for a prompt handover, and only
+ * ever records bound to that lease, so a late release by an expired holder can never delete a
+ * new holder's record at the same path; a crashed holder's record is deleted by the leader's
+ * expiry scheduler within roughly one ttl.
  *
  * <p>{@link Hold#getToken()} is a fencing token: after each successful create the lock bumps a
  * counter named after the lock path, so tokens are strictly increasing across holders. External
@@ -85,10 +88,6 @@ public final class MetadataLock implements AutoCloseable {
     private boolean stopped;
     /** True while parked on the change stream; a wake or the watchdog un-parks an attempt. */
     private boolean waiting;
-    /** True once this contender's create committed; only then may the undo delete the record. */
-    private boolean held;
-    /** True while a create may have committed without its outcome being known. */
-    private boolean ambiguous;
     private LeaseSession session;
     private MetadataWatcher watcher;
     private ScheduledFuture<?> watchdog;
@@ -158,8 +157,9 @@ public final class MetadataLock implements AutoCloseable {
 
     /**
      * Acquires the lock with a deadline; on expiry the future completes with {@link
-     * TimeoutException} and the contender unwinds - a create that committed anyway is undone, so
-     * a timed-out contender never leaks the lock.
+     * TimeoutException} and the contender unwinds by revoking its private lease - a create that
+     * committed anyway is swept by the lease's expiry cascade, so a timed-out contender never
+     * leaks the lock and never touches another holder's record.
      */
     public CompletableFuture<Hold> acquireAsync(Duration timeout) {
         if (timeout != null) {
@@ -355,14 +355,19 @@ public final class MetadataLock implements AutoCloseable {
                                 fail(unwrap(failure));
                                 return;
                             }
+                            final boolean settleWon;
                             synchronized (state) {
-                                if (settled()) {
-                                    // The winner of the settle owns the cleanup; this lease just
-                                    // opened and belongs to no one - close it here.
-                                    opened.close();
-                                    return;
+                                settleWon = settled();
+                                if (!settleWon) {
+                                    session = opened;
                                 }
-                                session = opened;
+                            }
+                            if (settleWon) {
+                                // The winner of the settle owns the cleanup; this lease just
+                                // opened and belongs to no one - retire it here, outside the
+                                // state lock like every other cleanup.
+                                retireLeaseOf(opened);
+                                return;
                             }
                             tryCreate(opened);
                         });
@@ -373,7 +378,6 @@ public final class MetadataLock implements AutoCloseable {
             if (settled()) {
                 return;
             }
-            ambiguous = true;
         }
         client.createAsync(path, EMPTY, current)
                 .whenComplete(
@@ -383,11 +387,9 @@ public final class MetadataLock implements AutoCloseable {
     private void onCreateOutcome(LeaseSession current, Throwable failure) {
         if (failure == null) {
             synchronized (state) {
-                ambiguous = false;
-                held = true;
                 if (settled()) {
-                    // The settle path saw the create in flight and issued its undo; the client's
-                    // ordered pipeline runs that delete after this committed create.
+                    // The settle path saw the create in flight and already retired this lease;
+                    // the client's ordered pipeline runs that revocation after this create.
                     return;
                 }
             }
@@ -396,7 +398,6 @@ public final class MetadataLock implements AutoCloseable {
         }
         if (isRejectionOf(failure, RaftResult.Status.NODE_EXISTS)) {
             synchronized (state) {
-                ambiguous = false;
                 if (settled()) {
                     return;
                 }
@@ -409,28 +410,21 @@ public final class MetadataLock implements AutoCloseable {
         }
         if (isRejectionOf(failure, RaftResult.Status.UNKNOWN_LEASE)) {
             // The contender's own lease died (a partition outlasted the ttl); a new one keeps it
-            // in the race. This create was rejected, not committed: nothing to undo.
+            // in the race. This create was rejected, not committed - but the dead lease may still
+            // own records from an earlier attempt, so retire it rather than just stop renewing.
             synchronized (state) {
-                ambiguous = false;
                 if (settled()) {
                     return;
                 }
                 session = null;
             }
-            current.close();
+            retireLeaseOf(current);
             AsyncDriver.schedule(this::attempt, 0);
             return;
         }
-        if (!(failure instanceof RaftMetadataException)) {
-            // Transport trouble or a closed client: the create's outcome is unknown - leave
-            // {@code ambiguous} set so the undo covers a create that committed anyway.
-            fail(failure);
-            return;
-        }
-        synchronized (state) {
-            // A definitive rejection: this contender's create never committed, nothing to undo.
-            ambiguous = false;
-        }
+        // A definitive rejection (this contender's create never committed) or transport trouble
+        // (its outcome is unknown, and a create may have committed anyway): either way the
+        // revocation of this contender's own lease is the complete, ownership-safe unwind.
         fail(failure);
     }
 
@@ -493,13 +487,14 @@ public final class MetadataLock implements AutoCloseable {
 
     /**
      * Settles the acquire with {@code failure} and unwinds it, unless it already settled - the
-     * first settler owns the unwind. The undo delete runs only when this contender created the
-     * record or a create's outcome is unknown: a waiting contender must leave the holder's
-     * record alone.
+     * first settler owns the unwind. The unwind retires this contender's own private lease
+     * whether or not its create committed: the lease-checked expiry cascade removes exactly the
+     * records bound to that lease, so a waiting contender (whose lease owns no record) disturbs
+     * nothing, while a contender whose create may have committed frees it - and no one else's
+     * record at the same path can ever be touched.
      */
     private void fail(Throwable failure) {
-        final boolean undo;
-        final LeaseSession toClose;
+        final LeaseSession toRetire;
         final MetadataWatcher watcherToClose;
         synchronized (state) {
             if (pending == null || !pending.completeExceptionally(failure)) {
@@ -515,37 +510,43 @@ public final class MetadataLock implements AutoCloseable {
                 timeoutTask.cancel(false);
                 timeoutTask = null;
             }
-            undo = held || ambiguous;
-            toClose = session;
+            toRetire = session;
             session = null;
             watcherToClose = watcher;
             watcher = null;
         }
-        if (undo) {
-            undoRecord();
-        }
-        if (toClose != null) {
-            toClose.close();
-        }
         if (watcherToClose != null) {
             watcherToClose.close();
         }
+        retireLeaseOf(toRetire);
     }
 
-    /** The best-effort record undo of a failed or overtaken acquire; failures only log. */
-    private void undoRecord() {
-        client.deleteAsync(path)
+    /**
+     * The one cleanup this recipe knows: stop the session's renewals, then revoke its lease
+     * through the ordered pipeline - never a delete of the lock path, which cannot tell whose
+     * record sits at it. A create of this lease issued earlier in the same pipeline is
+     * guaranteed to apply before the revocation, so the cascade covers a create that committed
+     * anyway; a create of any OTHER holder is bound to a different lease and survives.
+     */
+    private void retireLeaseOf(LeaseSession session) {
+        if (session == null) {
+            return;
+        }
+        session.close();
+        final long leaseId = session.getLeaseId();
+        client.revokeLeaseAsync(leaseId)
                 .whenComplete(
                         (ignored, failure) -> {
                             if (failure == null) {
                                 return;
                             }
-                            if (isRejectionOf(unwrap(failure), RaftResult.Status.NOT_FOUND)) {
-                                return;
-                            }
+                            // The renewals are already stopped, so the leader's scheduler frees
+                            // whatever the revocation could not within one ttl. A path delete is
+                            // never the fallback - it would be ownership-unsafe.
                             LOG.warn(
-                                    "Undoing the lock record {} failed; the closed lease frees"
-                                            + " it within one ttl",
+                                    "Revoking lease {} of {} failed; the stopped renewals free"
+                                            + " its records within one ttl",
+                                    leaseId,
                                     path,
                                     unwrap(failure));
                         });
@@ -573,9 +574,11 @@ public final class MetadataLock implements AutoCloseable {
         boolean isHeld();
 
         /**
-         * Releases the lock: deletes the record for a prompt handover and stops the renewals -
-         * idempotent, never throws. A delete that cannot reach the cluster falls back to the
-         * crash-release path (the record dies within one ttl).
+         * Releases the lock: stops the renewals and revokes the holder's private lease, whose
+         * expiry cascade deletes the lock record for a prompt handover - idempotent, never
+         * throws. A revocation that cannot reach the cluster falls back to the crash-release
+         * path (the record dies within one ttl); it never falls back to a path delete, which
+         * could remove a later holder's record at the same path.
          */
         void release();
 
@@ -613,22 +616,10 @@ public final class MetadataLock implements AutoCloseable {
                 }
                 released = true;
             }
-            client.deleteAsync(path)
-                    .whenComplete(
-                            (ignored, failure) -> {
-                                if (failure == null) {
-                                    return;
-                                }
-                                if (isRejectionOf(unwrap(failure), RaftResult.Status.NOT_FOUND)) {
-                                    return;
-                                }
-                                LOG.warn(
-                                        "Releasing {} did not reach the cluster; the lease frees it"
-                                                + " within one ttl",
-                                        path,
-                                        unwrap(failure));
-                            });
-            session.close();
+            // The revocation is scoped to this holder's lease, so it deletes exactly this
+            // holder's record - even if the release races a new holder at the same path, or a
+            // partition outlasted the ttl and the lease already died underneath.
+            retireLeaseOf(session);
         }
 
         @Override

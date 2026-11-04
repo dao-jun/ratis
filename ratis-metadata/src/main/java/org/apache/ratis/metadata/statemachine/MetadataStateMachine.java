@@ -18,8 +18,11 @@
 package org.apache.ratis.metadata.statemachine;
 
 import org.apache.ratis.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.metadata.util.Clock;
 import org.apache.ratis.metadata.util.FileUtils;
 import org.apache.ratis.metadata.util.IOUtils;
+import org.apache.ratis.metadata.util.SystemClock;
 
 import org.rocksdb.Checkpoint;
 import org.rocksdb.ColumnFamilyDescriptor;
@@ -33,7 +36,10 @@ import org.rocksdb.RocksIterator;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
+import org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto;
+import org.apache.ratis.protocol.ClientInvocationId;
 import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftPeerId;
@@ -58,6 +64,7 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -73,6 +80,8 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.ratis.metadata.util.Preconditions.checkArgument;
+import static org.apache.ratis.metadata.util.Preconditions.checkNotNull;
+import static org.apache.ratis.metadata.util.Preconditions.checkState;
 
 /**
  * The RocksDB-backed metadata state machine: each committed raft log entry is one deterministic
@@ -87,10 +96,11 @@ public class MetadataStateMachine extends BaseStateMachine {
     private static final byte[] LEASES_CF = "leases".getBytes(StandardCharsets.UTF_8);
     private static final byte[] LEASE_PATHS_CF = "lease-paths".getBytes(StandardCharsets.UTF_8);
     private static final byte[] CHANGES_CF = "changes".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] RESULTS_CF = "command-results".getBytes(StandardCharsets.UTF_8);
 
     /** The column families this machine opens, in the order the identity manifest lists them. */
     static final byte[][] COLUMN_FAMILIES = {
-        STATE_CF, COUNTERS_CF, LEASES_CF, LEASE_PATHS_CF, CHANGES_CF
+        STATE_CF, COUNTERS_CF, LEASES_CF, LEASE_PATHS_CF, CHANGES_CF, RESULTS_CF
     };
 
     private static final byte[] APPLIED_REVISION_KEY =
@@ -144,7 +154,18 @@ public class MetadataStateMachine extends BaseStateMachine {
     private ColumnFamilyHandle leasesHandle;
     private ColumnFamilyHandle leasePathsHandle;
     private ColumnFamilyHandle changesHandle;
+    private ColumnFamilyHandle resultsHandle;
     private WriteOptions writeOptions;
+    private InvocationResultStore resultStore;
+
+    /** Narrow test seam immediately before the sole valid-command {@code db.write} call. */
+    @VisibleForTesting
+    interface CommandWriteHook {
+        void beforeWrite() throws RocksDBException;
+    }
+
+    @SuppressWarnings("checkstyle:VisibilityModifier")
+    @VisibleForTesting CommandWriteHook beforeCommandWrite;
 
     /**
      * Guards the database handle: queries hold the read lock for their whole duration (native calls
@@ -180,9 +201,38 @@ public class MetadataStateMachine extends BaseStateMachine {
     @SuppressWarnings("checkstyle:VisibilityModifier")
     @VisibleForTesting Runnable restoreBeforeFirstFile;
 
-    /** Creates a state machine that stores its RocksDB under the given directory. */
+    private Clock clock;
+    private long resultRetentionMillis;
+    private boolean configurationLocked;
+
+    /** Creates a state machine with the system clock and seven-day result retention. */
     public MetadataStateMachine(File dbDir) {
+        this(dbDir, SystemClock.getInstance(), Duration.ofDays(7));
+    }
+
+    /** Creates a state machine with the leader time source and result-retention policy. */
+    public MetadataStateMachine(File dbDir, Clock clock, Duration resultRetention) {
         this.dbDir = dbDir;
+        configureBeforeOpen(clock, resultRetention);
+    }
+
+    /**
+     * Supplies the complete preprocessing configuration before raft opens this machine. Both values
+     * are set together so an injected machine cannot silently retain only part of its builder config.
+     */
+    public final void configureBeforeOpen(Clock clock, Duration resultRetention) {
+        checkState(
+                !configurationLocked,
+                "Metadata state machine configuration is locked after initialization");
+        final Clock validatedClock = checkNotNull(clock, "clock");
+        final Duration validatedRetention = checkNotNull(resultRetention, "resultRetention");
+        final long validatedRetentionMillis = validatedRetention.toMillis();
+        checkArgument(
+                validatedRetentionMillis > 0,
+                "resultRetention must be positive, got %s",
+                validatedRetention);
+        this.clock = validatedClock;
+        this.resultRetentionMillis = validatedRetentionMillis;
     }
 
     // --- Lifecycle ---
@@ -195,6 +245,7 @@ public class MetadataStateMachine extends BaseStateMachine {
     @Override
     public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage raftStorage)
             throws IOException {
+        configurationLocked = true;
         super.initialize(server, groupId, raftStorage);
         storage.init(raftStorage);
         // Drive the LifeCycle ourselves: BaseStateMachine never starts it, yet ratis'
@@ -530,14 +581,16 @@ public class MetadataStateMachine extends BaseStateMachine {
                         .setCreateIfMissing(true)
                         // our column families do not exist on first open and must be created
                         .setCreateMissingColumnFamilies(true)
+                        .setAtomicFlush(true)
                         .setUseFsync(false)
                         .setStatsDumpPeriodSec(0);
         ownedOptions.add(options);
 
         final List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+        final ColumnFamilyOptions defaultCfOptions = new ColumnFamilyOptions();
+        ownedOptions.add(defaultCfOptions);
         descriptors.add(
-                new ColumnFamilyDescriptor(
-                        RocksDB.DEFAULT_COLUMN_FAMILY, new ColumnFamilyOptions()));
+                new ColumnFamilyDescriptor(RocksDB.DEFAULT_COLUMN_FAMILY, defaultCfOptions));
         for (byte[] cfName : COLUMN_FAMILIES) {
             final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
             ownedOptions.add(cfOptions);
@@ -556,10 +609,12 @@ public class MetadataStateMachine extends BaseStateMachine {
         leasesHandle = handles.get(3);
         leasePathsHandle = handles.get(4);
         changesHandle = handles.get(5);
+        resultsHandle = handles.get(6);
 
         // The raft log is the WAL; the RocksDB WAL buys nothing (batches survive process death at
         // memtable granularity, not power loss).
         writeOptions = new WriteOptions().setDisableWAL(true);
+        resultStore = new InvocationResultStore(db, defaultHandle, resultsHandle);
 
         try {
             final byte[] marker = db.get(defaultHandle, APPLIED_REVISION_KEY);
@@ -580,23 +635,26 @@ public class MetadataStateMachine extends BaseStateMachine {
     }
 
     private void closeDb() {
-        // Close in ownership order, best-effort: one failure must not leak the rest.
-        if (db != null) {
-            db.close();
-            db = null;
-        }
+        // Native column-family handles must be released before their owning DB.
         IOUtils.closeQuietly(defaultHandle);
         IOUtils.closeQuietly(stateHandle);
         IOUtils.closeQuietly(countersHandle);
         IOUtils.closeQuietly(leasesHandle);
         IOUtils.closeQuietly(leasePathsHandle);
         IOUtils.closeQuietly(changesHandle);
+        IOUtils.closeQuietly(resultsHandle);
         defaultHandle = null;
         stateHandle = null;
         countersHandle = null;
         leasesHandle = null;
         leasePathsHandle = null;
         changesHandle = null;
+        resultsHandle = null;
+        resultStore = null;
+        if (db != null) {
+            db.close();
+            db = null;
+        }
         IOUtils.closeQuietly(writeOptions);
         writeOptions = null;
         for (AutoCloseable option : ownedOptions) {
@@ -605,30 +663,43 @@ public class MetadataStateMachine extends BaseStateMachine {
         ownedOptions.clear();
     }
 
+    /**
+     * Preprocesses a leader write exactly once. The original request remains the invocation identity;
+     * only the replicated log data becomes an envelope. Expected client-input failures are returned
+     * through the context so the server can complete its retry-cache entry without appending.
+     */
+    @Override
+    public TransactionContext startTransaction(RaftClientRequest request) throws IOException {
+        final TransactionContext.Builder builder =
+                TransactionContext.newBuilder().setStateMachine(this).setClientRequest(request);
+        final byte[] rawCommand = request.getMessage().getContent().toByteArray();
+        final MetadataLogEnvelope envelope;
+        try {
+            envelope = MetadataLogEnvelope.create(rawCommand, clock, resultRetentionMillis);
+        } catch (IllegalArgumentException invalidCommand) {
+            return builder.build().setException(invalidCommand);
+        }
+        builder.setLogData(ByteString.copyFrom(envelope.encode()));
+        return builder.build();
+    }
+
     // --- Apply path (leader and followers, serialized by the ratis applier thread) ---
 
     @Override
     public CompletableFuture<Message> applyTransaction(TransactionContext trx) {
         final LogEntryProto entry = trx.getLogEntry();
-        final long revision = entry.getIndex();
+        final TermIndex candidate = TermIndex.valueOf(entry);
         // Only state machine entries reach here; config entries arrive as notifyTermIndexUpdated.
-        final Applied applied =
-                applyCommittedCommand(
-                        entry.getTerm(),
-                        revision,
-                        entry.getStateMachineLogEntry().getLogData().toByteArray());
-        if (!applied.committed) {
-            writeGapMarker(revision);
-        }
+        final byte[] reply =
+                applyCommittedCommand(candidate, entry.getStateMachineLogEntry());
         // Advance last-applied only after the effects are in RocksDB, and only when it advances:
         // the log may replay entries below a restored snapshot, and the base asserts monotonicity.
-        final TermIndex candidate = TermIndex.valueOf(entry.getTerm(), revision);
         if (candidate.compareTo(getLastAppliedTermIndex()) >= 0) {
             updateLastAppliedTermIndex(candidate);
         }
         // GC after the watermark update so the line never exceeds the just-reported revision.
-        maybeGcChangeRecords(revision);
-        return CompletableFuture.completedFuture(Message.valueOf(ByteBuffer.wrap(applied.reply)));
+        maybeGcChangeRecords(candidate.getIndex());
+        return CompletableFuture.completedFuture(Message.valueOf(ByteBuffer.wrap(reply)));
     }
 
     /** Handles config entries (no command): persists the marker in lockstep with last-applied. */
@@ -640,7 +711,7 @@ public class MetadataStateMachine extends BaseStateMachine {
         super.notifyTermIndexUpdated(term, index);
     }
 
-    /** Advances the marker for a revision with no durable effects (config or rejected command). */
+    /** Advances the marker for a config entry or an invalid committed-entry no-op. */
     private void writeGapMarker(long revision) {
         if (revision <= appliedRevisionMarker) {
             // Replayed entry whose revision is already durable.
@@ -659,61 +730,150 @@ public class MetadataStateMachine extends BaseStateMachine {
         appliedRevisionMarker = revision;
     }
 
-    /** The durable outcome of one applied command: encoded reply and whether it committed. */
-    private static final class Applied {
-        private final byte[] reply;
-        private final boolean committed;
-
-        Applied(byte[] reply, boolean committed) {
-            this.reply = reply;
-            this.committed = committed;
-        }
+    /** Returns the same no-op for an invalid envelope or invocation, including same-entry replay. */
+    private byte[] malformedNoop(long revision) {
+        // This branch is deliberately independent of the marker: invalid old/log data can never
+        // turn into a missing-result replay or a bare-command execution after the marker moves.
+        writeGapMarker(revision);
+        return RaftCommandCodec.encodeResult(
+                RaftResult.error(RaftCommand.Op.UNKNOWN, RaftResult.Status.MALFORMED));
     }
 
-    /** Applies one committed command; protocol failures become error results, storage rethrows. */
-    private Applied applyCommittedCommand(long entryTerm, long revision, byte[] payload) {
-        final RaftCommand command = RaftCommandCodec.decodeCommand(payload);
-        if (command == null || !command.getOp().isWrite()) {
-            // A malformed command is a client bug or log corruption, never a retriable transition.
-            LOG.error("{}: malformed metadata command committed at revision {}", getId(), revision);
-            return new Applied(
-                    RaftCommandCodec.encodeResult(
-                            RaftResult.error(RaftCommand.Op.UNKNOWN, RaftResult.Status.MALFORMED)),
-                    false);
-        }
-        if (command.getWriterTerm() > 0 && command.getWriterTerm() < entryTerm) {
-            // The entry term above the writer's observed term means a newer leader committed this.
-            LOG.warn(
-                    "{}: rejected a term-fenced command at revision {}: writer term {} is behind "
-                            + "the entry term {}",
-                    getId(),
-                    revision,
-                    command.getWriterTerm(),
-                    entryTerm);
-            return new Applied(
-                    RaftCommandCodec.encodeResult(
-                            RaftResult.error(command.getOp(), RaftResult.Status.STALE_TERM)),
-                    false);
-        }
-        if (revision <= appliedRevisionMarker) {
-            // Replayed entry whose effects are already durable here.
-            return new Applied(RaftCommandCodec.encodeResult(RaftResult.ok(command.getOp())), true);
+    /** Applies one committed envelope; protocol failures become durable first results. */
+    private byte[] applyCommittedCommand(
+            TermIndex termIndex, StateMachineLogEntryProto stateEntry) {
+        final long revision = termIndex.getIndex();
+        final MetadataLogEnvelope envelope =
+                MetadataLogEnvelope.decode(stateEntry.getLogData().toByteArray());
+        if (envelope == null) {
+            LOG.error("{}: malformed metadata log envelope committed at revision {}", getId(), revision);
+            return malformedNoop(revision);
         }
 
-        final ApplyEngine engine = new ApplyEngine(revision);
+        final ClientInvocationId invocation;
         try {
-            final RaftResult result = engine.execute(command);
-            if (result.getStatus() == RaftResult.Status.OK) {
-                // Only successful commands commit; a rejected one leaves a gap the marker covers.
-                engine.commit();
-                return new Applied(RaftCommandCodec.encodeResult(result), true);
+            invocation = ClientInvocationId.valueOf(stateEntry);
+        } catch (IllegalStateException invalidInvocation) {
+            LOG.error(
+                    "{}: malformed client invocation committed at revision {}",
+                    getId(),
+                    revision,
+                    invalidInvocation);
+            return malformedNoop(revision);
+        }
+
+        final RaftCommand command = envelope.getCommand();
+        try {
+            // Duplicate selection precedes every new term fence and all business validation.
+            final InvocationResultStore.Disposition disposition =
+                    resultStore.lookup(invocation, termIndex, envelope);
+            if (disposition.getKind()
+                    == InvocationResultStore.Disposition.Kind.RESULT_EXPIRED) {
+                return disposition.getEncodedResult();
             }
-            return new Applied(RaftCommandCodec.encodeResult(result), false);
+            if (disposition.getKind()
+                    == InvocationResultStore.Disposition.Kind.RETURN_RESULT) {
+                final byte[] reply = disposition.getEncodedResult();
+                if (revision > appliedRevisionMarker) {
+                    commitControl(disposition, reply, revision);
+                }
+                return reply;
+            }
+
+            if (!hasValidLeaseExpiries(command, envelope.getServerTimeMillis())) {
+                LOG.error("{}: invalid replicated lease timing at revision {}", getId(), revision);
+                final byte[] reply =
+                        RaftCommandCodec.encodeResult(
+                                RaftResult.error(command.getOp(), RaftResult.Status.MALFORMED));
+                commitControl(disposition, reply, revision);
+                return reply;
+            }
+            if (command.getWriterTerm() > 0 && command.getWriterTerm() < termIndex.getTerm()) {
+                LOG.warn(
+                        "{}: rejected a term-fenced command at revision {}: writer term {} is behind "
+                                + "the entry term {}",
+                        getId(),
+                        revision,
+                        command.getWriterTerm(),
+                        termIndex.getTerm());
+                final byte[] reply =
+                        RaftCommandCodec.encodeResult(
+                                RaftResult.error(command.getOp(), RaftResult.Status.STALE_TERM));
+                commitControl(disposition, reply, revision);
+                return reply;
+            }
+
+            try (ApplyEngine engine = new ApplyEngine(revision)) {
+                final RaftResult result = engine.execute(command);
+                final byte[] reply = RaftCommandCodec.encodeResult(result);
+                if (result.getStatus() == RaftResult.Status.OK) {
+                    engine.stageChanges();
+                    commitCommandBatch(engine.batch, disposition, reply, revision);
+                } else {
+                    // The overlay and every staged business effect are discarded with engine.batch.
+                    commitControl(disposition, reply, revision);
+                }
+                return reply;
+            }
+        } catch (IOException e) {
+            throw new CompletionException(e);
         } catch (RocksDBException e) {
             throw new CompletionException(
                     new IOException("Failed to apply metadata command at revision " + revision, e));
-        } finally {
-            engine.close();
+        }
+    }
+
+    /** Commits a result/cutoff/marker transition without any business writes or change event. */
+    private void commitControl(
+            InvocationResultStore.Disposition disposition, byte[] reply, long revision)
+            throws IOException, RocksDBException {
+        try (WriteBatch control = new WriteBatch()) {
+            commitCommandBatch(control, disposition, reply, revision);
+        }
+    }
+
+    /** The sole commit point for a valid envelope at a new revision. */
+    private void commitCommandBatch(
+            WriteBatch batch,
+            InvocationResultStore.Disposition disposition,
+            byte[] reply,
+            long revision)
+            throws IOException, RocksDBException {
+        resultStore.stageRetention(batch, disposition);
+        resultStore.stageResult(batch, disposition, reply);
+        batch.put(defaultHandle, APPLIED_REVISION_KEY, longToBytes(revision));
+        final CommandWriteHook hook = beforeCommandWrite;
+        if (hook != null) {
+            hook.beforeWrite();
+        }
+        db.write(writeOptions, batch);
+        appliedRevisionMarker = revision;
+    }
+
+    /** Validates every lease expiry against the single replicated leader time sample. */
+    private static boolean hasValidLeaseExpiries(RaftCommand command, long serverTimeMillis) {
+        if (command.getOp() == RaftCommand.Op.MULTI) {
+            if (command.getOps() == null) {
+                return true;
+            }
+            for (RaftCommand child : command.getOps()) {
+                if (!hasValidLeaseExpiries(child, serverTimeMillis)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        if (command.getOp() != RaftCommand.Op.LEASE_REGISTER
+                && command.getOp() != RaftCommand.Op.LEASE_RENEW) {
+            return true;
+        }
+        if (command.getTtlMs() <= 0) {
+            return false;
+        }
+        try {
+            return command.getExpireAtMs() == Math.addExact(serverTimeMillis, command.getTtlMs());
+        } catch (ArithmeticException overflow) {
+            return false;
         }
     }
 
@@ -892,6 +1052,13 @@ public class MetadataStateMachine extends BaseStateMachine {
                 if (!records.isEmpty() && accumulatedBytes + encoded.length > maxBytes) {
                     break;
                 }
+                // The applier may commit between the watermark sample and this live
+                // iterator: records are ordered by revision, so the first one above the
+                // sampled watermark ends this poll cleanly - the record stays in the
+                // family, retrievable by the next poll.
+                if (bytesToLong(iterator.key(), 0) > watermark) {
+                    break;
+                }
                 final ChangeEvent record = RaftCommandCodec.decodeChangeRecord(encoded);
                 if (record == null) {
                     throw new IllegalStateException(
@@ -1035,13 +1202,14 @@ public class MetadataStateMachine extends BaseStateMachine {
     }
 
     private List<ColumnFamilyHandle> allColumnFamilyHandles() {
-        final List<ColumnFamilyHandle> handles = new ArrayList<>(6);
+        final List<ColumnFamilyHandle> handles = new ArrayList<>(7);
         handles.add(defaultHandle);
         handles.add(stateHandle);
         handles.add(countersHandle);
         handles.add(leasesHandle);
         handles.add(leasePathsHandle);
         handles.add(changesHandle);
+        handles.add(resultsHandle);
         return handles;
     }
 
@@ -1271,17 +1439,14 @@ public class MetadataStateMachine extends BaseStateMachine {
             }
         }
 
-        /** Commits all staged writes as one atomic batch; the marker rides in the same write. */
-        void commit() throws RocksDBException {
+        /** Stages this revision's change record; the outer coordinator owns result/marker/commit. */
+        void stageChanges() throws RocksDBException {
             if (!changes.isEmpty()) {
                 batch.put(
                         changesHandle,
                         longToBytes(revision),
                         RaftCommandCodec.encodeChangeRecord(new ChangeEvent(revision, changes)));
             }
-            batch.put(defaultHandle, APPLIED_REVISION_KEY, longToBytes(revision));
-            db.write(writeOptions, batch);
-            appliedRevisionMarker = revision;
         }
 
         // ---- individual write ops ----
@@ -1292,9 +1457,20 @@ public class MetadataStateMachine extends BaseStateMachine {
             if (pathError != null) {
                 return RaftResult.error(command.getOp(), pathError);
             }
+            if (command.getPath().equals("/")) {
+                // The root is never a record, like CREATE and DELETE hold; upserting it is
+                // not allowed.
+                return RaftResult.error(command.getOp(), RaftResult.Status.NOT_ALLOWED);
+            }
             final RaftResult.Status leaseError = checkLeaseExists(command.getLeaseId());
             if (leaseError != null) {
                 return RaftResult.error(command.getOp(), leaseError);
+            }
+            if (command.getLeaseId() != 0 && hasLiveDescendant(command.getPath())) {
+                // An ephemeral record carries no descendants: committed children and ones
+                // staged earlier in this batch (the MULTI overlay) both block the binding -
+                // the symmetric half of checkParent's creation gate.
+                return RaftResult.error(command.getOp(), RaftResult.Status.NOT_ALLOWED);
             }
             final StateRecord existing = getRecord(command.getPath());
             if (existing == null) {
@@ -1375,7 +1551,10 @@ public class MetadataStateMachine extends BaseStateMachine {
                 sequence++;
                 final String candidate =
                         command.getPath() + String.format(Locale.ROOT, "%010d", sequence);
-                if (getRecord(candidate) == null) {
+                // The final candidate, not the validated base, carries the length risk:
+                // validate it before any counter or business-effect staging. An invalid
+                // candidate advances to the next number inside the same bounded loop.
+                if (checkPath(candidate) == null && getRecord(candidate) == null) {
                     finalPath = candidate;
                     break;
                 }
@@ -1551,8 +1730,9 @@ public class MetadataStateMachine extends BaseStateMachine {
                 return RaftResult.error(
                         RaftCommand.Op.LEASE_RENEW, RaftResult.Status.UNKNOWN_LEASE);
             }
+            // Renewal carries the new TTL as well as the normalized absolute expiry.
             final LeaseState renewed =
-                    new LeaseState(lease.ttlMs, command.getExpireAtMs(), revision);
+                    new LeaseState(command.getTtlMs(), command.getExpireAtMs(), revision);
             batch.put(leasesHandle, longToBytes(command.getLeaseId()), renewed.encode());
             leaseOverlay.put(command.getLeaseId(), renewed);
             addChange(ChangeEvent.ChangeOp.LEASE_RENEW, "", longToBytes(command.getLeaseId()));

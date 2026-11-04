@@ -52,7 +52,11 @@ public final class RaftResult {
         /** The path does not satisfy the path syntax. */
         BAD_PATH((byte) 11),
         /** A term-fenced write committed under a higher term; nothing applied. */
-        STALE_TERM((byte) 12);
+        STALE_TERM((byte) 12),
+        /** The retained invocation result is no longer available for this replayed entry. */
+        RESULT_EXPIRED((byte) 13),
+        /** An invocation was replayed with bytes different from its original raw command. */
+        INVOCATION_MISMATCH((byte) 14);
 
         private final byte code;
 
@@ -122,12 +126,12 @@ public final class RaftResult {
             return leaseId;
         }
 
-        /** The registered ttl; renewals extend only the expiry, never this. */
+        /** The latest ttl; each successful renewal stores its new ttl and expiry. */
         public long getTtlMs() {
             return ttlMs;
         }
 
-        /** The proposer-computed absolute expiry timestamp; past due at and after this value. */
+        /** The leader-normalized replicated expiry; past due at and after this value. */
         public long getExpireAtMs() {
             return expireAtMs;
         }

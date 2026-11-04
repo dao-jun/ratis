@@ -74,9 +74,10 @@ Notes:
   remote members need concrete ports.
 - The ratis grpc message cap defaults to 64 MB, ample headroom over the POLL_CHANGES default
   byte budget (4 MB) - no transport tuning needed for the metadata traffic.
-- MetadataServer wires async log flush, no per-commit METADATA log entry, a 5-minute retry
-  cache (outliving the client's retry budget, for exactly-once) and a bounded snapshot
-  lifecycle; see `MetadataServer#raftProperties()`.
+- MetadataServer wires async log flush, no per-commit METADATA log entry, linearizable
+  reads by default (a customizer may deliberately override), a 5-minute memory retry cache
+  fast path over the durable replicated result store, and a bounded snapshot lifecycle; see
+  `MetadataServer#raftProperties()`.
 
 ## Failure contract (summary)
 
@@ -84,6 +85,22 @@ Notes:
 - `NeedSnapshotException` - polled change records were garbage collected; resynchronize.
 - `MetadataTransportException` - the request never went through (retries exhausted, transport
   broke, or the reply was undecodable).
+
+## Write invariants (enforced by the replicated apply)
+
+- The root `/` is never a record: CREATE, DELETE, PUT and CAS all reject it with
+  NOT_ALLOWED. Every rule below lives in the replicated apply, not the client - raw log
+  entries and MULTI children hit the same gates (the client does no path validation).
+- A PUT that would create a missing path is held to CREATE's parent rule (the parent must
+  exist and must not be lease-bound); updating an existing record is ungated by parents.
+- Sequential CREATE validates the final candidate path (base + `%010d`) before any counter
+  or record effect; a candidate that fails validation advances to the next number, and an
+  exhausted range fails NODE_EXISTS with no effects staged.
+- A lease-bound (ephemeral) record can carry no descendants: binding a lease to a path with
+  live descendants is rejected (committed records and same-batch MULTI overlay both count),
+  and creating under a lease-bound parent is rejected symmetrically.
+- POLL_CHANGES returns only records at or below the poll's sampled watermark (the reply's
+  `revision`); a record committed after the sample is left for the next poll to return.
 
 ## Threading model
 
@@ -94,6 +111,20 @@ poll from each completion, and a lock's acquire is an event-driven state machine
 and timeout events) - any number of sessions, watchers or lock contenders costs no extra threads.
 `close()` on a session, watcher or lock never blocks. Listener callbacks run inline on the
 client's small completion executor: keep them short, or hand the watcher an explicit executor.
+
+## Operations
+
+- Startup pairs `rocksdb/` with `raft/`: a kept working database whose raft log is gone is
+  refused, never auto-restored - keep the pair together or rebuild both, an explicit
+  operator decision. A torn working database still heals itself from the newest local
+  snapshot; the raft log replays everything above it.
+- Exactly-once retries hit a five-minute in-memory fast path; the durable, replicated
+  result store (default 7-day retention) is the fallback. Client retry budgets must be
+  finite (`setRetryForever` is rejected), must fit inside every server's result retention,
+  and retries arriving after retention are unsupported (they legitimately re-execute).
+- All components must run the same version: identity manifests (codec and layout versions)
+  reject older working databases, snapshots and log data on sight - there is no rolling
+  downgrade.
 
 ## Tests
 
@@ -116,4 +147,3 @@ and raft-3 in-process groups. Run it from the test classpath:
 java -cp target/test-classes:target/classes:$(cat target/cp.txt) \
     org.apache.ratis.metadata.MetadataBenchmark [--quick] [--csv=<path>]
 ```
-

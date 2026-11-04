@@ -19,9 +19,11 @@ package org.apache.ratis.metadata.statemachine;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.metadata.util.ManualClock;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
-import org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto;
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
@@ -32,14 +34,16 @@ import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.server.storage.StorageImplUtils;
 import org.apache.ratis.statemachine.TransactionContext;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.RocksDBException;
 
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -48,9 +52,11 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Lease-side invariants of {@link MetadataStateMachine} on a standalone, thread-free machine. */
@@ -61,13 +67,33 @@ public class TestMetadataStateMachine {
 
     @TempDir File tempDir;
 
+    private static final class AppliedReply {
+        private final LogEntryProto entry;
+        private final byte[] encoded;
+        private final RaftResult result;
+
+        AppliedReply(LogEntryProto entry, byte[] encoded) {
+            this.entry = entry;
+            this.encoded = encoded;
+            this.result = RaftCommandCodec.decodeResult(encoded);
+            assertNotNull(result, "applied reply decodes");
+        }
+    }
+
     private static final class StandaloneMachine implements AutoCloseable {
 
-        private final RaftServer server;
-        private final MetadataStateMachine stateMachine;
+        private final File dir;
+        private final ManualClock clock = new ManualClock(100_000L);
+        private RaftServer server;
+        private MetadataStateMachine stateMachine;
         private long index;
 
         StandaloneMachine(File dir) throws Exception {
+            this.dir = dir;
+            open();
+        }
+
+        private void open() throws Exception {
             final RaftPeerId selfId = RaftPeerId.valueOf("m0");
             final RaftGroup group =
                     RaftGroup.valueOf(
@@ -80,7 +106,9 @@ public class TestMetadataStateMachine {
             RaftServerConfigKeys.setStorageDir(
                     properties, Collections.singletonList(new File(dir, "raft")));
 
-            stateMachine = new MetadataStateMachine(new File(dir, "meta"));
+            stateMachine =
+                    new MetadataStateMachine(
+                            new File(dir, "meta"), clock, Duration.ofMillis(10_000L));
             server =
                     RaftServer.newBuilder()
                             .setServerId(selfId)
@@ -93,37 +121,75 @@ public class TestMetadataStateMachine {
                     StorageImplUtils.newRaftStorage(
                             new File(dir, "raft"),
                             SizeInBytes.valueOf("0MB"),
-                            RaftStorage.StartupOption.FORMAT,
+                            RaftStorage.StartupOption.RECOVER,
                             null);
-            storage.initialize();
-            stateMachine.initialize(server, group.getGroupId(), storage);
+            try {
+                storage.initialize();
+                stateMachine.initialize(server, group.getGroupId(), storage);
+            } finally {
+                storage.close();
+            }
         }
 
         RaftResult apply(RaftCommand command) throws Exception {
-            final LogEntryProto entry =
-                    LogEntryProto.newBuilder()
-                            .setTerm(1L)
-                            .setIndex(++index)
-                            .setStateMachineLogEntry(
-                                    StateMachineLogEntryProto.newBuilder()
-                                            .setLogData(
-                                                    ByteString.copyFrom(
-                                                            RaftCommandCodec.encodeCommand(
-                                                                    command))))
-                            .build();
-            final Message reply =
-                    stateMachine
-                            .applyTransaction(
-                                    TransactionContext.newBuilder()
-                                            .setStateMachine(stateMachine)
-                                            .setLogEntry(entry)
-                                            .build())
-                            .get(10, TimeUnit.SECONDS);
-            final RaftResult result =
-                    RaftCommandCodec.decodeResult(reply.getContent().toByteArray());
-            assertNotNull(result, "reply of " + command.getOp() + " decodes");
+            final long revision = ++index;
+            final RaftResult result = applyEntry(1L, revision, revision, command).result;
             assertEquals(command.getOp(), result.getOp());
             return result;
+        }
+
+        AppliedReply applyEntry(long term, long revision, long callId, RaftCommand command)
+                throws Exception {
+            return applyContext(prepareEntry(term, revision, callId, command));
+        }
+
+        TransactionContext prepareEntry(
+                long term, long revision, long callId, RaftCommand command) throws Exception {
+            index = Math.max(index, revision);
+            final RaftClientRequest request =
+                    RaftClientRequest.newBuilder()
+                            .setClientId(ClientId.valueOf(UUID.fromString(GROUP_UUID)))
+                            .setServerId(stateMachine.getId())
+                            .setGroupId(stateMachine.getGroupId())
+                            .setCallId(callId)
+                            .setMessage(
+                                    Message.valueOf(
+                                            ByteBuffer.wrap(
+                                                    RaftCommandCodec.encodeCommand(command))))
+                            .setType(RaftClientRequest.writeRequestType())
+                            .build();
+            final TransactionContext context = stateMachine.startTransaction(request);
+            ((TransactionContextImpl) context).initLogEntry(term, revision);
+            return context;
+        }
+
+        AppliedReply replay(AppliedReply original) throws Exception {
+            return applyEntry(original.entry);
+        }
+
+        AppliedReply duplicateAtNewRevision(AppliedReply original, long term, long revision)
+                throws Exception {
+            index = Math.max(index, revision);
+            return applyEntry(
+                    LogEntryProto.newBuilder(original.entry)
+                            .setTerm(term)
+                            .setIndex(revision)
+                            .build());
+        }
+
+        private AppliedReply applyEntry(LogEntryProto entry) throws Exception {
+            return applyContext(
+                    TransactionContext.newBuilder()
+                            .setStateMachine(stateMachine)
+                            .setLogEntry(entry)
+                            .build());
+        }
+
+        private AppliedReply applyContext(TransactionContext context) throws Exception {
+            final Message reply =
+                    stateMachine.applyTransaction(context).get(10, TimeUnit.SECONDS);
+            return new AppliedReply(
+                    context.getLogEntry(), reply.getContent().toByteArray());
         }
 
         RaftResult query(RaftCommand command) {
@@ -137,10 +203,292 @@ public class TestMetadataStateMachine {
             return result;
         }
 
+        void reopen() throws Exception {
+            close();
+            open();
+        }
+
         @Override
         public void close() throws Exception {
-            server.close();
-            stateMachine.close();
+            if (server != null) {
+                server.close();
+                server = null;
+            }
+            if (stateMachine != null) {
+                stateMachine.close();
+                stateMachine = null;
+            }
+        }
+    }
+
+    @Test
+    void testSequentialCreateReplayAfterReopenReturnsOriginalEncodedResult() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(RaftCommand.put("/replay", bytes(""), 0L, 1L)).getStatus());
+            final AppliedReply original =
+                    machine.applyEntry(
+                            1L,
+                            2L,
+                            2L,
+                            RaftCommand.create("/replay/node-", bytes("v"), true, 0L, 1L));
+            assertEquals("/replay/node-0000000001", original.result.getResultPath());
+
+            machine.reopen();
+            final AppliedReply replayed = machine.replay(original);
+
+            assertArrayEquals(original.encoded, replayed.encoded);
+            assertEquals(1, machine.query(RaftCommand.list("/replay/", 0)).getEntries().size());
+        }
+    }
+
+    @Test
+    void testDuplicateIncrementAtNewRevisionReturnsOriginalWithoutSecondEffect() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final AppliedReply original =
+                    machine.applyEntry(1L, 1L, 40L, RaftCommand.increment("replay-counter", 5L));
+
+            final AppliedReply duplicate = machine.duplicateAtNewRevision(original, 1L, 2L);
+
+            assertArrayEquals(original.encoded, duplicate.encoded);
+            assertEquals(
+                    5L,
+                    machine
+                            .applyEntry(1L, 3L, 41L, RaftCommand.increment("replay-counter", 0L))
+                            .result
+                            .getValue());
+        }
+    }
+
+    @Test
+    void testDuplicateSelectionPrecedesHigherEntryTermFence() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final AppliedReply original =
+                    machine.applyEntry(
+                            1L,
+                            1L,
+                            42L,
+                            RaftCommand.multi(
+                                    Collections.singletonList(
+                                            RaftCommand.put(
+                                                    "/duplicate-before-fence", bytes("v"), 0L, 1L)),
+                                    1L));
+            assertEquals(RaftResult.Status.OK, original.result.getStatus());
+            final int changesBefore =
+                    machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().size();
+
+            final AppliedReply duplicate = machine.duplicateAtNewRevision(original, 2L, 2L);
+
+            assertArrayEquals(original.encoded, duplicate.encoded);
+            assertEquals(RaftResult.Status.OK, duplicate.result.getStatus());
+            assertEquals(1L, machine.query(RaftCommand.get("/duplicate-before-fence")).getVersion());
+            assertEquals(
+                    changesBefore,
+                    machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().size(),
+                    "the control-only duplicate emits no business change event");
+        }
+    }
+
+    @Test
+    void testLeaseRenewDuplicatePreservesFirstEmbeddedRevision() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            machine.applyEntry(1L, 1L, 45L, RaftCommand.leaseRegister(45L, 1_000L, 1L));
+            final AppliedReply original =
+                    machine.applyEntry(1L, 2L, 46L, RaftCommand.leaseRenew(45L, 1_000L, 2L));
+            assertEquals(2L, original.result.getRevision());
+
+            final AppliedReply duplicate = machine.duplicateAtNewRevision(original, 1L, 3L);
+
+            assertArrayEquals(original.encoded, duplicate.encoded);
+            assertEquals(2L, duplicate.result.getRevision());
+            assertEquals(
+                    2L,
+                    machine.query(RaftCommand.leaseList()).getLeases().get(0).getLastRenewIndex());
+        }
+    }
+
+    @Test
+    void testFailedMultiReplayAfterReopenReturnsOriginalFailureAndNoPrefix() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final AppliedReply original =
+                    machine.applyEntry(
+                            1L,
+                            1L,
+                            50L,
+                            RaftCommand.multi(
+                                    Arrays.asList(
+                                            RaftCommand.put(
+                                                    "/failed-multi-prefix", bytes("v"), 0L, 1L),
+                                            RaftCommand.delete("/failed-multi-missing", true))));
+            assertEquals(RaftResult.Status.MULTI_FAILED, original.result.getStatus());
+
+            machine.reopen();
+            final AppliedReply replayed = machine.replay(original);
+
+            assertArrayEquals(original.encoded, replayed.encoded);
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/failed-multi-prefix")).getStatus());
+        }
+    }
+
+    @Test
+    void testSuccessfulCommandWriteFailureHasNoVisiblePrefixAndFullRedo() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final TransactionContext context =
+                    machine.prepareEntry(
+                            1L,
+                            1L,
+                            51L,
+                            RaftCommand.put("/write-failure", bytes("v"), 0L, 1L));
+            machine.stateMachine.beforeCommandWrite =
+                    () -> {
+                        throw new RocksDBException("injected before command db.write");
+                    };
+
+            assertThrows(
+                    java.util.concurrent.CompletionException.class,
+                    () -> machine.applyContext(context));
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/write-failure")).getStatus());
+            assertTrue(machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().isEmpty());
+            assertEquals(-1L, machine.query(RaftCommand.revision()).getRevision());
+
+            machine.stateMachine.beforeCommandWrite = null;
+            final AppliedReply redone = machine.applyContext(context);
+            assertEquals(RaftResult.Status.OK, redone.result.getStatus());
+            assertArrayEquals(
+                    bytes("v"), machine.query(RaftCommand.get("/write-failure")).getData());
+            assertEquals(1, machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().size());
+
+            machine.reopen();
+            assertArrayEquals(redone.encoded, machine.replay(redone).encoded);
+        }
+    }
+
+    @Test
+    void testFailedMultiWriteFailureHasNoControlPrefixAndFullRedo() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final TransactionContext context =
+                    machine.prepareEntry(
+                            1L,
+                            1L,
+                            52L,
+                            RaftCommand.multi(
+                                    Arrays.asList(
+                                            RaftCommand.put(
+                                                    "/failed-control-prefix", bytes("v"), 0L, 1L),
+                                            RaftCommand.delete("/failed-control-missing", true))));
+            machine.stateMachine.beforeCommandWrite =
+                    () -> {
+                        throw new RocksDBException("injected before control db.write");
+                    };
+
+            assertThrows(
+                    java.util.concurrent.CompletionException.class,
+                    () -> machine.applyContext(context));
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/failed-control-prefix")).getStatus());
+            assertTrue(machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().isEmpty());
+            assertEquals(-1L, machine.query(RaftCommand.revision()).getRevision());
+
+            machine.stateMachine.beforeCommandWrite = null;
+            final AppliedReply redone = machine.applyContext(context);
+            assertEquals(RaftResult.Status.MULTI_FAILED, redone.result.getStatus());
+            assertEquals(1, redone.result.getFailIndex());
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/failed-control-prefix")).getStatus());
+            assertTrue(machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().isEmpty());
+
+            machine.reopen();
+            assertArrayEquals(redone.encoded, machine.replay(redone).encoded);
+        }
+    }
+
+    @Test
+    void testStaleTermReplayAfterReopenReturnsOriginalFailure() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final AppliedReply original =
+                    machine.applyEntry(
+                            2L,
+                            1L,
+                            60L,
+                            RaftCommand.multi(
+                                    Collections.singletonList(
+                                            RaftCommand.put("/stale-replay", bytes("v"), 0L, 1L)),
+                                    1L));
+            assertEquals(RaftResult.Status.STALE_TERM, original.result.getStatus());
+
+            machine.reopen();
+            final AppliedReply replayed = machine.replay(original);
+
+            assertArrayEquals(original.encoded, replayed.encoded);
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/stale-replay")).getStatus());
+        }
+    }
+
+    @Test
+    void testSameInvocationDifferentDigestDoesNotExecute() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final AppliedReply original =
+                    machine.applyEntry(
+                            1L,
+                            1L,
+                            70L,
+                            RaftCommand.put("/invocation-mismatch", bytes("first"), 0L, 1L));
+
+            final AppliedReply mismatch =
+                    machine.applyEntry(
+                            1L,
+                            2L,
+                            70L,
+                            RaftCommand.put("/invocation-mismatch", bytes("second"), 0L, 2L));
+
+            assertEquals(RaftResult.Status.INVOCATION_MISMATCH, mismatch.result.getStatus());
+            assertEquals(RaftCommand.Op.PUT, mismatch.result.getOp());
+            assertEquals(1L, machine.query(RaftCommand.get("/invocation-mismatch")).getVersion());
+            assertArrayEquals(
+                    bytes("first"), machine.query(RaftCommand.get("/invocation-mismatch")).getData());
+            assertEquals(1L, original.result.getVersion());
+        }
+    }
+
+    @Test
+    void testBusinessRejectionsReplayAfterReopenReturnOriginalFailures() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            machine.applyEntry(
+                    1L, 1L, 80L, RaftCommand.put("/rejected-replay", bytes("v"), 0L, 1L));
+            final AppliedReply nodeExists =
+                    machine.applyEntry(
+                            1L,
+                            2L,
+                            81L,
+                            RaftCommand.create("/rejected-replay", bytes("x"), false, 0L, 1L));
+            final AppliedReply versionMismatch =
+                    machine.applyEntry(
+                            1L,
+                            3L,
+                            82L,
+                            RaftCommand.cas("/rejected-replay", bytes("x"), 99L, 0L, 1L));
+            assertEquals(RaftResult.Status.NODE_EXISTS, nodeExists.result.getStatus());
+            assertEquals(RaftResult.Status.VERSION_MISMATCH, versionMismatch.result.getStatus());
+
+            machine.reopen();
+            final AppliedReply replayedNodeExists = machine.replay(nodeExists);
+            final AppliedReply replayedVersionMismatch = machine.replay(versionMismatch);
+
+            org.junit.jupiter.api.Assertions.assertAll(
+                    () -> assertArrayEquals(nodeExists.encoded, replayedNodeExists.encoded),
+                    () ->
+                            assertArrayEquals(
+                                    versionMismatch.encoded, replayedVersionMismatch.encoded));
+            assertEquals(1L, machine.query(RaftCommand.get("/rejected-replay")).getVersion());
         }
     }
 
@@ -263,7 +611,8 @@ public class TestMetadataStateMachine {
                     "the lease itself is gone");
             assertEquals(
                     RaftResult.Status.UNKNOWN_LEASE,
-                    machine.apply(RaftCommand.leaseRenew(leaseId, now + 2 * TTL_MS)).getStatus());
+                    machine.apply(RaftCommand.leaseRenew(leaseId, TTL_MS, now + 2 * TTL_MS))
+                            .getStatus());
         }
     }
 
@@ -708,6 +1057,133 @@ public class TestMetadataStateMachine {
             assertEquals(
                     RaftResult.Status.NOT_FOUND,
                     machine.query(RaftCommand.get("/")).getStatus());
+        }
+    }
+
+    @Test
+    void testPutAndCasOnTheRootAreNotAllowed() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final long now = 1_000L;
+            assertEquals(
+                    RaftResult.Status.NOT_ALLOWED,
+                    machine.apply(RaftCommand.put("/", bytes("v"), 0L, now)).getStatus(),
+                    "PUT on the root is rejected like CREATE and DELETE");
+            assertEquals(
+                    RaftResult.Status.NOT_ALLOWED,
+                    machine.apply(RaftCommand.cas("/", bytes("v"), 0L, 0L, now)).getStatus(),
+                    "CAS on the root is rejected the same way");
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/")).getStatus(),
+                    "no rejected write left a record at the root");
+            assertTrue(
+                    machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().isEmpty(),
+                    "the rejected root writes staged no change record");
+
+            // a failing MULTI child aborts the batch: the root rejection has no bypass
+            final RaftResult batch =
+                    machine.apply(
+                            RaftCommand.multi(
+                                    Arrays.asList(
+                                            RaftCommand.put("/root-multi", bytes("v"), 0L, now),
+                                            RaftCommand.put("/", bytes("v"), 0L, now))));
+            assertEquals(RaftResult.Status.MULTI_FAILED, batch.getStatus());
+            assertEquals(1, batch.getFailIndex());
+            assertEquals(RaftResult.Status.NOT_ALLOWED, batch.getFailStatus());
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/root-multi")).getStatus(),
+                    "the batch's earlier child was discarded with it");
+        }
+    }
+
+    @Test
+    void testSequentialCreateValidatesTheFinalCandidateBeforeAnyEffect() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final long now = 1_000L;
+            // an 8183-char base: every candidate base + %010d is 8193 chars, past the 8192
+            // bound, so the bounded loop finds no legal candidate and fails terminally
+            final StringBuilder over = new StringBuilder("/seq-over");
+            while (over.length() < 8_183) {
+                over.append('x');
+            }
+            assertEquals(
+                    RaftResult.Status.NODE_EXISTS,
+                    machine.apply(RaftCommand.create(over.toString(), bytes("v"), true, 0L, now))
+                            .getStatus(),
+                    "no legal final candidate exists: the loop's terminal outcome stands");
+            assertTrue(
+                    machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords().isEmpty(),
+                    "no counter write, record or change event was staged for an invalid"
+                            + " candidate");
+
+            // the boundary: an 8182-char base yields exactly the 8192-char maximum
+            final StringBuilder edge = new StringBuilder("/seq-edge");
+            while (edge.length() < 8_182) {
+                edge.append('y');
+            }
+            final RaftResult atEdge =
+                    machine.apply(RaftCommand.create(edge.toString(), bytes("v"), true, 0L, now));
+            assertEquals(RaftResult.Status.OK, atEdge.getStatus());
+            assertEquals(8_192, atEdge.getResultPath().length());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.query(RaftCommand.get(atEdge.getResultPath())).getStatus());
+        }
+    }
+
+    @Test
+    void testLeaseBindingRejectsLiveDescendantsCommittedAndStaged() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final long leaseId = 61L;
+            final long now = 1_000L;
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(RaftCommand.leaseRegister(leaseId, TTL_MS, now + TTL_MS))
+                            .getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(RaftCommand.put("/lb", bytes(""), 0L, now)).getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(RaftCommand.put("/lb/child", bytes("c"), 0L, now)).getStatus());
+
+            // committed descendant: binding would make an ephemeral record carry a child
+            assertEquals(
+                    RaftResult.Status.NOT_ALLOWED,
+                    machine.apply(RaftCommand.put("/lb", bytes("v"), leaseId, now)).getStatus(),
+                    "a lease cannot bind to a path with a live committed descendant");
+            assertEquals(
+                    RaftResult.Status.NOT_ALLOWED,
+                    machine.apply(RaftCommand.cas("/lb", bytes("v"), 1L, leaseId, now))
+                            .getStatus(),
+                    "CAS binds a lease the same way");
+            assertEquals(0L, machine.query(RaftCommand.get("/lb")).getLeaseId());
+
+            // staged descendant: the check must see the MULTI overlay, not just committed state
+            final RaftResult staged =
+                    machine.apply(
+                            RaftCommand.multi(
+                                    Arrays.asList(
+                                            RaftCommand.put("/lb/kid", bytes("k"), 0L, now),
+                                            RaftCommand.put("/lb", bytes("v"), leaseId, now))));
+            assertEquals(RaftResult.Status.MULTI_FAILED, staged.getStatus());
+            assertEquals(1, staged.getFailIndex());
+            assertEquals(RaftResult.Status.NOT_ALLOWED, staged.getFailStatus());
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/lb/kid")).getStatus(),
+                    "the aborted batch left no staged child either");
+
+            // permissive direction: the same batch may delete the descendant, then bind
+            final RaftResult rebound =
+                    machine.apply(
+                            RaftCommand.multi(
+                                    Arrays.asList(
+                                            RaftCommand.delete("/lb/child", false),
+                                            RaftCommand.put("/lb", bytes("v"), leaseId, now))));
+            assertEquals(RaftResult.Status.OK, rebound.getStatus());
+            assertEquals(leaseId, machine.query(RaftCommand.get("/lb")).getLeaseId());
         }
     }
 

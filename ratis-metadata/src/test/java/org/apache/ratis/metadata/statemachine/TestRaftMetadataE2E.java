@@ -17,13 +17,14 @@
 package org.apache.ratis.metadata.statemachine;
 
 import org.apache.ratis.RaftConfigKeys;
+import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.metadata.MetadataCluster;
-import org.apache.ratis.proto.RaftProtos.LogEntryProto;
-import org.apache.ratis.proto.RaftProtos.StateMachineLogEntryProto;
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
@@ -34,7 +35,7 @@ import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.server.storage.StorageImplUtils;
 import org.apache.ratis.statemachine.TransactionContext;
-import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
+import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.AfterAll;
@@ -576,7 +577,7 @@ public class TestRaftMetadataE2E {
 
         assertEquals(
                 RaftResult.Status.UNKNOWN_LEASE,
-                send(RaftCommand.leaseRenew(42L, now + 60000)).getStatus());
+                send(RaftCommand.leaseRenew(42L, 30000L, now + 60000)).getStatus());
         assertFalse(send(RaftCommand.leaseExpire(42L, -1)).isExpired());
 
         final RaftResult poll =
@@ -594,7 +595,8 @@ public class TestRaftMetadataE2E {
         final RaftResult stale = send(RaftCommand.leaseExpire(43L, register43.getRevision() - 1));
         assertFalse(stale.isExpired());
         assertEquals(
-                RaftResult.Status.OK, send(RaftCommand.leaseRenew(43L, now + 60000)).getStatus());
+                RaftResult.Status.OK,
+                send(RaftCommand.leaseRenew(43L, 30000L, now + 60000)).getStatus());
     }
 
     @Test
@@ -645,6 +647,91 @@ public class TestRaftMetadataE2E {
     }
 
     @Test
+    void testFollowerServesReadAfterWriteThroughTheLinearizableDefault() throws Exception {
+        final RaftPeerId leader = awaitLeader(cluster.peerIds());
+        RaftPeerId follower = null;
+        for (RaftPeerId candidate : cluster.peerIds()) {
+            if (!candidate.equals(leader)) {
+                follower = candidate;
+                break;
+            }
+        }
+        assertNotNull(follower, "a three-member group always has a follower");
+
+        assertEquals(RaftResult.Status.OK, send(RaftCommand.put("/linear", NO_DATA, 0, 1L)).getStatus());
+        assertEquals(
+                RaftResult.Status.OK,
+                send(RaftCommand.put("/linear/x", bytes("read-after-write"), 0, 1L)).getStatus());
+
+        // A read addressed to the follower: only the linearizable default (read index)
+        // lets a non-leader answer a read after the client's write committed - a
+        // local-state read would fail NotLeader instead.
+        final RaftClientRequest request =
+                RaftClientRequest.newBuilder()
+                        .setClientId(cluster.adminClient().getId())
+                        .setServerId(follower)
+                        .setGroupId(cluster.groupId())
+                        .setCallId(9_000_001L)
+                        .setMessage(toMessage(RaftCommand.get("/linear/x")))
+                        .setType(RaftClientRequest.readRequestType())
+                        .build();
+        final RaftClientReply reply =
+                cluster.adminClient()
+                        .getClientRpc()
+                        .sendRequestAsyncUnordered(request)
+                        .get(30, TimeUnit.SECONDS);
+        assertTrue(reply.isSuccess(), () -> "the follower read failed: " + reply);
+        final RaftResult read = decodeResult(reply.getMessage().getContent().toByteArray());
+        assertEquals(RaftCommand.Op.GET, read.getOp());
+        assertArrayEquals(bytes("read-after-write"), read.getData());
+    }
+
+    @Test
+    void testRootWritesAreRejectedThroughTheReplicatedApply() throws Exception {
+        // the cluster path: the leader's envelope-serialized write fails the same way
+        assertEquals(
+                RaftResult.Status.NOT_ALLOWED, send(RaftCommand.put("/", NO_DATA, 0, 1L)).getStatus());
+        assertEquals(
+                RaftResult.Status.NOT_ALLOWED,
+                send(RaftCommand.cas("/", bytes("root"), 0, 0, 1L)).getStatus());
+        final RaftResult batch =
+                send(
+                        RaftCommand.multi(
+                                Arrays.asList(
+                                        RaftCommand.put("/root-batch", NO_DATA, 0, 1L),
+                                        RaftCommand.put("/", NO_DATA, 0, 1L))));
+        assertEquals(RaftResult.Status.MULTI_FAILED, batch.getStatus());
+        assertEquals(1, batch.getFailIndex());
+        assertEquals(RaftResult.Status.NOT_ALLOWED, batch.getFailStatus());
+        assertEquals(
+                RaftResult.Status.NOT_FOUND, sendReadOnly(RaftCommand.get("/root-batch")).getStatus());
+
+        // the raw replicated entry: no client-side gate, only the state machine's apply
+        try (Standalone standalone = new Standalone("root-apply")) {
+            final MetadataStateMachine sm = standalone.stateMachine;
+            long index = 0;
+            applyOnStandalone(
+                    sm, 1L, ++index, RaftCommand.put("/", NO_DATA, 0, 1L),
+                    RaftResult.Status.NOT_ALLOWED);
+            applyOnStandalone(
+                    sm, 1L, ++index, RaftCommand.cas("/", bytes("root"), 0, 0, 1L),
+                    RaftResult.Status.NOT_ALLOWED);
+            applyOnStandalone(
+                    sm,
+                    1L,
+                    ++index,
+                    RaftCommand.multi(
+                            Arrays.asList(
+                                    RaftCommand.create("/root-raw/child", NO_DATA, false, 0, 1L, true),
+                                    RaftCommand.put("/", NO_DATA, 0, 1L))),
+                    RaftResult.Status.MULTI_FAILED);
+            assertFalse(
+                    directQuery(sm, RaftCommand.exists("/root-raw/child")).isFound(),
+                    "the aborted raw batch left no prefix behind");
+        }
+    }
+
+    @Test
     void testPollChangesNeedSnapshotErrorPath() throws Exception {
         try {
             // pretend change-record GC moved past 10000 (real GC is gcChangeRecords' retention
@@ -692,6 +779,48 @@ public class TestRaftMetadataE2E {
             final RaftResult tail = directQuery(sm, RaftCommand.pollChanges(head, 1 << 20));
             assertEquals(RaftResult.Status.OK, tail.getStatus());
             assertEquals(Collections.singletonList(head + 1), revisionsOf(tail.getRecords()));
+        }
+    }
+
+    @Test
+    void testPollChangesStopsAtTheFirstRevisionAboveTheSampledWatermark() throws Exception {
+        try (Standalone standalone = new Standalone("poll-watermark")) {
+            final MetadataStateMachine sm = standalone.stateMachine;
+            standalone.apply(RaftCommand.put("/wm-a", bytes("a"), 0, 1L));
+            final long watermark = directQuery(sm, RaftCommand.revision()).getRevision();
+
+            // a commit landing between the watermark sample and the iteration: the live
+            // iterator would still walk into it
+            sm.pollBetweenCheckAndIteration =
+                    () -> {
+                        try {
+                            standalone.apply(RaftCommand.put("/wm-b", bytes("b"), 0, 1L));
+                        } catch (Exception e) {
+                            throw new RuntimeException(e);
+                        }
+                    };
+            final RaftResult raced = directQuery(sm, RaftCommand.pollChanges(0, 1 << 20));
+            sm.pollBetweenCheckAndIteration = null;
+
+            assertEquals(RaftResult.Status.OK, raced.getStatus());
+            assertEquals(watermark, raced.getRevision());
+            for (ChangeEvent record : raced.getRecords()) {
+                assertTrue(
+                        record.getRevision() <= raced.getRevision(),
+                        "record revision "
+                                + record.getRevision()
+                                + " exceeds the sampled watermark "
+                                + raced.getRevision());
+            }
+            assertEquals(
+                    Collections.singletonList(watermark),
+                    revisionsOf(raced.getRecords()),
+                    "the later commit stays parked for the next poll instead of leaking in");
+
+            // ... and the next poll retrieves exactly that parked record
+            final RaftResult next = directQuery(sm, RaftCommand.pollChanges(watermark, 1 << 20));
+            assertEquals(RaftResult.Status.OK, next.getStatus());
+            assertEquals(Collections.singletonList(watermark + 1), revisionsOf(next.getRecords()));
         }
     }
 
@@ -815,33 +944,65 @@ public class TestRaftMetadataE2E {
     }
 
     @Test
-    void testCommittedMalformedPayloadIsNoOpOnEveryReplica() throws Exception {
-        final RaftClientReply reply =
-                cluster
-                        .adminClient()
-                        .io()
-                        .send(
-                                Message.valueOf(
-                                        ByteBuffer.wrap(
-                                                new byte[] {
-                                                    (byte) RaftCommandCodec.CURRENT_FORMAT_VERSION,
-                                                    RaftCommand.Op.PUT.code(),
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    (byte) 0xFF,
-                                                    0x01
-                                                })));
-        final RaftResult malformed =
-                RaftCommandCodec.decodeResult(reply.getMessage().getContent().toByteArray());
-        assertNotNull(malformed);
-        assertEquals(RaftCommand.Op.UNKNOWN, malformed.getOp());
-        assertEquals(RaftResult.Status.MALFORMED, malformed.getStatus());
+    void testInvalidCommandRetryCompletesWithoutLogGrowth() throws Exception {
+        final RaftPeerId leader = awaitLeader(cluster.peerIds());
+        final RaftClientRequest request =
+                RaftClientRequest.newBuilder()
+                        .setClientId(cluster.adminClient().getId())
+                        .setServerId(leader)
+                        .setGroupId(cluster.groupId())
+                        .setCallId(Long.MAX_VALUE - 17L)
+                        .setMessage(Message.valueOf(ByteBuffer.wrap(new byte[] {1, 2, 3})))
+                        .setType(RaftClientRequest.writeRequestType())
+                        .build();
+
+        final long before = leaderLogNextIndex(leader);
+        final Throwable first = invalidRequestFailure(request, "first");
+        final long afterFirst = leaderLogNextIndex(leader);
+        final Throwable retry = invalidRequestFailure(request, "retry");
+        final long afterRetry = leaderLogNextIndex(leader);
+
+        org.junit.jupiter.api.Assertions.assertAll(
+                () -> org.junit.jupiter.api.Assertions.assertNull(first, "first RPC did not reply"),
+                () -> org.junit.jupiter.api.Assertions.assertNull(retry, "retry did not reply"),
+                () -> assertEquals(before, afterFirst, "the first invalid RPC appended a log entry"),
+                () -> assertEquals(before, afterRetry, "the invalid RPC retry appended a log entry"));
+    }
+
+    @Test
+    void testMalformedPayloadIsRejectedBeforeAppendOnEveryReplica() throws Exception {
+        final byte[] malformed = {
+            (byte) RaftCommandCodec.CURRENT_FORMAT_VERSION,
+            RaftCommand.Op.PUT.code(),
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            (byte) 0xFF,
+            0x01
+        };
+        long callId = 0;
+        for (MetadataStateMachine stateMachine : stateMachines()) {
+            final RaftClientRequest request =
+                    RaftClientRequest.newBuilder()
+                            .setClientId(ClientId.valueOf(UUID.fromString(GROUP_UUID)))
+                            .setServerId(stateMachine.getId())
+                            .setGroupId(stateMachine.getGroupId())
+                            .setCallId(++callId)
+                            .setMessage(Message.valueOf(ByteBuffer.wrap(malformed)))
+                            .setType(RaftClientRequest.writeRequestType())
+                            .build();
+            final TransactionContext context = stateMachine.startTransaction(request);
+            assertTrue(
+                    context.getException() instanceof IllegalArgumentException,
+                    "the malformed command must be rejected before its log append");
+            org.junit.jupiter.api.Assertions.assertSame(request, context.getClientRequest());
+            assertNull(context.getLogEntry());
+        }
 
         send(RaftCommand.put("/malformed", NO_DATA, 0, 1L));
         assertEquals(
@@ -905,6 +1066,136 @@ public class TestRaftMetadataE2E {
         }
     }
 
+    @Test
+    void testPostRetentionRetryBoundaryRunsAsNewInvocationAndRestartKeepsGenerations()
+            throws Exception {
+        // Documented unsupported boundary: a retry arriving after the replicated cutoff collected
+        // the first result legitimately re-executes, producing a second business effect. This
+        // test pins that sequence with a controlled restart - it is not SIGKILL or power-loss
+        // coverage.
+        try (MetadataCluster retained =
+                        MetadataCluster.newBuilder(new File(tempDir, "post-retention-boundary"))
+                                .setGroupUuid(UUID.randomUUID())
+                                .setResultRetention(Duration.ofMillis(1_000))
+                                .setRetryCacheExpiry(Duration.ofMillis(500))
+                                .build()) {
+            retained.start();
+            RaftPeerId leader = retained.awaitLeader();
+            // Warm the leader up: an ordered admin write retries internally until the leader is
+            // ready, keeping the raw unordered stream below safe from a LeaderNotReady reply.
+            assertEquals(
+                    RaftResult.Status.OK,
+                    sendOn(retained, RaftCommand.put("/post-retention-warmup", NO_DATA, 0, 1L))
+                            .getStatus());
+            final ClientId clientId = ClientId.valueOf(UUID.randomUUID());
+            final RaftCommand command = RaftCommand.put("/post-retention", bytes("v"), 0, 1L);
+            final RaftClientRequest request =
+                    rawWriteRequest(retained, leader, clientId, 4242L, command);
+
+            final RaftClientReply first = sendRaw(retained, request);
+            final byte[] firstEncoded = first.getMessage().getContent().toByteArray();
+            assertEquals(1L, decodeResult(firstEncoded).getVersion());
+            final long firstIndex = first.getLogIndex();
+
+            Thread.sleep(1_200L); // outlive the memory retry cache
+
+            // Advance the shared clock - the only time source envelopes sample - and commit an
+            // unrelated write: its replicated cutoff passes the first result's retentionTime, so
+            // deterministic GC collects the first-generation record on every replica.
+            retained.clock.advanceTime(Duration.ofMillis(3_000));
+            assertEquals(
+                    RaftResult.Status.OK,
+                    sendOn(
+                                    retained,
+                                    RaftCommand.put("/post-retention/advance", NO_DATA, 0, 1L))
+                            .getStatus());
+
+            final RaftClientReply second = sendRaw(retained, request);
+            final byte[] secondEncoded = second.getMessage().getContent().toByteArray();
+            final long secondIndex = second.getLogIndex();
+            assertTrue(secondIndex > firstIndex, "the boundary retry appended a new entry");
+            assertEquals(
+                    2L,
+                    decodeResult(secondEncoded).getVersion(),
+                    "the collected first generation re-executed: a second business effect");
+
+            // Final cache position: an immediate retry is served from the memory cache at the
+            // newer index without appending anything.
+            final long nextIndexBeforeCacheHit = logNextIndexOf(retained, leader);
+            final RaftClientReply cached = sendRaw(retained, request);
+            assertEquals(secondIndex, cached.getLogIndex(), "the cache holds the newer index");
+            assertArrayEquals(secondEncoded, cached.getMessage().getContent().toByteArray());
+            assertEquals(
+                    nextIndexBeforeCacheHit,
+                    logNextIndexOf(retained, leader),
+                    "the cached retry appended no log entry");
+
+            // Full controlled restart: exactly two business effects survive.
+            for (int i = 0; i < retained.numServers(); i++) {
+                retained.killServer(i);
+            }
+            for (int i = 0; i < retained.numServers(); i++) {
+                retained.restartServer(i);
+            }
+            leader = retained.awaitLeader();
+            final RaftClientReply warmupAfterRestart =
+                    sendOnReply(
+                            retained,
+                            RaftCommand.put(
+                                    "/post-retention-warmup-after-restart", NO_DATA, 0, 1L));
+            assertEquals(
+                    RaftResult.Status.OK,
+                    decodeReply(warmupAfterRestart, RaftCommand.put("/", NO_DATA, 0, 1L))
+                            .getStatus(),
+                    "warm the restarted leader up before the next raw send");
+            assertEquals(
+                    2L,
+                    sendReadOnlyOn(retained, RaftCommand.get("/post-retention")).getVersion(),
+                    "exactly two business effects survive the restart");
+
+            // The restart emptied every memory cache, but the new leader's startup log replay
+            // re-seeds its cache with the replayed entries' replies. Waiting out the expiry
+            // proves the DURABLE store answers: the same retry re-reads generation two's record.
+            Thread.sleep(1_200L);
+            final RaftClientReply third =
+                    sendRaw(retained, rawWriteRequest(retained, leader, clientId, 4242L, command));
+            assertTrue(
+                    third.getLogIndex() > secondIndex,
+                    "thirdIndex="
+                            + third.getLogIndex()
+                            + ", secondIndex="
+                            + secondIndex
+                            + ", warmupAfterRestartIndex="
+                            + warmupAfterRestart.getLogIndex());
+            assertArrayEquals(
+                    secondEncoded,
+                    third.getMessage().getContent().toByteArray(),
+                    "generation two's original encoded reply");
+            assertEquals(
+                    2L,
+                    sendReadOnlyOn(retained, RaftCommand.get("/post-retention")).getVersion(),
+                    "no third business effect");
+
+            // Old- and new-generation replay of the committed entries against the restarted
+            // leader's state machine. This is a synthetic re-apply of the committed indices: a
+            // clean restart never re-applies entries below its durable marker.
+            final MetadataStateMachine leaderMachine =
+                    retained.stateMachine(retained.indexOf(leader));
+            final RaftResult oldGeneration =
+                    decodeResult(
+                            applyCommittedIndex(
+                                    leaderMachine, clientId, 4242L, command, firstIndex));
+            assertEquals(
+                    RaftResult.Status.RESULT_EXPIRED,
+                    oldGeneration.getStatus(),
+                    "the old generation is fenced off by generation two");
+            assertArrayEquals(
+                    secondEncoded,
+                    applyCommittedIndex(leaderMachine, clientId, 4242L, command, secondIndex),
+                    "the current generation replays its original encoded reply");
+        }
+    }
+
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
@@ -912,6 +1203,131 @@ public class TestRaftMetadataE2E {
     private RaftResult send(RaftCommand command) throws IOException {
         final RaftClientReply reply = cluster.adminClient().io().send(toMessage(command));
         return decodeReply(reply, command);
+    }
+
+    /** Returns any failure instead of throwing so the same invocation can always be sent twice. */
+    private Throwable invalidRequestFailure(RaftClientRequest request, String attempt) {
+        final CompletableFuture<RaftClientReply> future =
+                cluster.adminClient().getClientRpc().sendRequestAsyncUnordered(request);
+        try {
+            final RaftClientReply reply = future.get(5, TimeUnit.SECONDS);
+            assertNotNull(reply, attempt + " RPC returned no reply");
+            assertFalse(reply.isSuccess(), attempt + " invalid RPC unexpectedly succeeded");
+            assertTrue(
+                    reply.getException()
+                            instanceof org.apache.ratis.protocol.exceptions.StateMachineException,
+                    attempt + " RPC did not return the state machine input failure: " + reply);
+            return null;
+        } catch (java.util.concurrent.TimeoutException timeout) {
+            future.cancel(true);
+            return timeout;
+        } catch (Exception | AssertionError failure) {
+            return failure;
+        }
+    }
+
+    /** Reads the actual leader log, not the applied state-machine revision. */
+    private long leaderLogNextIndex(RaftPeerId leader) throws Exception {
+        return logNextIndexOf(cluster, leader);
+    }
+
+    /** Reads any live member's raft log next index through the harness server field. */
+    private static long logNextIndexOf(MetadataCluster cluster, RaftPeerId member)
+            throws Exception {
+        final java.lang.reflect.Field field =
+                org.apache.ratis.metadata.MetadataServer.class.getDeclaredField("raftServer");
+        field.setAccessible(true);
+        final RaftServer raftServer =
+                (RaftServer) field.get(cluster.server(cluster.indexOf(member)));
+        final RaftServer.Division division = raftServer.getDivision(cluster.groupId());
+        assertNotNull(division);
+        return division.getRaftLog().getNextIndex();
+    }
+
+    /** A fixed write request: resending it re-uses one ClientInvocationId across attempts. */
+    private static RaftClientRequest rawWriteRequest(
+            MetadataCluster cluster,
+            RaftPeerId server,
+            ClientId clientId,
+            long callId,
+            RaftCommand command) {
+        return RaftClientRequest.newBuilder()
+                .setClientId(clientId)
+                .setServerId(server)
+                .setGroupId(cluster.groupId())
+                .setCallId(callId)
+                .setMessage(
+                        Message.valueOf(
+                                ByteBuffer.wrap(RaftCommandCodec.encodeCommand(command))))
+                .setType(RaftClientRequest.writeRequestType())
+                .build();
+    }
+
+    /**
+     * Sends a fixed raw write request on a fresh admin client and asserts it succeeded. Callers
+     * must warm the addressed leader up with an ordered admin write first: a raw unordered send
+     * has no client-side retry, and a LeaderNotReady reply closes its unordered stream.
+     */
+    private static RaftClientReply sendRaw(MetadataCluster cluster, RaftClientRequest request)
+            throws Exception {
+        try (RaftClient client = cluster.newAdminClient()) {
+            final CompletableFuture<RaftClientReply> future =
+                    client.getClientRpc().sendRequestAsyncUnordered(request);
+            final RaftClientReply reply = future.get(30, TimeUnit.SECONDS);
+            assertNotNull(reply, "the raw write returned no reply");
+            assertTrue(reply.isSuccess(), () -> "the raw write failed: " + reply);
+            return reply;
+        }
+    }
+
+    /** Re-applies one committed index against an open state machine; asserts nothing about raft. */
+    private static byte[] applyCommittedIndex(
+            MetadataStateMachine stateMachine,
+            ClientId clientId,
+            long callId,
+            RaftCommand command,
+            long index)
+            throws Exception {
+        final RaftClientRequest request =
+                RaftClientRequest.newBuilder()
+                        .setClientId(clientId)
+                        .setServerId(stateMachine.getId())
+                        .setGroupId(stateMachine.getGroupId())
+                        .setCallId(callId)
+                        .setMessage(
+                                Message.valueOf(
+                                        ByteBuffer.wrap(
+                                                RaftCommandCodec.encodeCommand(command))))
+                        .setType(RaftClientRequest.writeRequestType())
+                        .build();
+        final TransactionContext context = stateMachine.startTransaction(request);
+        ((TransactionContextImpl) context).initLogEntry(1L, index);
+        return stateMachine.applyTransaction(context)
+                .get(10, TimeUnit.SECONDS)
+                .getContent()
+                .toByteArray();
+    }
+
+    private static RaftResult decodeResult(byte[] encoded) {
+        final RaftResult result = RaftCommandCodec.decodeResult(encoded);
+        assertNotNull(result, "the raw reply decodes");
+        return result;
+    }
+
+    private static RaftResult sendOn(MetadataCluster cluster, RaftCommand command)
+            throws IOException {
+        return decodeReply(cluster.adminClient().io().send(toMessage(command)), command);
+    }
+
+    /** The raw admin-client reply of one ordered write, for tests that need its log index. */
+    private static RaftClientReply sendOnReply(MetadataCluster cluster, RaftCommand command)
+            throws IOException {
+        return cluster.adminClient().io().send(toMessage(command));
+    }
+
+    private static RaftResult sendReadOnlyOn(MetadataCluster cluster, RaftCommand command)
+            throws IOException {
+        return decodeReply(cluster.adminClient().io().sendReadOnly(toMessage(command)), command);
     }
 
     private static final class Standalone implements AutoCloseable {
@@ -968,22 +1384,20 @@ public class TestRaftMetadataE2E {
     private static RaftResult applyOnStandalone(
             MetadataStateMachine sm, long term, long index, RaftCommand command,
             RaftResult.Status expected) throws Exception {
-        final LogEntryProto entry =
-                LogEntryProto.newBuilder()
-                        .setTerm(term)
-                        .setIndex(index)
-                        .setStateMachineLogEntry(
-                                StateMachineLogEntryProto.newBuilder()
-                                        .setLogData(
-                                                ByteString.copyFrom(RaftCommandCodec.encodeCommand(command))))
+        final RaftClientRequest request =
+                RaftClientRequest.newBuilder()
+                        .setClientId(ClientId.valueOf(UUID.fromString(GROUP_UUID)))
+                        .setServerId(sm.getId())
+                        .setGroupId(sm.getGroupId())
+                        .setCallId(index)
+                        .setMessage(
+                                Message.valueOf(
+                                        ByteBuffer.wrap(RaftCommandCodec.encodeCommand(command))))
+                        .setType(RaftClientRequest.writeRequestType())
                         .build();
-        final Message reply =
-                sm.applyTransaction(
-                                TransactionContext.newBuilder()
-                                        .setStateMachine(sm)
-                                        .setLogEntry(entry)
-                                        .build())
-                        .get(10, TimeUnit.SECONDS);
+        final TransactionContext context = sm.startTransaction(request);
+        ((TransactionContextImpl) context).initLogEntry(term, index);
+        final Message reply = sm.applyTransaction(context).get(10, TimeUnit.SECONDS);
         final RaftResult result = RaftCommandCodec.decodeResult(reply.getContent().toByteArray());
         assertNotNull(result, "reply of a fenced " + command.getOp() + " decodes");
         assertEquals(

@@ -248,6 +248,51 @@ public class TestRaftCommandCodec {
     }
 
     @Test
+    void testVersionTwoLeaseRenewRoundTripsTtl() {
+        assertEquals(2, RaftCommandCodec.CURRENT_FORMAT_VERSION);
+
+        final RaftCommand renewed =
+                RaftCommandCodec.decodeCommand(
+                        RaftCommandCodec.encodeCommand(RaftCommand.leaseRenew(11L, 30L, 100L)));
+        assertNotNull(renewed);
+        assertEquals(11L, renewed.getLeaseId());
+        assertEquals(30L, renewed.getTtlMs());
+        assertEquals(100L, renewed.getExpireAtMs());
+
+        final RaftCommand legacyFactory =
+                RaftCommandCodec.decodeCommand(
+                        RaftCommandCodec.encodeCommand(RaftCommand.leaseRenew(11L, 100L)));
+        assertNotNull(legacyFactory);
+        assertEquals(0L, legacyFactory.getTtlMs());
+        assertEquals(100L, legacyFactory.getExpireAtMs());
+    }
+
+    @Test
+    void testVersionOneLeaseRenewWirePayloadIsRejected() {
+        // v1 LEASE_RENEW was [leaseId][expireAt], without the v2 ttl field.
+        assertNull(
+                RaftCommandCodec.decodeCommand(
+                        new byte[] {1, RaftCommand.Op.LEASE_RENEW.code(), 11, 100}));
+    }
+
+    @Test
+    void testNewResultStatusesAppendWithoutRenumbering() {
+        assertEquals(12, RaftResult.Status.STALE_TERM.code());
+        assertEquals(13, RaftResult.Status.RESULT_EXPIRED.code());
+        assertEquals(14, RaftResult.Status.INVOCATION_MISMATCH.code());
+        for (RaftResult.Status status :
+                Arrays.asList(
+                        RaftResult.Status.RESULT_EXPIRED, RaftResult.Status.INVOCATION_MISMATCH)) {
+            final RaftResult decoded =
+                    RaftCommandCodec.decodeResult(
+                            RaftCommandCodec.encodeResult(
+                                    RaftResult.error(RaftCommand.Op.PUT, status)));
+            assertNotNull(decoded);
+            assertEquals(status, decoded.getStatus());
+        }
+    }
+
+    @Test
     void testCommandCodecRoundTrip() {
         final List<RaftCommand> commands =
                 Arrays.asList(

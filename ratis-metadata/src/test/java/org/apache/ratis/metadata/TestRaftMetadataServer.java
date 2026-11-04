@@ -16,15 +16,25 @@
  */
 package org.apache.ratis.metadata;
 
+import org.apache.ratis.metadata.statemachine.MetadataLogEnvelope;
+import org.apache.ratis.metadata.statemachine.MetadataStateMachine;
+import org.apache.ratis.metadata.statemachine.RaftCommand;
+import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.util.FileUtils;
+import org.apache.ratis.metadata.util.ManualClock;
 import org.apache.ratis.metadata.util.SystemClock;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.server.RaftServerConfigKeys;
+import org.apache.ratis.statemachine.TransactionContext;
+import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.util.NetUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -157,6 +167,7 @@ public class TestRaftMetadataServer {
 
         final RaftProperties properties = server.raftProperties();
 
+        assertEquals(Duration.ofDays(7), MetadataServer.DEFAULT_RESULT_RETENTION);
         assertEquals(
                 3, RaftClientConfigKeys.Rpc.requestTimeout(properties).toLong(TimeUnit.SECONDS));
         assertTrue(RaftServerConfigKeys.Snapshot.autoTriggerEnabled(properties));
@@ -166,11 +177,119 @@ public class TestRaftMetadataServer {
         // commit still means majority-fsync with async flush, and no METADATA entry per commit
         assertTrue(RaftServerConfigKeys.Log.asyncFlushEnabled(properties));
         assertFalse(RaftServerConfigKeys.Log.logMetadataEnabled(properties));
-        // the retry cache must outlive the client's total retry window (exactly-once)
+        // a five-minute memory fast path; the durable result store is the fallback
         assertEquals(
                 5,
                 RaftServerConfigKeys.RetryCache.expiryTime(properties)
                         .toLong(TimeUnit.MINUTES));
+    }
+
+    @Test
+    void testReadOptionDefaultsToLinearizableBeforeTheCustomizer() {
+        final MetadataServer plain =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:9126")
+                        .setDataDir(new File(tempDir, "data-default"))
+                        .build();
+        assertEquals(
+                RaftServerConfigKeys.Read.Option.LINEARIZABLE,
+                RaftServerConfigKeys.Read.option(plain.raftProperties()),
+                "reads must default to the read-index path, not local state");
+
+        // the customizer runs after the default, so an embedder may trade the guarantee away
+        final MetadataServer customized =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:9126")
+                        .setDataDir(new File(tempDir, "data-customized"))
+                        .setPropertiesCustomizer(
+                                properties ->
+                                        RaftServerConfigKeys.Read.setOption(
+                                                properties,
+                                                RaftServerConfigKeys.Read.Option.DEFAULT))
+                        .build();
+        assertEquals(
+                RaftServerConfigKeys.Read.Option.DEFAULT,
+                RaftServerConfigKeys.Read.option(customized.raftProperties()),
+                "the customizer has the last word on the read option");
+    }
+
+    @Test
+    void testResultRetentionMustBeFiniteAndPositive() {
+        final MetadataServer.Builder builder = MetadataServer.newBuilder();
+        assertEquals(builder, builder.setResultRetention(Duration.ofMillis(1)));
+        assertThrows(
+                IllegalArgumentException.class, () -> builder.setResultRetention(Duration.ZERO));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.setResultRetention(Duration.ofMillis(-1)));
+    }
+
+    @Test
+    void testStartWiresClockAndRetentionIntoBothStateMachinePaths() throws Exception {
+        for (int path = 0; path < 2; path++) {
+            final boolean injected = path == 1;
+            final File dataDir = new File(tempDir, "configured-" + path);
+            final int port = probedPort();
+            final ManualClock clock = new ManualClock(10_000L);
+            final MetadataStateMachine stateMachine =
+                    injected
+                            ? new MetadataStateMachine(new File(dataDir, "injected-rocksdb"))
+                            : null;
+            final MetadataServer.Builder builder =
+                    MetadataServer.newBuilder()
+                            .setSelfId("n1")
+                            .setQuorum("n1@localhost:" + port)
+                            .setDataDir(dataDir)
+                            .setClock(clock)
+                            .setResultRetention(Duration.ofMillis(500L))
+                            .setPropertiesCustomizer(
+                                    properties -> GrpcConfigKeys.Server.setPort(properties, port));
+            if (injected) {
+                builder.setStateMachine(stateMachine);
+            }
+            final MetadataServer server = builder.build();
+            try {
+                server.start();
+                final MetadataStateMachine configured = server.getStateMachine();
+                final byte[] raw =
+                        RaftCommandCodec.encodeCommand(RaftCommand.leaseRegister(77L, 100L, 1L));
+                final RaftClientRequest request =
+                        RaftClientRequest.newBuilder()
+                                .setClientId(
+                                        ClientId.valueOf(
+                                                java.util.UUID.nameUUIDFromBytes(
+                                                        ("configuration-" + path)
+                                                                .getBytes(StandardCharsets.UTF_8))))
+                                .setServerId(RaftPeerId.valueOf("n1"))
+                                .setGroupId(server.getGroupId())
+                                .setCallId(91L)
+                                .setMessage(Message.valueOf(java.nio.ByteBuffer.wrap(raw)))
+                                .setType(RaftClientRequest.writeRequestType())
+                                .build();
+
+                final TransactionContext context = configured.startTransaction(request);
+                ((TransactionContextImpl) context).initLogEntry(1L, 100L + path);
+                final MetadataLogEnvelope envelope =
+                        MetadataLogEnvelope.decode(
+                                context.getLogEntry()
+                                        .getStateMachineLogEntry()
+                                        .getLogData()
+                                        .toByteArray());
+                assertNotNull(envelope);
+                assertEquals(10_000L, envelope.getServerTimeMillis());
+                assertEquals(9_500L, envelope.getProposedCutoffMillis());
+                assertEquals(10_100L, envelope.getCommand().getExpireAtMs());
+                assertThrows(
+                        IllegalStateException.class,
+                        () ->
+                                configured.configureBeforeOpen(
+                                        new ManualClock(0L), Duration.ofMillis(1L)));
+            } finally {
+                server.close();
+            }
+        }
     }
 
     @Test

@@ -20,7 +20,10 @@ import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
 import org.apache.ratis.metadata.util.FileUtils;
+import org.apache.ratis.proto.RaftProtos.LogEntryProto;
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
@@ -30,6 +33,8 @@ import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.server.storage.StorageImplUtils;
+import org.apache.ratis.statemachine.TransactionContext;
+import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.Test;
@@ -55,6 +60,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -176,6 +182,37 @@ public class TestMetadataStateMachineStorageSafety {
         assertEquals(1L, member.stateMachine.takeSnapshot());
     }
 
+    private static LogEntryProto prepareEntry(
+            Member member, long term, long revision, long callId, RaftCommand command)
+            throws IOException {
+        final RaftClientRequest request =
+                RaftClientRequest.newBuilder()
+                        .setClientId(ClientId.valueOf(GROUP_A))
+                        .setServerId(member.stateMachine.getId())
+                        .setGroupId(member.groupId)
+                        .setCallId(callId)
+                        .setMessage(
+                                Message.valueOf(
+                                        ByteBuffer.wrap(RaftCommandCodec.encodeCommand(command))))
+                        .setType(RaftClientRequest.writeRequestType())
+                        .build();
+        final TransactionContext context = member.stateMachine.startTransaction(request);
+        ((TransactionContextImpl) context).initLogEntry(term, revision);
+        return context.getLogEntry();
+    }
+
+    private static byte[] applyEntry(Member member, LogEntryProto entry) throws Exception {
+        final Message reply =
+                member.stateMachine
+                        .applyTransaction(
+                                TransactionContext.newBuilder()
+                                        .setStateMachine(member.stateMachine)
+                                        .setLogEntry(entry)
+                                        .build())
+                        .get(10, TimeUnit.SECONDS);
+        return reply.getContent().toByteArray();
+    }
+
     private static RaftResult revisionOf(MetadataStateMachine stateMachine) {
         try {
             final CompletableFuture<Message> reply =
@@ -254,7 +291,8 @@ public class TestMetadataStateMachineStorageSafety {
             // manifest line cannot drift apart.
             assertTrue(
                     manifestText.contains(
-                            "column-families=default,state,counters,leases,lease-paths,changes"));
+                            "column-families=default,state,counters,leases,lease-paths,changes,"
+                                    + "command-results"));
         }
 
         try (Member rebuilt = new Member("rebuilt", GROUP_B, dbDir)) {
@@ -303,7 +341,12 @@ public class TestMetadataStateMachineStorageSafety {
         try (Member member = new Member("member", GROUP_A, dbDir)) {
             final IOException failure = assertThrows(IOException.class, member::open);
             assertTrue(failure.getMessage().contains(snapshotDir.getPath()));
-            assertTrue(failure.getMessage().contains("layout-version: found 99, expected 1"));
+            assertTrue(
+                    failure
+                            .getMessage()
+                            .contains(
+                                    "layout-version: found 99, expected "
+                                            + StateMachineIdentity.LAYOUT_VERSION));
             assertEquals(
                     refusedInventory,
                     fileInventory(snapshotDir),
@@ -507,6 +550,54 @@ public class TestMetadataStateMachineStorageSafety {
             assertEquals(2L, revisionOf(receiver.stateMachine).getRevision());
         } finally {
             receiver.close();
+        }
+    }
+
+    @Test
+    void testSnapshotRestoreAndReinitializeReplayOriginalInvocationResult() throws Exception {
+        final File donorDb = new File(tempDir, "result-donor-rocksdb");
+        final Member donor = new Member("result-donor", GROUP_A, donorDb);
+        final LogEntryProto originalEntry;
+        final byte[] originalReply;
+        try {
+            donor.open();
+            originalEntry =
+                    prepareEntry(
+                            donor,
+                            1L,
+                            1L,
+                            91L,
+                            RaftCommand.put("/snapshot-replay", "v".getBytes(StandardCharsets.UTF_8), 0L, 1L));
+            originalReply = applyEntry(donor, originalEntry);
+            assertEquals(
+                    RaftResult.Status.OK,
+                    RaftCommandCodec.decodeResult(originalReply).getStatus());
+            assertEquals(1L, donor.stateMachine.takeSnapshot());
+        } finally {
+            donor.close();
+        }
+
+        FileUtils.deleteDirectoryQuietly(donorDb);
+        try (Member restored = new Member("result-donor", GROUP_A, donorDb)) {
+            restored.open();
+            assertEquals(1L, revisionOf(restored.stateMachine).getRevision());
+            assertArrayEquals(
+                    originalReply,
+                    applyEntry(restored, originalEntry),
+                    "startup restore carries the original result, cutoff and time index");
+        }
+
+        final File receiverDb = new File(tempDir, "result-receiver-rocksdb");
+        try (Member receiver = new Member("result-receiver", GROUP_A, receiverDb)) {
+            receiver.open();
+            copyTree(donor.snapshotDir(1, 1), receiver.snapshotDir(1, 1));
+            receiver.stateMachine.pause();
+            receiver.stateMachine.reinitialize();
+
+            assertArrayEquals(
+                    originalReply,
+                    applyEntry(receiver, originalEntry),
+                    "reinitialize rebuilds the same invocation lookup path");
         }
     }
 

@@ -65,8 +65,16 @@ public final class MetadataServer implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(MetadataServer.class);
 
-    /** Must outlive the client's whole retry window (exactly-once); deliberately not a knob. */
-    private static final TimeDuration RETRY_CACHE_EXPIRY =
+    /** Default replicated result-retention window proposed by each leader. */
+    static final java.time.Duration DEFAULT_RESULT_RETENTION = java.time.Duration.ofDays(7);
+
+    /**
+     * Default memory retry-cache expiry. The in-memory cache is a five-minute fast path; the
+     * durable, replicated result store the state machine commits is the fallback that keeps
+     * retries exactly-once after memory expires. The builder setter exists so test harnesses
+     * can shorten it and drive the durable store below the in-memory cache.
+     */
+    private static final TimeDuration DEFAULT_RETRY_CACHE_EXPIRY =
             TimeDuration.valueOf(5, TimeUnit.MINUTES);
 
     private final RaftPeerId selfId;
@@ -78,6 +86,8 @@ public final class MetadataServer implements AutoCloseable {
     private final Clock clock;
     private final SupportedRpcType rpcType;
     private final java.time.Duration requestTimeout;
+    private final java.time.Duration resultRetention;
+    private final TimeDuration retryCacheExpiry;
     private final java.time.Duration leaseScanInterval;
     private final boolean snapshotAutoTrigger;
     private final long snapshotAutoTriggerThreshold;
@@ -115,6 +125,8 @@ public final class MetadataServer implements AutoCloseable {
         this.clock = builder.clock;
         this.rpcType = builder.rpcType;
         this.requestTimeout = builder.requestTimeout;
+        this.resultRetention = builder.resultRetention;
+        this.retryCacheExpiry = builder.retryCacheExpiry;
         this.leaseScanInterval = builder.leaseScanInterval;
         this.snapshotAutoTrigger = builder.snapshotAutoTrigger;
         this.snapshotAutoTriggerThreshold = builder.snapshotAutoTriggerThreshold;
@@ -155,6 +167,7 @@ public final class MetadataServer implements AutoCloseable {
                 injectedStateMachine != null
                         ? injectedStateMachine
                         : new MetadataStateMachine(rocksdbDir);
+        stateMachine.configureBeforeOpen(clock, resultRetention);
 
         final RaftServer.Builder builder =
                 RaftServer.newBuilder()
@@ -274,8 +287,16 @@ public final class MetadataServer implements AutoCloseable {
         // entries only seed the commit index at restart, which the new leader re-advertises
         // anyway; replaying the tail is idempotent (the state machine's revision marker).
         RaftServerConfigKeys.Log.setLogMetadataEnabled(properties, false);
-        // Must outlive the client's whole retry window (exactly-once); deliberately not a knob.
-        RaftServerConfigKeys.RetryCache.setExpiryTime(properties, RETRY_CACHE_EXPIRY);
+        // Reads must never trail the committed state a client's write returned: default to
+        // the read-index (linearizable) path instead of a leader's local state. Set before
+        // the customizer below so an embedder keeps the last word and may trade the
+        // guarantee for local-state reads.
+        RaftServerConfigKeys.Read.setOption(
+                properties, RaftServerConfigKeys.Read.Option.LINEARIZABLE);
+        // A five-minute memory fast path; retries past it fall back to the durable result
+        // store the state machine commits with every command. A builder knob exists for
+        // test harnesses, which keep the burden of choosing a defensible expiry themselves.
+        RaftServerConfigKeys.RetryCache.setExpiryTime(properties, retryCacheExpiry);
         // Transport-specific keys (e.g. the grpc listen port) belong to the transport artifact,
         // which this module deliberately does not depend on; the customizer supplies them.
         if (propertiesCustomizer != null) {
@@ -325,6 +346,8 @@ public final class MetadataServer implements AutoCloseable {
         private Clock clock = SystemClock.getInstance();
         private SupportedRpcType rpcType = SupportedRpcType.GRPC;
         private java.time.Duration requestTimeout = java.time.Duration.ofSeconds(3);
+        private java.time.Duration resultRetention = DEFAULT_RESULT_RETENTION;
+        private TimeDuration retryCacheExpiry = DEFAULT_RETRY_CACHE_EXPIRY;
         private java.time.Duration leaseScanInterval = java.time.Duration.ofSeconds(1);
         private boolean snapshotAutoTrigger = true;
         private long snapshotAutoTriggerThreshold = 400_000L;
@@ -397,6 +420,34 @@ public final class MetadataServer implements AutoCloseable {
                     "requestTimeout must be positive, got %s",
                     requestTimeout);
             this.requestTimeout = requestTimeout;
+            return this;
+        }
+
+        /** Sets the result-retention window each leader proposes; must be positive. */
+        public Builder setResultRetention(java.time.Duration resultRetention) {
+            checkNotNull(resultRetention, "resultRetention");
+            checkArgument(
+                    resultRetention.toMillis() > 0,
+                    "resultRetention must be positive, got %s",
+                    resultRetention);
+            this.resultRetention = resultRetention;
+            return this;
+        }
+
+        /**
+         * Sets the memory retry-cache expiry (default 5 minutes). The in-memory cache is a fast
+         * path; the durable, replicated result store answers retries after it expires. Test
+         * harnesses may shorten it to drive the durable invocation results below the in-memory
+         * cache.
+         */
+        public Builder setRetryCacheExpiry(java.time.Duration retryCacheExpiry) {
+            checkNotNull(retryCacheExpiry, "retryCacheExpiry");
+            checkArgument(
+                    retryCacheExpiry.toMillis() > 0,
+                    "retryCacheExpiry must be positive, got %s",
+                    retryCacheExpiry);
+            this.retryCacheExpiry =
+                    TimeDuration.valueOf(retryCacheExpiry.toMillis(), TimeUnit.MILLISECONDS);
             return this;
         }
 

@@ -80,7 +80,7 @@ public final class RaftMetadataClient implements AutoCloseable {
     /** Default of the per-attempt request timeout; same as ratis' own client default. */
     private static final Duration DEFAULT_REQUEST_TIMEOUT = Duration.ofSeconds(3);
 
-    private static final Duration DEFAULT_RETRY_TIMEOUT = Duration.ofSeconds(60);
+    static final Duration DEFAULT_RETRY_TIMEOUT = Duration.ofHours(24);
 
     /** The first backoff between failed attempts, doubled with jitter on every retry. */
     private static final Duration RETRY_BACKOFF_BASE = Duration.ofMillis(200);
@@ -518,12 +518,13 @@ public final class RaftMetadataClient implements AutoCloseable {
         return session;
     }
 
-    /** Renews a lease, setting its expiry to {@code ttl} from the client's clock. */
+    /** Renews a lease with this ttl; the leader sets the replicated expiry from its own time. */
     public long renewLease(long leaseId, Duration ttl) {
         checkNotNull(ttl, "ttl");
         long ttlMs = ttl.toMillis();
         checkArgument(ttlMs > 0, "Lease ttl must be positive, got %s", ttl);
-        RaftCommand command = RaftCommand.leaseRenew(leaseId, clock.milliseconds() + ttlMs);
+        RaftCommand command =
+                RaftCommand.leaseRenew(leaseId, ttlMs, clock.milliseconds() + ttlMs);
         return accepted(command, "renew lease " + leaseId).getRevision();
     }
 
@@ -535,9 +536,27 @@ public final class RaftMetadataClient implements AutoCloseable {
                     long ttlMs = ttl.toMillis();
                     checkArgument(ttlMs > 0, "Lease ttl must be positive, got %s", ttl);
                     RaftCommand command =
-                            RaftCommand.leaseRenew(leaseId, clock.milliseconds() + ttlMs);
+                            RaftCommand.leaseRenew(leaseId, ttlMs, clock.milliseconds() + ttlMs);
                     return acceptedAsync(command, "renew lease " + leaseId)
                             .thenApply(RaftResult::getRevision);
+                });
+    }
+
+    /**
+     * Revokes the lease now, unconditionally: the leader deletes the lease and every record bound
+     * to it - and nothing else, which is what makes revocation ownership-safe where a path delete
+     * is not. Idempotent: revoking an unknown or already-expired lease is a no-op success
+     * settling with 0 deletions. Runs on the ordered async pipeline like every other send, so a
+     * revocation issued after a create of the same lease is guaranteed to apply after it.
+     *
+     * @return how many bound records the expiry cascade removed
+     */
+    public CompletableFuture<Long> revokeLeaseAsync(long leaseId) {
+        return settleEarly(
+                () -> {
+                    RaftCommand command = RaftCommand.leaseExpire(leaseId, -1L);
+                    return acceptedAsync(command, "revoke lease " + leaseId)
+                            .thenApply(RaftResult::getDeletedCount);
                 });
     }
 
@@ -746,7 +765,7 @@ public final class RaftMetadataClient implements AutoCloseable {
         private final Map<String, InetSocketAddress> members = new LinkedHashMap<>();
         private UUID groupId;
         private Duration requestTimeout = DEFAULT_REQUEST_TIMEOUT;
-        /** Null only after {@link #setRetryForever()}: ratis then retries without a total bound. */
+        /** Total retry budget; the metadata protocol requires a finite value. */
         private Duration retryTimeout = DEFAULT_RETRY_TIMEOUT;
 
         private Clock clock = SystemClock.getInstance();
@@ -796,10 +815,11 @@ public final class RaftMetadataClient implements AutoCloseable {
             return this;
         }
 
-        /** Opts out of the retry budget: operations retry forever, which is ratis' own default. */
+        /** Rejected: the metadata protocol requires a bounded retry budget. */
+        @Deprecated
         public Builder setRetryForever() {
-            this.retryTimeout = null;
-            return this;
+            throw new IllegalStateException(
+                    "Retry timeout must be finite; setRetryTimeout(Duration) is required");
         }
 
         /** Sets the time source for record timestamps and lease expiries. */
@@ -842,12 +862,10 @@ public final class RaftMetadataClient implements AutoCloseable {
                     RequestTypeDependentRetryPolicy.newBuilder()
                             .setRetryPolicy(TypeCase.WRITE, backoffRetry())
                             .setRetryPolicy(TypeCase.READ, backoffRetry());
-            if (retryTimeout != null) {
-                final TimeDuration budget =
-                        TimeDuration.valueOf(retryTimeout.toMillis(), TimeUnit.MILLISECONDS);
-                retryPolicy.setTimeout(TypeCase.WRITE, budget);
-                retryPolicy.setTimeout(TypeCase.READ, budget);
-            }
+            final TimeDuration budget =
+                    TimeDuration.valueOf(retryTimeout.toMillis(), TimeUnit.MILLISECONDS);
+            retryPolicy.setTimeout(TypeCase.WRITE, budget);
+            retryPolicy.setTimeout(TypeCase.READ, budget);
 
             final RaftClient raftClient =
                     RaftClient.newBuilder()

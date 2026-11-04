@@ -18,21 +18,30 @@ package org.apache.ratis.metadata.lock;
 
 import org.apache.ratis.metadata.MetadataCluster;
 import org.apache.ratis.metadata.client.RaftMetadataClient;
+import org.apache.ratis.metadata.client.RaftMetadataException;
+import org.apache.ratis.metadata.statemachine.RaftCommand;
+import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
+import org.apache.ratis.metadata.statemachine.RaftResult;
+import org.apache.ratis.protocol.Message;
+import org.apache.ratis.protocol.RaftClientReply;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.apache.ratis.metadata.util.TestWait.waitUntil;
 
 /**
  * The lock recipe over the live cluster: exclusion and token advance, prompt release, crash
@@ -98,9 +107,9 @@ public class TestMetadataLock {
     }
 
     /**
-     * A holder that stops renewing (here: the frozen clock keeps every renewal undue) loses the
-     * record through the leader's expiry scheduler; the waiter wakes on the record's delete. Its
-     * own lease died with the same clock jump, so the take-over also exercises the reopen path.
+     * A holder whose client has stopped renewing loses the record through the leader's expiry
+     * scheduler; the waiter wakes on the record's delete. Closing only the holder's client is
+     * essential: a clock jump also makes every live session due for renewal.
      */
     @Test
     void testCrashReleaseExpiresRecordAndWaiterTakesOver() throws Exception {
@@ -109,6 +118,8 @@ public class TestMetadataLock {
                 newLock(contenderClient, "/locks/b").acquireAsync();
         assertFalse(pending.isDone(), "the contender waits while the holder's lease is renewed");
 
+        holderClient.close();
+        assertFalse(holder.isHeld(), "the crashed holder cannot renew its lease");
         cluster.clock.advanceTime(LEASE_TTL.plusSeconds(1).toMillis(), TimeUnit.MILLISECONDS);
 
         final MetadataLock.Hold taker = pending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
@@ -188,6 +199,241 @@ public class TestMetadataLock {
         final MetadataLock.Hold hold = lock.acquire();
         hold.release();
         assertThrows(IllegalStateException.class, lock::acquireAsync);
+    }
+
+    /**
+     * THE ownership race: the holder's lease dies underneath it (a partition outlasted the ttl),
+     * the waiter takes over with a lease of its own, and only then does the old holder release.
+     * The late release may not delete the new holder's record: cleanup is scoped to the releaser's
+     * own dead lease, so the record at the path - bound to the new holder's lease - survives and
+     * the lock keeps excluding.
+     *
+     * <p>The lease's death is forced deterministically by expiring it through the admin client -
+     * exactly the command the leader's scheduler proposes in production after a crashed holder
+     * (see {@code testCrashReleaseExpiresRecordAndWaiterTakesOver}); the property under test is
+     * what the old holder's LATE cleanup does to the record that replaced its own.
+     */
+    @Test
+    void testLateReleaseByAnExpiredHolderCannotTakeTheNewHoldersRecord() throws Exception {
+        final String path = "/locks/g1";
+        final MetadataLock.Hold first = newLock(holderClient, path).acquire();
+        assertTrue(first.isHeld(), "the first holder holds");
+        final long deadLease = holderClient.get(path).getLeaseId();
+        assertTrue(deadLease != 0L, "the lock record is bound to the holder's lease");
+
+        // A waiter with a ttl far from due, so no clock advance of this test can lapse its lease.
+        final MetadataLock contender =
+                MetadataLock.newBuilder()
+                        .setClient(contenderClient)
+                        .setPath(path)
+                        .setTtl(Duration.ofSeconds(30))
+                        .build();
+        final CompletableFuture<MetadataLock.Hold> pending = contender.acquireAsync();
+        assertFalse(pending.isDone(), "the contender waits while the record exists");
+
+        // The holder's lease dies underneath it; the expiry cascade deletes the record and the
+        // waiter takes over with a fresh lease of its own.
+        adminExpireLease(deadLease);
+        final MetadataLock.Hold second = pending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
+        assertTrue(second.isHeld(), "the waiter took over after the lease expired");
+        final long takersLease = contenderClient.get(path).getLeaseId();
+        assertTrue(takersLease != 0L && takersLease != deadLease, "the new record binds a new lease");
+
+        // The dead session surfaces its lease's death once a renewal comes due (one ttl of clock).
+        cluster.clock.advanceTime(LEASE_TTL.toMillis(), TimeUnit.MILLISECONDS);
+        waitUntil(
+                () -> !first.isHeld(),
+                SETTLE,
+                "The expired holder's session did not surface its lease's death");
+
+        // The late release of the long-dead hold: whatever it does may not touch the new holder's
+        // record at the shared path.
+        first.release();
+        Thread.sleep(500); // lets any ownership-unsafe delete land before the asserts below
+        final RaftMetadataClient.MetadataRecord survivor = contenderClient.get(path);
+        assertEquals(
+                takersLease,
+                survivor.getLeaseId(),
+                "the new holder's record survives the old holder's late release");
+
+        // And the lock still excludes: a third contender cannot take over a live holder.
+        final CompletableFuture<MetadataLock.Hold> thirdPending =
+                newLock(contenderClient, path).acquireAsync();
+        Thread.sleep(700);
+        assertFalse(
+                thirdPending.isDone(),
+                "a live holder still excludes later contenders after another holder's late"
+                        + " release");
+
+        second.release();
+        final MetadataLock.Hold third = thirdPending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
+        assertTrue(third.getToken() > second.getToken(), "the handover after release still works");
+        third.release();
+    }
+
+    /**
+     * A waiter whose acquire times out while parked on {@code NODE_EXISTS} owns no record: its
+     * unwind may not disturb the holder's. The holder keeps its record, a follow-up acquire still
+     * blocks, and the release hands over cleanly.
+     */
+    @Test
+    void testTimedOutWaiterLeavesTheHoldersRecordUntouched() throws Exception {
+        final String path = "/locks/g2";
+        final MetadataLock.Hold holder = newLock(holderClient, path).acquire();
+        final long holdersLease = holderClient.get(path).getLeaseId();
+
+        final MetadataLock waiter = newLock(contenderClient, path);
+        final CompletableFuture<MetadataLock.Hold> pending =
+                waiter.acquireAsync(Duration.ofMillis(300));
+        final ExecutionException failure =
+                assertThrows(
+                        ExecutionException.class,
+                        () -> pending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS));
+        assertTrue(failure.getCause() instanceof TimeoutException, "the waiter times out");
+
+        assertEquals(
+                holdersLease,
+                holderClient.get(path).getLeaseId(),
+                "the holder's record is untouched by the waiter's unwind");
+        assertTrue(holder.isHeld(), "the holder still holds");
+        final CompletableFuture<MetadataLock.Hold> nextPending =
+                newLock(contenderClient, path).acquireAsync();
+        assertFalse(nextPending.isDone(), "the holder's record still guards the lock");
+
+        holder.release();
+        final MetadataLock.Hold next = nextPending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
+        assertTrue(next.getToken() > holder.getToken());
+        next.release();
+    }
+
+    /**
+     * A release whose cleanup cannot reach the cluster (the client closed first) falls back to the
+     * crash-release path: no exception escapes, and the record dies through the leader's expiry
+     * scheduler within one ttl, leaving the path acquirable again.
+     */
+    @Test
+    void testReleaseOnAClosedClientStillFreesThePathWithinOneTtl() throws Exception {
+        final String path = "/locks/g3";
+        final MetadataLock.Hold holder = newLock(holderClient, path).acquire();
+
+        holderClient.close();
+        holder.release(); // must not throw even though the cleanup has no client to go through
+        assertFalse(holder.isHeld());
+
+        cluster.clock.advanceTime(LEASE_TTL.plus(LEASE_TTL.dividedBy(3)).plusSeconds(1).toMillis(),
+                TimeUnit.MILLISECONDS);
+        final RaftMetadataClient reopener = cluster.newMetadataClient();
+        try {
+            waitUntil(
+                    () -> {
+                        try {
+                            reopener.get(path);
+                            return false;
+                        } catch (RaftMetadataException notFound) {
+                            return notFound.getStatus() == RaftResult.Status.NOT_FOUND;
+                        }
+                    },
+                    SETTLE,
+                    "The released path was not freed within one ttl");
+            final MetadataLock.Hold next =
+                    newLock(reopener, path).acquire(Duration.ofSeconds(10));
+            next.release();
+        } finally {
+            closeQuietly(reopener);
+        }
+    }
+
+    /**
+     * A waiter parked on {@code NODE_EXISTS} survives a retention-line advance: its watcher
+     * stops with NEED_SNAPSHOT, reports, resumes from the line - the restart the lock requests
+     * from inside the report, arbitrated last-wins - and keeps waiting, so the holder's
+     * release still hands over. The purge cluster makes the snapshot advance the retention
+     * line deterministically past the waiter's parked watch position.
+     */
+    @Test
+    void testWaiterSurvivesARetentionLineAdvanceWhileParked() throws Exception {
+        final File purgeDir = new File(tempDir, "purge-cluster");
+        assertTrue(purgeDir.mkdirs(), "the purge cluster needs its own storage dir");
+        try (MetadataCluster purged =
+                MetadataCluster.newBuilder(purgeDir)
+                        .setNumServers(3)
+                        .setPurgeForSnapshot(true)
+                        .build()) {
+            purged.start();
+            final RaftMetadataClient holderOnPurged = purged.newMetadataClient();
+            final RaftMetadataClient contenderOnPurged = purged.newMetadataClient();
+            try {
+                final MetadataLock.Hold holder = newLock(holderOnPurged, "/locks/h").acquire();
+
+                final long revisionAtPark = adminRevisionOf(purged);
+                final CompletableFuture<MetadataLock.Hold> pending =
+                        newLock(contenderOnPurged, "/locks/h").acquireAsync();
+                // Parked provably: the contender's lease registration and its rejected create
+                // both appended entries beyond the revision it took as its watch position.
+                waitUntil(
+                        () -> adminRevisionOf(purged) >= revisionAtPark + 2,
+                        SETTLE,
+                        "The contender never parked on the held record");
+                assertFalse(pending.isDone(), "the contender waits while the record exists");
+
+                // The snapshot purges below its index, so the retention line jumps past the
+                // parked watch position; the watcher must report, resume and re-park.
+                final long snapshotIndex = purged.takeSnapshotOnLeader();
+                assertTrue(
+                        snapshotIndex >= revisionAtPark + 2,
+                        "the retention line passed the parked watch position");
+                waitUntil(
+                        () -> adminRevisionOf(purged) >= revisionAtPark + 3,
+                        SETTLE,
+                        "The waiter did not resume from the retention line and re-attempt");
+                assertFalse(
+                        pending.isDone(),
+                        "the contender still waits after resuming from the retention line");
+
+                holder.release();
+                final MetadataLock.Hold taker =
+                        pending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
+                assertTrue(taker.getToken() > holder.getToken(), "the handover still works");
+                taker.release();
+            } finally {
+                closeQuietly(contenderOnPurged);
+                closeQuietly(holderOnPurged);
+            }
+        }
+    }
+
+    /** The leader's applied revision, read through the admin client. */
+    private static long adminRevisionOf(MetadataCluster cluster) throws Exception {
+        final RaftCommand revision = RaftCommand.revision();
+        final RaftClientReply reply =
+                cluster.adminClient()
+                        .io()
+                        .sendReadOnly(
+                                Message.valueOf(
+                                        ByteBuffer.wrap(
+                                                RaftCommandCodec.encodeCommand(revision))));
+        final RaftResult result =
+                RaftCommandCodec.decodeResult(reply.getMessage().getContent().toByteArray());
+        assertEquals(RaftResult.Status.OK, result.getStatus());
+        return result.getRevision();
+    }
+
+    /**
+     * Expire {@code leaseId} unconditionally through the admin client - the very command the
+     * leader's scheduler proposes in production; replies map like any metadata result.
+     */
+    private void adminExpireLease(long leaseId) throws Exception {
+        final RaftCommand expire = RaftCommand.leaseExpire(leaseId, -1L);
+        final RaftClientReply reply =
+                cluster.adminClient()
+                        .io()
+                        .send(
+                                Message.valueOf(
+                                        ByteBuffer.wrap(RaftCommandCodec.encodeCommand(expire))));
+        final RaftResult result =
+                RaftCommandCodec.decodeResult(reply.getMessage().getContent().toByteArray());
+        assertEquals(RaftResult.Status.OK, result.getStatus());
+        assertTrue(result.isExpired(), "the forced expiry removed the lease");
     }
 
     private static void closeQuietly(AutoCloseable closeable) {

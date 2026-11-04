@@ -17,6 +17,7 @@
 
 package org.apache.ratis.metadata.statemachine;
 
+import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.metadata.MetadataCluster;
 import org.apache.ratis.metadata.util.FileUtils;
 
@@ -28,8 +29,10 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
 
+import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
+import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -45,6 +48,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 
 import static org.apache.ratis.metadata.util.TestWait.waitUntil;
@@ -332,6 +337,107 @@ public class TestRaftMetadataSnapshot {
         }
     }
 
+    @Test
+    void testWithinContractRetrySurvivesSnapshotPurgeRestartAndCacheExpiry() throws Exception {
+        // Within the retry contract (before retention expiry): a resubmission of the same
+        // invocation returns the original encoded reply with no second business effect, and the
+        // guarantee survives snapshot, log purge, a full controlled restart and the memory retry
+        // cache being expired/invalidated.
+        final File base = new File(tempDir, "within-contract-retry");
+        try (MetadataCluster cluster =
+                MetadataCluster.newBuilder(base)
+                        .setNumServers(NUM_SERVERS)
+                        .setPurgeForSnapshot(true)
+                        .setGroupUuid(UUID.fromString(GROUP_UUID))
+                        .setResultRetention(Duration.ofMinutes(1))
+                        .setRetryCacheExpiry(Duration.ofMillis(300))
+                        .build()) {
+            cluster.start();
+            RaftPeerId leader = cluster.awaitLeader();
+            final int leaderIndex = cluster.indexOf(leader);
+            // Warm the leader up: an ordered admin write retries internally until the leader is
+            // ready, keeping the raw unordered stream below safe from a LeaderNotReady reply.
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.put("/within-contract-warmup", bytes("w"), 0, 100L))
+                            .getStatus());
+            final ClientId clientId = ClientId.valueOf(UUID.randomUUID());
+            final RaftCommand command = RaftCommand.put("/within-contract", bytes("v1"), 0, 100L);
+            final RaftClientRequest request =
+                    rawWriteRequest(cluster, leader, clientId, 42L, command);
+
+            final RaftClientReply first = sendRaw(cluster, request);
+            final byte[] original = first.getMessage().getContent().toByteArray();
+            assertEquals(RaftResult.Status.OK, decodeResult(original).getStatus());
+            assertEquals(1L, decodeResult(original).getVersion());
+            final long firstIndex = first.getLogIndex();
+
+            // While the memory cache still holds the reply, a retry is served without appending.
+            final RaftClientReply cached = sendRaw(cluster, request);
+            assertEquals(firstIndex, cached.getLogIndex());
+            assertArrayEquals(original, cached.getMessage().getContent().toByteArray());
+
+            Thread.sleep(800L); // memory retry-cache expiry
+
+            final RaftClientReply retry = sendRaw(cluster, request);
+            assertTrue(
+                    retry.getLogIndex() > firstIndex,
+                    "the expired-cache retry appended a duplicate-refresh entry");
+            assertArrayEquals(
+                    original,
+                    retry.getMessage().getContent().toByteArray(),
+                    "the durable store returned the original encoded reply");
+            assertEquals(
+                    1L,
+                    sendReadOnly(cluster, RaftCommand.get("/within-contract")).getVersion(),
+                    "no second business effect");
+
+            // Snapshot and purge until the leader log no longer holds either duplicate entry.
+            long snapshotIndex = cluster.takeSnapshotOnLeader();
+            for (int push = 0;
+                    logStartOnDisk(raftDirOf(base, leaderIndex)) <= retry.getLogIndex();
+                    push++) {
+                assertTrue(push < 100, "the purge crossed the duplicate entries");
+                send(
+                        cluster,
+                        RaftCommand.put(
+                                "/within-contract/purge-push-" + push, bytes("p"), 0, 100L));
+                snapshotIndex = cluster.takeSnapshotOnLeader();
+            }
+            assertTrue(snapshotIndex >= retry.getLogIndex());
+
+            // Full controlled restart invalidates every memory retry cache, but the new leader's
+            // startup replay re-seeds its own cache; waiting out the expiry proves the record
+            // itself - snapshotted and purged with the log - still answers with the original
+            // reply.
+            for (int i = 0; i < NUM_SERVERS; i++) {
+                cluster.killServer(i);
+            }
+            for (int i = 0; i < NUM_SERVERS; i++) {
+                cluster.restartServer(i);
+            }
+            leader = cluster.awaitLeader();
+            Thread.sleep(800L);
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster,
+                            RaftCommand.put(
+                                    "/within-contract-warmup-after-restart", bytes("w"), 0, 100L))
+                            .getStatus(),
+                    "warm the restarted leader up before the next raw send");
+            final RaftClientReply afterRestart =
+                    sendRaw(cluster, rawWriteRequest(cluster, leader, clientId, 42L, command));
+            assertTrue(afterRestart.getLogIndex() > retry.getLogIndex());
+            assertArrayEquals(
+                    original,
+                    afterRestart.getMessage().getContent().toByteArray(),
+                    "the original encoded reply survives restart, snapshot and purge");
+            final RaftResult state = sendReadOnly(cluster, RaftCommand.get("/within-contract"));
+            assertEquals(1L, state.getVersion(), "still exactly one business effect");
+            assertArrayEquals(bytes("v1"), state.getData());
+        }
+    }
+
     private static RaftResult send(MetadataCluster cluster, RaftCommand command)
             throws IOException {
         return decodeReply(cluster.adminClient().io().send(toMessage(command)), command);
@@ -424,7 +530,13 @@ public class TestRaftMetadataSnapshot {
             }
             assertTrue(
                     columnFamilies.containsAll(
-                            Arrays.asList("state", "counters", "leases", "lease-paths", "changes")),
+                            Arrays.asList(
+                                    "state",
+                                    "counters",
+                                    "leases",
+                                    "lease-paths",
+                                    "changes",
+                                    "command-results")),
                     "the checkpoint contains every column family");
 
             final List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
@@ -441,6 +553,8 @@ public class TestRaftMetadataSnapshot {
                 final ColumnFamilyHandle state = handleOf(handles, columnFamilies, "state");
                 final ColumnFamilyHandle changes = handleOf(handles, columnFamilies, "changes");
                 final ColumnFamilyHandle defaults = handleOf(handles, columnFamilies, "default");
+                final ColumnFamilyHandle results =
+                        handleOf(handles, columnFamilies, "command-results");
 
                 assertNotNull(
                         checkpoint.get(
@@ -460,6 +574,22 @@ public class TestRaftMetadataSnapshot {
                 } finally {
                     iterator.close();
                 }
+
+                boolean invocationRecord = false;
+                boolean timeIndex = false;
+                try (RocksIterator resultIterator = checkpoint.newIterator(results)) {
+                    for (resultIterator.seekToFirst();
+                            resultIterator.isValid();
+                            resultIterator.next()) {
+                        invocationRecord |= resultIterator.key()[0] == 1;
+                        timeIndex |= resultIterator.key()[0] == 2;
+                    }
+                }
+                assertNotNull(
+                        checkpoint.get(results, new byte[] {0}),
+                        "the checkpoint holds the replicated result cutoff");
+                assertTrue(invocationRecord, "the checkpoint holds original invocation results");
+                assertTrue(timeIndex, "the checkpoint holds invocation retention indices");
 
                 // The marker equals the snapshot index: takeSnapshot runs after every apply.
                 final byte[] marker =
@@ -510,6 +640,48 @@ public class TestRaftMetadataSnapshot {
         assertNotNull(
                 result, "reply of " + command.getOp() + " decodes (op echo must match)");
         assertEquals(command.getOp(), result.getOp());
+        return result;
+    }
+
+    /** A fixed write request: resending it re-uses one ClientInvocationId across attempts. */
+    private static RaftClientRequest rawWriteRequest(
+            MetadataCluster cluster,
+            RaftPeerId server,
+            ClientId clientId,
+            long callId,
+            RaftCommand command) {
+        return RaftClientRequest.newBuilder()
+                .setClientId(clientId)
+                .setServerId(server)
+                .setGroupId(cluster.groupId())
+                .setCallId(callId)
+                .setMessage(
+                        Message.valueOf(
+                                ByteBuffer.wrap(RaftCommandCodec.encodeCommand(command))))
+                .setType(RaftClientRequest.writeRequestType())
+                .build();
+    }
+
+    /**
+     * Sends a fixed raw write request on a fresh admin client and asserts it succeeded. Callers
+     * must warm the addressed leader up with an ordered admin write first: a raw unordered send
+     * has no client-side retry, and a LeaderNotReady reply closes its unordered stream.
+     */
+    private static RaftClientReply sendRaw(MetadataCluster cluster, RaftClientRequest request)
+            throws Exception {
+        try (RaftClient client = cluster.newAdminClient()) {
+            final CompletableFuture<RaftClientReply> future =
+                    client.getClientRpc().sendRequestAsyncUnordered(request);
+            final RaftClientReply reply = future.get(30, TimeUnit.SECONDS);
+            assertNotNull(reply, "the raw write returned no reply");
+            assertTrue(reply.isSuccess(), () -> "the raw write failed: " + reply);
+            return reply;
+        }
+    }
+
+    private static RaftResult decodeResult(byte[] encoded) {
+        final RaftResult result = RaftCommandCodec.decodeResult(encoded);
+        assertNotNull(result, "the raw reply decodes");
         return result;
     }
 

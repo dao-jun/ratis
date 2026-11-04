@@ -24,7 +24,11 @@ public final class RaftCommand {
 
     /** The operation; the code also selects the payload layout on the wire. */
     public enum Op {
-        /** Write: upsert a path (creates or bumps the version); ignores missing parents. */
+        /**
+         * Write: upsert a path (creates or bumps the version). A PUT that would create is
+         * held to CREATE's parent rule - the parent must exist and must not be lease-bound;
+         * updating an existing record is ungated by parents.
+         */
         PUT((byte) 1, true),
         /** Write: create a path (ZooKeeper-like semantics; supports sequential and ephemeral). */
         CREATE((byte) 2, true),
@@ -207,10 +211,22 @@ public final class RaftCommand {
         return c;
     }
 
-    /** Creates a LEASE_RENEW command; sets a new proposer-computed expiry. */
+    /**
+     * Creates the legacy LEASE_RENEW form with a proposer-computed expiry and no TTL. Leaders and
+     * replicas reject this form; it is retained only to keep the old factory signature unambiguous.
+     */
     public static RaftCommand leaseRenew(long leaseId, long expireAtMs) {
         RaftCommand c = new RaftCommand(Op.LEASE_RENEW);
         c.leaseId = leaseId;
+        c.expireAtMs = expireAtMs;
+        return c;
+    }
+
+    /** Creates a LEASE_RENEW with a new TTL and proposer-computed expiry. */
+    public static RaftCommand leaseRenew(long leaseId, long ttlMs, long expireAtMs) {
+        RaftCommand c = new RaftCommand(Op.LEASE_RENEW);
+        c.leaseId = leaseId;
+        c.ttlMs = ttlMs;
         c.expireAtMs = expireAtMs;
         return c;
     }

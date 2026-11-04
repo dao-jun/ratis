@@ -21,6 +21,7 @@ import org.apache.ratis.metadata.statemachine.MetadataStateMachine;
 import org.apache.ratis.metadata.statemachine.RaftCommand;
 import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.statemachine.RaftResult;
+import org.apache.ratis.metadata.util.Clock;
 import org.apache.ratis.metadata.util.ManualClock;
 import org.apache.ratis.metadata.util.TestWait;
 import org.apache.ratis.client.RaftClient;
@@ -68,6 +69,8 @@ public final class MetadataCluster implements AutoCloseable {
     private final boolean purgeForSnapshot;
     private final SupportedRpcType rpcType;
     private final Duration leaseScanInterval;
+    private final Duration resultRetention;
+    private final Duration retryCacheExpiry;
     private final UUID groupUuid;
 
     public final ManualClock clock = new ManualClock(100_000L);
@@ -83,6 +86,8 @@ public final class MetadataCluster implements AutoCloseable {
         this.purgeForSnapshot = builder.purgeForSnapshot;
         this.rpcType = builder.rpcType;
         this.leaseScanInterval = builder.leaseScanInterval;
+        this.resultRetention = builder.resultRetention;
+        this.retryCacheExpiry = builder.retryCacheExpiry;
         this.groupUuid = builder.groupUuid;
         this.ports = new int[numServers];
         this.quorum = new ArrayList<>(numServers);
@@ -115,13 +120,29 @@ public final class MetadataCluster implements AutoCloseable {
             newServer(i, fullGroup);
             servers[i].start();
         }
+        adminClient = newAdminClient();
+    }
+
+    /**
+     * A fresh admin raft client on the cluster's transport. Raw unordered sends need one per
+     * connection era: a client's unordered stream to a server dies permanently when that server
+     * restarts or answers LeaderNotReady.
+     */
+    public RaftClient newAdminClient() {
         final RaftProperties adminProperties = new RaftProperties();
         RaftConfigKeys.Rpc.setType(adminProperties, rpcType);
-        adminClient =
-                RaftClient.newBuilder()
-                        .setRaftGroup(fullGroup)
-                        .setProperties(adminProperties)
-                        .build();
+        final List<RaftPeer> peers = new ArrayList<>(numServers);
+        for (int i = 0; i < numServers; i++) {
+            peers.add(
+                    RaftPeer.newBuilder()
+                            .setId("n" + i)
+                            .setAddress("localhost:" + ports[i])
+                            .build());
+        }
+        return RaftClient.newBuilder()
+                .setRaftGroup(RaftGroup.valueOf(groupId(), peers))
+                .setProperties(adminProperties)
+                .build();
     }
 
     /** (Re)builds member {@code i} against the given group; visible for restart flows. */
@@ -140,20 +161,27 @@ public final class MetadataCluster implements AutoCloseable {
                         .setRpcType(rpcType)
                         .setLeaseScanInterval(leaseScanInterval)
                         .setStateMachine(stateMachine)
-                        .setGroupId(fullGroup.getGroupId().getUuid())
-                        .setPropertiesCustomizer(
-                                properties -> {
-                                    setTransportPort(properties, ports[i]);
-                                    if (purgeForSnapshot) {
-                                        // 256b segments: one entry per segment, so a purge
-                                        // advances the retention line in lock-step.
-                                        RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(
-                                                properties, true);
-                                        RaftServerConfigKeys.Log.setPurgeGap(properties, 1);
-                                        RaftServerConfigKeys.Log.setSegmentSizeMax(
-                                                properties, SizeInBytes.valueOf("256b"));
-                                    }
-                                });
+                        .setGroupId(fullGroup.getGroupId().getUuid());
+        // Test-only overrides; unset means the production defaults (7-day retention, 5-minute
+        // retry-cache expiry) so these knobs never change default harness behavior.
+        if (resultRetention != null) {
+            builder.setResultRetention(resultRetention);
+        }
+        if (retryCacheExpiry != null) {
+            builder.setRetryCacheExpiry(retryCacheExpiry);
+        }
+        builder.setPropertiesCustomizer(
+                properties -> {
+                    setTransportPort(properties, ports[i]);
+                    if (purgeForSnapshot) {
+                        // 256b segments: one entry per segment, so a purge
+                        // advances the retention line in lock-step.
+                        RaftServerConfigKeys.Log.setPurgeUptoSnapshotIndex(properties, true);
+                        RaftServerConfigKeys.Log.setPurgeGap(properties, 1);
+                        RaftServerConfigKeys.Log.setSegmentSizeMax(
+                                properties, SizeInBytes.valueOf("256b"));
+                    }
+                });
         servers[i] = builder.build();
     }
 
@@ -173,10 +201,18 @@ public final class MetadataCluster implements AutoCloseable {
 
     /** A fresh metadata client wired to every member, on the cluster's transport. */
     public RaftMetadataClient newMetadataClient() {
+        return newMetadataClient(clock);
+    }
+
+    /**
+     * A fresh metadata client as {@link #newMetadataClient()}, but on the caller's clock - for
+     * suites that pin the client's time source independently of the servers'.
+     */
+    public RaftMetadataClient newMetadataClient(Clock clientClock) {
         final RaftMetadataClient.Builder builder =
                 RaftMetadataClient.newBuilder()
                         .setGroupId(groupUuid != null ? groupUuid : groupId().getUuid())
-                        .setClock(clock)
+                        .setClock(clientClock)
                         .setRpcType(rpcType);
         for (int i = 0; i < numServers; i++) {
             builder.addQuorumMember(
@@ -378,6 +414,8 @@ public final class MetadataCluster implements AutoCloseable {
         private boolean purgeForSnapshot = false;
         private SupportedRpcType rpcType = SupportedRpcType.GRPC;
         private Duration leaseScanInterval = Duration.ofMillis(50);
+        private Duration resultRetention;
+        private Duration retryCacheExpiry;
         private UUID groupUuid;
 
         private Builder(File tempDir) {
@@ -402,6 +440,25 @@ public final class MetadataCluster implements AutoCloseable {
 
         public Builder setLeaseScanInterval(Duration leaseScanInterval) {
             this.leaseScanInterval = leaseScanInterval;
+            return this;
+        }
+
+        /**
+         * Forwards the result-retention window every member's leader proposes (default: the
+         * production 7 days); short windows plus the shared {@link ManualClock} let suites drive
+         * deterministic collection.
+         */
+        public Builder setResultRetention(Duration resultRetention) {
+            this.resultRetention = resultRetention;
+            return this;
+        }
+
+        /**
+         * Forwards the memory retry-cache expiry of every member (default: the production
+         * 5 minutes) so suites can expire the in-memory cache and reach the durable store.
+         */
+        public Builder setRetryCacheExpiry(Duration retryCacheExpiry) {
+            this.retryCacheExpiry = retryCacheExpiry;
             return this;
         }
 
