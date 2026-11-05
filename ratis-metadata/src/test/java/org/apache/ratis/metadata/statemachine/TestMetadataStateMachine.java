@@ -262,6 +262,51 @@ public class TestMetadataStateMachine {
     }
 
     @Test
+    void testUnpairedSurrogateCounterNameNeverReachesTheApply() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            // an unpaired-surrogate counter name would arrive at the apply substituted with '?',
+            // indistinguishable from a counter a second client literally named "locks?x",
+            // silently aliasing a fencing counter. The codec rejects the encode before any log
+            // entry exists.
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> machine.applyEntry(1L, 1L, 50L, RaftCommand.increment("locks\uD800x", 1L)));
+
+            // the literal '?' name starts fresh at 1: the rejected increment never landed on it
+            assertEquals(
+                    1L,
+                    machine.applyEntry(1L, 2L, 51L, RaftCommand.increment("locks?x", 1L))
+                            .result
+                            .getValue());
+
+            // no substituted name was ever committed: exactly one change, for the literal name
+            final List<ChangeEvent> records =
+                    machine.query(RaftCommand.pollChanges(0L, 1 << 20)).getRecords();
+            assertEquals(1, records.size());
+            assertEquals(1, records.get(0).getChanges().size());
+            assertEquals(ChangeEvent.ChangeOp.INCREMENT, records.get(0).getChanges().get(0).getOp());
+            assertEquals("locks?x", records.get(0).getChanges().get(0).getPath());
+
+            // a paired surrogate is one code point and encodes losslessly: an astral counter
+            // name rides the wire unchanged (the no-over-rejection boundary of the same scan)
+            assertEquals(
+                    1L,
+                    machine.applyEntry(1L, 3L, 52L, RaftCommand.increment("cnt\uD83D\uDE00x", 1L))
+                            .result
+                            .getValue());
+            assertEquals(
+                    "cnt\uD83D\uDE00x",
+                    machine
+                            .query(RaftCommand.pollChanges(0L, 1 << 20))
+                            .getRecords()
+                            .get(1)
+                            .getChanges()
+                            .get(0)
+                            .getPath());
+        }
+    }
+
+    @Test
     void testDuplicateSelectionPrecedesHigherEntryTermFence() throws Exception {
         try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
             final AppliedReply original =
@@ -294,6 +339,10 @@ public class TestMetadataStateMachine {
     void testLeaseRenewDuplicatePreservesFirstEmbeddedRevision() throws Exception {
         try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
             machine.applyEntry(1L, 1L, 45L, RaftCommand.leaseRegister(45L, 1_000L, 1L));
+            // LEASE_RENEW applies monotone in expiry - a non-extending renewal is a no-op that
+            // bumps no fence - and this fixture's clock is frozen, so the original renewal must
+            // move past the register's normalized expiry to apply at all.
+            machine.clock.advanceTime(1, TimeUnit.SECONDS);
             final AppliedReply original =
                     machine.applyEntry(1L, 2L, 46L, RaftCommand.leaseRenew(45L, 1_000L, 2L));
             assertEquals(2L, original.result.getRevision());
@@ -563,6 +612,115 @@ public class TestMetadataStateMachine {
             assertEquals(
                     RaftResult.Status.NOT_FOUND,
                     machine.query(RaftCommand.get("/ul/live")).getStatus());
+        }
+    }
+
+    @Test
+    void testGuardedIncrementIsRejectedWhenTheLeaseNoLongerOwnsThePath() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final long leaseA = 71L;
+            final long leaseB = 72L;
+            final long leaseC = 73L; // live, owns nothing at the path
+            final long now = 1_000L;
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(RaftCommand.put("/locks", bytes(""), 0L, now)).getStatus());
+            for (long lease : Arrays.asList(leaseA, leaseB, leaseC)) {
+                assertEquals(
+                        RaftResult.Status.OK,
+                        machine.apply(RaftCommand.leaseRegister(lease, TTL_MS, now + TTL_MS))
+                                .getStatus());
+            }
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(
+                                    RaftCommand.create("/locks/i", bytes("a"), false, leaseA, now))
+                            .getStatus());
+
+            // the normal acquire path: the owner's guarded bump takes the next token
+            assertEquals(
+                    1L, machine.apply(RaftCommand.increment("/locks/i", 1L, leaseA)).getValue());
+
+            // A stalls past its ttl: the expiry cascade frees lease and record in one revision,
+            // B re-creates the path and takes a token of its own
+            assertTrue(machine.apply(RaftCommand.leaseExpire(leaseA, -1L)).isExpired());
+            assertEquals(
+                    RaftResult.Status.NOT_FOUND,
+                    machine.query(RaftCommand.get("/locks/i")).getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(
+                                    RaftCommand.create("/locks/i", bytes("b"), false, leaseB, now))
+                            .getStatus());
+            assertEquals(
+                    2L, machine.apply(RaftCommand.increment("/locks/i", 1L, leaseB)).getValue());
+
+            // A's late bump must die on its dead lease, never as a token above B's
+            assertEquals(
+                    RaftResult.Status.UNKNOWN_LEASE,
+                    machine.apply(RaftCommand.increment("/locks/i", 1L, leaseA)).getStatus(),
+                    "the dead contender's bump is rejected");
+            assertEquals(
+                    2L,
+                    machine.apply(RaftCommand.increment("/locks/i", 0L, leaseB)).getValue(),
+                    "the rejected bump moved no counter");
+            // a live lease that does not own the record is stale all the same
+            assertEquals(
+                    RaftResult.Status.STALE_LEASE,
+                    machine.apply(RaftCommand.increment("/locks/i", 1L, leaseC)).getStatus(),
+                    "a non-owner's bump is rejected");
+            assertEquals(
+                    2L,
+                    machine.apply(RaftCommand.increment("/locks/i", 0L)).getValue(),
+                    "no rejection moved the counter");
+
+            // plain counter arithmetic keeps its unconditional semantics
+            assertEquals(
+                    3L, machine.apply(RaftCommand.increment("/locks/i", 1L)).getValue());
+        }
+    }
+
+    @Test
+    void testGuardedIncrementSeesARecordStagedInTheSameMultiBatch() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final long leaseId = 81L;
+            final long strangerLeaseId = 82L; // registered, owns nothing at the path
+            final long now = 1_000L;
+            final RaftResult batch =
+                    machine.apply(
+                            RaftCommand.multi(
+                                    Arrays.asList(
+                                            RaftCommand.put("/locks", bytes(""), 0L, now),
+                                            RaftCommand.leaseRegister(leaseId, TTL_MS, now + TTL_MS),
+                                            RaftCommand.create(
+                                                    "/locks/m", bytes("m"), false, leaseId, now),
+                                            RaftCommand.increment("/locks/m", 1L, leaseId))));
+            assertEquals(RaftResult.Status.OK, batch.getStatus());
+            assertEquals(
+                    1L,
+                    batch.getSubResults().get(3).getValue(),
+                    "the guard read the record staged earlier in the same batch");
+
+            // a live lease that owns nothing at the path fails its batch with the guard's status
+            assertEquals(
+                    RaftResult.Status.OK,
+                    machine.apply(
+                                    RaftCommand.leaseRegister(
+                                            strangerLeaseId, TTL_MS, now + TTL_MS))
+                            .getStatus());
+            final RaftResult stranger =
+                    machine.apply(
+                            RaftCommand.multi(
+                                    Collections.singletonList(
+                                            RaftCommand.increment(
+                                                    "/locks/m", 1L, strangerLeaseId))));
+            assertEquals(RaftResult.Status.MULTI_FAILED, stranger.getStatus());
+            assertEquals(0, stranger.getFailIndex());
+            assertEquals(RaftResult.Status.STALE_LEASE, stranger.getFailStatus());
+            assertEquals(
+                    1L,
+                    machine.apply(RaftCommand.increment("/locks/m", 0L)).getValue(),
+                    "the aborted batch moved no counter");
         }
     }
 
@@ -1039,11 +1197,16 @@ public class TestMetadataStateMachine {
             assertEquals(
                     RaftResult.Status.OK,
                     machine.apply(RaftCommand.put("/c..d", bytes("v"), 0L, now)).getStatus());
-            // a lone surrogate is normalized to '?' by the UTF-8 wire encoding before checkPath
+            // a lone surrogate cannot ride the UTF-8 wire: the codec rejects it at encode instead
+            // of substituting '?' (itself a legal path character), so a surrogate path can never
+            // alias a literal one
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> machine.apply(RaftCommand.put("/a\uD800b", bytes("v"), 0L, now)));
             assertEquals(
                     RaftResult.Status.OK,
-                    machine.apply(RaftCommand.put("/a\uD800b", bytes("v"), 0L, now)).getStatus(),
-                    "the surrogate was normalized to '?' by the UTF-8 wire encoding");
+                    machine.apply(RaftCommand.put("/a?b", bytes("v"), 0L, now)).getStatus(),
+                    "a literal '?' is a legal path character");
             assertEquals(
                     RaftResult.Status.OK,
                     machine.query(RaftCommand.get("/a?b")).getStatus());

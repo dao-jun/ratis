@@ -27,7 +27,8 @@ import java.util.Arrays;
 public final class MetadataLogEnvelope {
 
     private static final int CURRENT_FORMAT_VERSION = 1;
-    private static final int DIGEST_LENGTH = 32;
+    /** The sha-256 digest width; shared with {@link InvocationResultStore}'s record format. */
+    static final int DIGEST_LENGTH = 32;
     private static final int COMMAND_LENGTH_OFFSET = 1 + Long.BYTES + Long.BYTES + DIGEST_LENGTH;
     private static final int HEADER_LENGTH = COMMAND_LENGTH_OFFSET + Integer.BYTES;
 

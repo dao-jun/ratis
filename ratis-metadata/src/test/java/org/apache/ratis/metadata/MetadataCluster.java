@@ -69,6 +69,7 @@ public final class MetadataCluster implements AutoCloseable {
     private final boolean purgeForSnapshot;
     private final SupportedRpcType rpcType;
     private final Duration leaseScanInterval;
+    private final Duration leaseClockSkewTolerance;
     private final Duration resultRetention;
     private final Duration retryCacheExpiry;
     private final UUID groupUuid;
@@ -86,6 +87,7 @@ public final class MetadataCluster implements AutoCloseable {
         this.purgeForSnapshot = builder.purgeForSnapshot;
         this.rpcType = builder.rpcType;
         this.leaseScanInterval = builder.leaseScanInterval;
+        this.leaseClockSkewTolerance = builder.leaseClockSkewTolerance;
         this.resultRetention = builder.resultRetention;
         this.retryCacheExpiry = builder.retryCacheExpiry;
         this.groupUuid = builder.groupUuid;
@@ -163,12 +165,16 @@ public final class MetadataCluster implements AutoCloseable {
                         .setStateMachine(stateMachine)
                         .setGroupId(fullGroup.getGroupId().getUuid());
         // Test-only overrides; unset means the production defaults (7-day retention, 5-minute
-        // retry-cache expiry) so these knobs never change default harness behavior.
+        // retry-cache expiry, per-lease ttl/3 skew tolerance) so these knobs never change
+        // default harness behavior.
         if (resultRetention != null) {
             builder.setResultRetention(resultRetention);
         }
         if (retryCacheExpiry != null) {
             builder.setRetryCacheExpiry(retryCacheExpiry);
+        }
+        if (leaseClockSkewTolerance != null) {
+            builder.setLeaseClockSkewTolerance(leaseClockSkewTolerance);
         }
         builder.setPropertiesCustomizer(
                 properties -> {
@@ -312,6 +318,41 @@ public final class MetadataCluster implements AutoCloseable {
         return findLeader(livePeerIds()).orElse(null);
     }
 
+    /**
+     * Waits until a restarted member has fully rejoined the group: it answers group info again
+     * (its transport is bound and its raft server runs, so it grants votes), and its local state
+     * has replayed the whole log - a direct query answers with the revision the current leader
+     * applies. Killing a leader while a restart is still catching up parks the next election
+     * far past any lease ttl - a failover outside the transparency the session contract
+     * describes.
+     */
+    public void awaitRejoined(int i) {
+        final RaftPeerId peerId = peerIds().get(i);
+        TestWait.waitUntil(
+                () -> {
+                    final RaftPeerId leader = leaderId();
+                    if (leader == null) {
+                        return false;
+                    }
+                    try {
+                        adminClient.getGroupManagementApi(peerId).info(groupId());
+                        final long applied =
+                                directQuery(stateMachine(indexOf(leader)), RaftCommand.revision())
+                                        .getRevision();
+                        return directQuery(stateMachine(i), RaftCommand.revision()).getRevision()
+                                >= applied;
+                    } catch (IOException rejoining) {
+                        // A restarting member answers late, not never.
+                        return false;
+                    } catch (RuntimeException notOpenYet) {
+                        // The restarted state machine replays its log before it answers queries.
+                        return false;
+                    }
+                },
+                LEADER_TIMEOUT,
+                "Server " + peerId + " did not rejoin the group within " + LEADER_TIMEOUT);
+    }
+
     private Optional<RaftPeerId> findLeader(List<RaftPeerId> candidates) {
         for (RaftPeerId candidate : candidates) {
             try {
@@ -414,6 +455,7 @@ public final class MetadataCluster implements AutoCloseable {
         private boolean purgeForSnapshot = false;
         private SupportedRpcType rpcType = SupportedRpcType.GRPC;
         private Duration leaseScanInterval = Duration.ofMillis(50);
+        private Duration leaseClockSkewTolerance;
         private Duration resultRetention;
         private Duration retryCacheExpiry;
         private UUID groupUuid;
@@ -440,6 +482,15 @@ public final class MetadataCluster implements AutoCloseable {
 
         public Builder setLeaseScanInterval(Duration leaseScanInterval) {
             this.leaseScanInterval = leaseScanInterval;
+            return this;
+        }
+
+        /**
+         * Forwards the lease clock-skew tolerance of every member's expiry scan (default: the
+         * production per-lease ttl/3) so suites can pin an absolute tolerance deterministically.
+         */
+        public Builder setLeaseClockSkewTolerance(Duration leaseClockSkewTolerance) {
+            this.leaseClockSkewTolerance = leaseClockSkewTolerance;
             return this;
         }
 

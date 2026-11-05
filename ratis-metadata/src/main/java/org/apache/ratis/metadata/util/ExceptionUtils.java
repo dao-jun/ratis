@@ -40,4 +40,22 @@ public final class ExceptionUtils {
         }
         return cause == null ? throwable : cause;
     }
+
+    /** The most causes walked; a longer chain, or one that loops, ends the walk. */
+    private static final int MAX_CAUSE_DEPTH = 64;
+
+    /**
+     * Whether the given type appears in the cause chain, the throwable itself included. The
+     * walk is depth-bounded: a chain longer than {@link #MAX_CAUSE_DEPTH}, or one that loops
+     * back on itself, simply ends the walk.
+     */
+    public static boolean causedBy(Throwable throwable, Class<? extends Throwable> type) {
+        for (int depth = 0; throwable != null && depth < MAX_CAUSE_DEPTH; depth++) {
+            if (type.isInstance(throwable)) {
+                return true;
+            }
+            throwable = throwable.getCause();
+        }
+        return false;
+    }
 }

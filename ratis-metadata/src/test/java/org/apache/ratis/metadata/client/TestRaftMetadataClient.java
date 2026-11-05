@@ -23,15 +23,17 @@ import org.apache.ratis.metadata.statemachine.MetadataStateMachine;
 import org.apache.ratis.metadata.statemachine.RaftCommand;
 import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.statemachine.RaftResult;
+import org.apache.ratis.metadata.util.AsyncDriver;
 import org.apache.ratis.metadata.util.Clock;
 import org.apache.ratis.metadata.util.ExceptionUtils;
-import org.apache.ratis.metadata.util.FutureUtils;
 import org.apache.ratis.metadata.util.ManualClock;
 import org.apache.ratis.metadata.util.SystemClock;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.client.RaftClientRpc;
+import org.apache.ratis.client.retry.RequestTypeDependentRetryPolicy;
 import org.apache.ratis.conf.RaftProperties;
+import org.apache.ratis.proto.RaftProtos.RaftClientRequestProto;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftClientRequest;
@@ -39,14 +41,20 @@ import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.exceptions.AlreadyClosedException;
+import org.apache.ratis.protocol.exceptions.RaftRetryFailureException;
+import org.apache.ratis.retry.ExponentialBackoffRetry;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.retry.RetryPolicy;
+import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.TimeDuration;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -77,8 +85,10 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -87,6 +97,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -108,12 +120,42 @@ public class TestRaftMetadataClient {
      * wait once the absence is proven for a margin no scheduling can miss.
      */
     private static final Duration NEGATIVE_WINDOW = Duration.ofMillis(1500);
+    /**
+     * The observation window of the isolation assertions: a settle that can run completes
+     * within milliseconds of its reply, so this bound only ends the wait once starvation is
+     * proven - well below OPERATION_TIMEOUT, so a regression fails fast.
+     */
+    private static final Duration SETTLE_WINDOW = Duration.ofSeconds(10);
     private static final long POLL_BUDGET_BYTES = 4 * 1024 * 1024;
     private static final String SEQUENTIAL_PATH_PATTERN = "/\\w+/task-\\d{10}";
 
     private static final int FAILOVER_WRITES = 60;
 
     @TempDir File tempDir;
+
+    /**
+     * The withholding stubs of the running test, released by {@link #releaseStubs()} even when a
+     * finally block was missed: {@link AsyncDriver} is JVM-wide, and an unreleased wedge parks
+     * the shared scheduler (or the client's sender) for every later test of the module run.
+     */
+    private final List<WithholdingRpc> withholdings = new CopyOnWriteArrayList<>();
+
+    /** The stub clients of the running test, closed belt-and-braces by {@link #releaseStubs()}. */
+    private final List<RaftMetadataClient> stubClients = new CopyOnWriteArrayList<>();
+
+    @AfterEach
+    void releaseStubs() {
+        for (WithholdingRpc rpc : withholdings) {
+            rpc.failAllPending();
+        }
+        for (RaftMetadataClient client : stubClients) {
+            try {
+                client.close();
+            } catch (RuntimeException ignored) {
+                // Belt-and-braces close: a test that closed already made this a no-op.
+            }
+        }
+    }
 
     @Test
     void testRetryDefaultsAreFiniteAndRetryForeverIsRejected() {
@@ -129,6 +171,28 @@ public class TestRaftMetadataClient {
                 IllegalArgumentException.class, () -> builder.setRetryTimeout(Duration.ofMillis(-1)));
     }
 
+    /**
+     * A retry budget at or below one request attempt gives up on the very first try, which ratis
+     * reports as the raw transport failure - no exhaustion signal, so an ambiguous mutation can
+     * no longer be told from a definitely-undelivered one. The builder refuses it at build; the
+     * rejected build constructs nothing, so one builder serves both asserts.
+     */
+    @Test
+    void testBuilderRejectsARetryBudgetBelowOneAttempt() {
+        final RaftMetadataClient.Builder builder =
+                RaftMetadataClient.newBuilder()
+                        .setGroupId(UUID.fromString(GROUP_UUID))
+                        .addQuorumMember("n0", new InetSocketAddress("localhost", 1));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.setRetryTimeout(Duration.ofSeconds(3)).build(),
+                "a budget equal to one attempt gives up on the first try");
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.setRetryTimeout(Duration.ofSeconds(1)).build(),
+                "a budget below one attempt gives up on the first try");
+    }
+
     @Test
     void testAsyncCallEndsWhenTheClientClosesUnderneath() throws Exception {
         final InetSocketAddress deadMember = new InetSocketAddress("localhost", refusedPort());
@@ -142,7 +206,10 @@ public class TestRaftMetadataClient {
         unbounded.close();
         final Throwable failure =
                 awaitFailureOf(pending, "Closing the client never ended the async call");
-        assertInstanceOf(MetadataTransportException.class, failure);
+        // Close-time teardown is NOT the declared exhaustion signal: a mutation abandoned by
+        // close() stays the plain type (its outcome may still be unknown - see the failure
+        // contract), never widening into the ambiguity subclass.
+        assertEquals(MetadataTransportException.class, failure.getClass());
     }
 
     @Test
@@ -184,6 +251,35 @@ public class TestRaftMetadataClient {
         }
     }
 
+    /**
+     * An unencodable name (an unpaired surrogate) must fail loudly before anything is sent: the
+     * sync surface throws it, the async twin settles its future with it - not with the transport
+     * failure the stub would otherwise produce for a request that did go out.
+     */
+    @Test
+    void testUnencodableNamesFailLoudly() {
+        // A finite policy, so a request that did go out (the pre-rejection behavior) would fail
+        // fast instead of spinning forever against the always-failing stub.
+        final RaftMetadataClient client =
+                newStubClient(
+                        new FailingTransportRpc(),
+                        RetryPolicies.retryUpToMaximumCountWithFixedSleep(
+                                2, TimeDuration.valueOf(20, TimeUnit.MILLISECONDS)));
+        try {
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> client.increment("locks\uD800x", 1L),
+                    "an unencodable counter name must be rejected at encode, not sent");
+            assertInstanceOf(
+                    IllegalArgumentException.class,
+                    awaitFailureOf(
+                            client.incrementAsync("locks\uD800x", 1L),
+                            "An unencodable counter name never settled the future"));
+        } finally {
+            client.close();
+        }
+    }
+
     @Test
     void testAsyncUndecodableReplyFailsTheFuture() throws Exception {
         final RaftMetadataClient poisoned = newStubClient(new UndecodableReplyRpc(), null);
@@ -197,6 +293,181 @@ public class TestRaftMetadataClient {
         }
     }
 
+    /**
+     * A mutation whose retry budget ran out is abandoned with its outcome unknown - some attempt
+     * may have committed and only its reply was lost - so both surfaces answer the ambiguity
+     * subclass carrying ratis' declared budget failure. A read commits nothing and keeps the
+     * plain transport failure (exact class: a subclass would satisfy an instanceof of the
+     * parent). One exhausted budget permanently poisons the async window, so each case gets a
+     * fresh client.
+     */
+    @Test
+    void testExhaustedMutationBudgetSurfacesPossiblyCommitted() {
+        final RetryPolicy twoAttempts =
+                RetryPolicies.retryUpToMaximumCountWithFixedSleep(
+                        2, TimeDuration.valueOf(20, TimeUnit.MILLISECONDS));
+
+        final RaftMetadataClient sync = newStubClient(new FailingTransportRpc(), twoAttempts);
+        try {
+            final PossiblyCommittedException failure =
+                    assertThrows(
+                            PossiblyCommittedException.class, () -> sync.put("/p", bytes("x")));
+            assertInstanceOf(RaftRetryFailureException.class, failure.getCause());
+        } finally {
+            sync.close();
+        }
+
+        final RaftMetadataClient single = newStubClient(new FailingTransportRpc(), twoAttempts);
+        try {
+            final Throwable failure =
+                    awaitFailureOf(
+                            single.putAsync("/p", bytes("x")),
+                            "The async put never settled after its budget ran out");
+            assertInstanceOf(PossiblyCommittedException.class, failure);
+            assertInstanceOf(RaftRetryFailureException.class, failure.getCause());
+        } finally {
+            single.close();
+        }
+
+        final RaftMetadataClient reader = newStubClient(new FailingTransportRpc(), twoAttempts);
+        try {
+            final Throwable failure =
+                    awaitFailureOf(
+                            reader.getAsync("/p"),
+                            "The async get never settled after its budget ran out");
+            assertEquals(MetadataTransportException.class, failure.getClass());
+        } finally {
+            reader.close();
+        }
+    }
+
+    /**
+     * The exhaustion cascade: ratis fails only the exhausted head with the raw budget failure
+     * and every other outstanding request of the ordered pipeline with that failure wrapped in
+     * an {@code AlreadyClosedException} - sent and merely queued alike, which the failure
+     * surface cannot tell apart. After one warmed reply the window pipelines every later
+     * request, so both puts were genuinely in flight; whichever exhausts first, both must carry
+     * the ambiguity, not just the head.
+     */
+    @Test
+    void testPipelinedSiblingsOfAnExhaustedMutationAreAlsoFlaggedAmbiguous() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final RaftMetadataClient client =
+                newStubClient(
+                        rpc,
+                        RetryPolicies.retryUpToMaximumCountWithFixedSleep(
+                                2, TimeDuration.valueOf(20, TimeUnit.MILLISECONDS)));
+        try {
+            // One reply first: the window then pipelines every later request immediately.
+            client.putAsync("/warm", bytes("w")).join();
+
+            rpc.failAll = true; // every attempt now fails at the transport level
+            final CompletableFuture<Long> first = client.putAsync("/p1", bytes("x"));
+            final CompletableFuture<Long> second = client.putAsync("/p2", bytes("y"));
+
+            for (CompletableFuture<Long> pipelined : Arrays.asList(first, second)) {
+                final Throwable failure =
+                        awaitFailureOf(
+                                pipelined,
+                                "A pipelined mutation never settled after the budget ran out");
+                assertInstanceOf(PossiblyCommittedException.class, failure);
+                assertTrue(
+                        causedBy(failure, RaftRetryFailureException.class),
+                        "the ambiguity must carry ratis' declared budget failure, got " + failure);
+            }
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * The residual first-attempt gap, pinned as the boundary it is: with one attempt budgeted,
+     * ratis reports the raw transport cause (no retry was ever made), so the client must keep it
+     * the plain transport failure and never widen its budget-failure matching into a guess about
+     * raw causes. Exact class, because a subclass would satisfy assertThrows of the parent.
+     */
+    @Test
+    void testFirstAttemptGiveUpStaysThePlainTransportFailure() {
+        final RaftMetadataClient client =
+                newStubClient(
+                        new FailingTransportRpc(),
+                        RetryPolicies.retryUpToMaximumCountWithFixedSleep(
+                                1, TimeDuration.valueOf(1, TimeUnit.MILLISECONDS)));
+        try {
+            final MetadataTransportException failure =
+                    assertThrows(
+                            MetadataTransportException.class, () -> client.put("/p", bytes("x")));
+            assertEquals(MetadataTransportException.class, failure.getClass());
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * The whole-prefix enumerations page: every LIST request the client issues is bounded by the
+     * wire-safe page size, the pages chain through continuation cursors that resume at the
+     * previous page's last path, and the combined result is still the entire sorted prefix - on
+     * the sync surface and the async one alike. The async chain must also issue every follow-on
+     * page off the completion threads: a send can block its issuer under ratis'
+     * outstanding-requests backpressure, and a parked completion thread stalls every async
+     * settlement of the client.
+     */
+    @Test
+    void testListEnumeratesInTransportBoundedPages() throws Exception {
+        final List<String> prefix = new ArrayList<>();
+        for (int i = 0; i < 3 * 1024 + 5; i++) {
+            prefix.add(String.format(Locale.ROOT, "/listing/%06d", i));
+        }
+        final ListServingRpc rpc = new ListServingRpc(prefix);
+        final RaftMetadataClient client = newStubClient(rpc, null);
+        try {
+            rpc.resetRecordings();
+            assertEquals(prefix, pathsOf(client.list("/listing/")));
+            assertBoundedChainedPages(rpc);
+
+            rpc.resetRecordings();
+            assertEquals(prefix, pathsOf(client.listAsync("/listing/").join()));
+            assertBoundedChainedPages(rpc);
+            final List<ListServingRpc.ServedList> served = rpc.served();
+            for (int i = 1; i < served.size(); i++) {
+                assertFalse(
+                        served.get(i).thread.startsWith("raft-metadata-async"),
+                        "follow-on page " + i + " was issued on " + served.get(i).thread);
+            }
+        } finally {
+            client.close();
+        }
+
+        // The wire-bound guard: whatever either constant becomes, one page must stay under the
+        // grpc default message cap even at the 3-bytes-per-char worst-case path.
+        final long pageResults = (Long) staticFieldOf(RaftMetadataClient.class, "LIST_PAGE_RESULTS");
+        final int maxPathLength =
+                (Integer) staticFieldOf(MetadataStateMachine.class, "MAX_PATH_LENGTH");
+        assertTrue(
+                pageResults * (3L * maxPathLength + 13L) < 64L * 1024 * 1024,
+                pageResults + " results of " + maxPathLength + "-char paths exceed the 64 MB cap");
+    }
+
+    /** Every recorded page is bounded, and each cursor resumes at the previous page's last path. */
+    private static void assertBoundedChainedPages(ListServingRpc rpc) {
+        final List<ListServingRpc.ServedList> served = rpc.served();
+        for (ListServingRpc.ServedList page : served) {
+            assertTrue(
+                    page.maxResults > 0 && page.maxResults <= 1024,
+                    "every page request must be wire-bounded, got " + page.maxResults);
+        }
+        assertTrue(
+                served.size() >= 2,
+                "a prefix beyond one page must be chained through several requests, got "
+                        + served.size());
+        for (int i = 1; i < served.size(); i++) {
+            assertEquals(
+                    served.get(i - 1).lastPath,
+                    served.get(i).startAfter,
+                    "page " + i + " must resume at the previous page's last path");
+        }
+    }
+
     @Test
     void testAsyncCompletionsRunOnTheClientExecutor() throws Exception {
         final ControllableReplyRpc rpc = new ControllableReplyRpc();
@@ -204,12 +475,202 @@ public class TestRaftMetadataClient {
         try {
             final CompletableFuture<String> completingThread =
                     client.getAsync("/any").thenApply(record -> Thread.currentThread().getName());
+            // A returned async call means the send is enqueued, not issued: gate on the stub -
+            // the request reaches it on the client's sender thread, moments after the return.
+            waitUntil(
+                    rpc::hasPending,
+                    Duration.ofSeconds(5),
+                    "The get never reached the rpc");
             // The call stays pending until the test supplies the reply, so the chain provably
             // runs on whatever thread settles it - the client's executor, not the caller's.
             rpc.completePendingGet();
             assertTrue(
                     completingThread.join().startsWith("raft-metadata-async"),
                     "completions must run on the client's own executor");
+        } finally {
+            client.close();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The sender thread: no caller, completion or scheduler thread ever
+    // parks inside ratis' ordered-async machinery
+    // ------------------------------------------------------------------
+
+    /**
+     * The core F5 pin: a send wedged in ratis' outstanding-request backpressure must stall only
+     * the client's sender thread - never the one JVM-wide scheduler every component's periodic
+     * step runs on. Both of the client's two permits are withheld forever (the first send parks
+     * at the stub, the second is delayed inside ratis' sliding window holding the second permit,
+     * and no retry fires), so any send issued on the scheduler thread itself would park it
+     * there; the probe task behind such a renewal would never run.
+     */
+    @Test
+    void testWedgedPipelineDoesNotStallTheSharedScheduler() throws Exception {
+        final WithholdingRpc rpc = new WithholdingRpc();
+        withholdings.add(rpc);
+        final RaftMetadataClient client = newStubClient(rpc, RetryPolicies.noRetry(), 2);
+        try {
+            client.putAsync("/wedge/first", bytes("x"));
+            client.putAsync("/wedge/second", bytes("x"));
+            // A background step's shape: a renewal driven by the shared scheduler.
+            AsyncDriver.schedule(() -> client.renewLeaseAsync(7L, Duration.ofSeconds(30)), 0L);
+            final CountDownLatch probe = new CountDownLatch(1);
+            AsyncDriver.schedule(probe::countDown, 50L);
+            assertTrue(
+                    probe.await(10, TimeUnit.SECONDS),
+                    "a send wedged in the pipeline backpressure must not stall the shared"
+                            + " scheduler");
+        } finally {
+            rpc.failAllPending();
+            client.close();
+        }
+    }
+
+    /**
+     * The finding's failure scenario verbatim: a lock's acquire-timeout task must fire while the
+     * pipeline is wedged. The timeout task runs on the shared scheduler - so its begin step must
+     * never park that scheduler in the pipeline's backpressure, or the queued timeout (and every
+     * other component's tick with it) never runs and the acquire hangs instead of failing.
+     */
+    @Test
+    void testLockAcquireTimeoutFiresWhileThePipelineIsWedged() throws Exception {
+        final WithholdingRpc rpc = new WithholdingRpc();
+        withholdings.add(rpc);
+        final RaftMetadataClient client = newStubClient(rpc, RetryPolicies.noRetry(), 2);
+        try {
+            client.putAsync("/wedge/first", bytes("x"));
+            client.putAsync("/wedge/second", bytes("x"));
+            final MetadataLock lock =
+                    MetadataLock.newBuilder()
+                            .setClient(client)
+                            .setPath("/wedge/lock")
+                            .setTtl(Duration.ofSeconds(2))
+                            .build();
+            final Throwable failure =
+                    awaitFailureOf(
+                            lock.acquireAsync(Duration.ofMillis(300)),
+                            "The acquire timeout never fired while the pipeline was wedged");
+            assertInstanceOf(TimeoutException.class, failure);
+        } finally {
+            rpc.failAllPending();
+            client.close();
+        }
+    }
+
+    /**
+     * Close()'s bounded drain: against a transport that fails nothing on close (this stub's
+     * close is a no-op and the permits stay withheld), close() itself must return at once, and
+     * the sends it stranded - the one whose issue parks the sender in the backpressure acquire
+     * and the ones still queued behind it - must still settle within the drain's grace. The
+     * first two puts are already inside ratis' pipeline at close and keep their pre-fix
+     * semantics (settled by the hygiene release, not asserted): the drain's contract covers
+     * exactly the newly-introduced queued state.
+     */
+    @Test
+    void testCloseSettlesSendsQueuedBehindAWedgedPipeline() throws Exception {
+        final WithholdingRpc rpc = new WithholdingRpc();
+        withholdings.add(rpc);
+        final RaftMetadataClient client = newStubClient(rpc, RetryPolicies.noRetry(), 2);
+        try {
+            client.putAsync("/wedge/first", bytes("x"));
+            client.putAsync("/wedge/second", bytes("x"));
+            final CompletableFuture<Long> parking = client.putAsync("/wedge/third", bytes("x"));
+            final CompletableFuture<Long> queued = client.putAsync("/wedge/fourth", bytes("x"));
+            final long closeStarted = System.nanoTime();
+            client.close();
+            assertTrue(
+                    System.nanoTime() - closeStarted < TimeUnit.SECONDS.toNanos(1),
+                    "close() must never block on a wedged pipeline");
+            for (CompletableFuture<Long> stranded : Arrays.asList(parking, queued)) {
+                final Throwable failure =
+                        awaitFailureOf(
+                                stranded,
+                                "A send stranded by close() never settled through the bounded"
+                                        + " drain");
+                assertEquals(
+                        MetadataTransportException.class,
+                        failure.getClass(),
+                        "a stranded send settles as the transport family, got " + failure);
+            }
+        } finally {
+            rpc.failAllPending();
+        }
+    }
+
+    /**
+     * The admission reservation: once the queue holds the non-lease bound, further non-lease
+     * sends fail fast with the transport family - while a lease-lifecycle send issued right
+     * after the flood is still admitted (its future stays pending, the reservation at work), so
+     * session renewals keep entering a saturated pipeline. Asserts admission only, not the
+     * renewal's latency; the bound itself is documented in the README's threading model.
+     */
+    @Test
+    void testLeaseCriticalSendsPassAFullQueue() throws Exception {
+        final WithholdingRpc rpc = new WithholdingRpc();
+        withholdings.add(rpc);
+        final RaftMetadataClient client = newStubClient(rpc, RetryPolicies.noRetry(), 2);
+        try {
+            client.putAsync("/wedge/first", bytes("x"));
+            client.putAsync("/wedge/second", bytes("x"));
+            client.putAsync("/wedge/third", bytes("x")); // parks the sender worker
+            final List<CompletableFuture<Long>> flood = new ArrayList<>();
+            for (int i = 0; i < 200; i++) {
+                flood.add(client.putAsync("/wedge/flood/" + i, bytes("x")));
+            }
+            CompletableFuture<Long> refused = null;
+            for (CompletableFuture<Long> flooded : flood) {
+                if (flooded.isDone()) {
+                    refused = flooded;
+                }
+            }
+            assertNotNull(refused, "a flood past the admission bound must fast-fail at return");
+            final Throwable failure =
+                    awaitFailureOf(
+                            refused, "The fast-failed flooded send settled with something else");
+            assertEquals(MetadataTransportException.class, failure.getClass());
+
+            final CompletableFuture<Long> renewal =
+                    client.renewLeaseAsync(7L, Duration.ofSeconds(30));
+            assertFalse(
+                    renewal.isDone(),
+                    "a lease-critical send is admitted past the non-lease bound");
+        } finally {
+            rpc.failAllPending();
+            client.close();
+        }
+    }
+
+    /**
+     * Design guard of the single FIFO sender - honest label: today's synchronous sends from one
+     * thread are also ordered, so this does not pin the defect; it pins the FIFO choice a naive
+     * multi-threaded "fix" would break. Every send issued from one thread must reach the
+     * pipeline in issue order: ratis assigns its sliding-window sequence numbers at submission,
+     * so a reordered submission breaks the lock recipe's create-before-revoke guarantee. All
+     * futures are joined (and the total count asserted) before the order check, so a send not
+     * yet issued can neither fail nor pass the assertion vacuously.
+     */
+    @Test
+    void testAsyncSendsReachThePipelineInIssueOrder() {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final RaftMetadataClient client = newStubClient(rpc, null);
+        try {
+            final int gets = 50;
+            final List<CompletableFuture<RaftMetadataClient.MetadataRecord>> reads =
+                    new ArrayList<>();
+            for (int i = 0; i < gets; i++) {
+                reads.add(client.getAsync("/order/" + i));
+            }
+            final CompletableFuture<Long> revocation = client.revokeLeaseAsync(7L);
+            CompletableFuture.allOf(reads.toArray(new CompletableFuture[0])).join();
+            revocation.join();
+
+            assertEquals(gets + 1, rpc.sent.size(), "every issued send reached the pipeline");
+            assertEquals(gets, rpc.countOf(RaftCommand.Op.GET));
+            assertEquals(
+                    gets,
+                    rpc.firstIndexOf(RaftCommand.Op.LEASE_EXPIRE, null),
+                    "the revocation follows every send issued before it");
         } finally {
             client.close();
         }
@@ -331,10 +792,122 @@ public class TestRaftMetadataClient {
                     () -> !watcher.isRunning() && watcher.getFailure() != null,
                     OPERATION_TIMEOUT,
                     "The watcher kept idling over the closed client instead of stopping");
-            assertInstanceOf(IllegalStateException.class, watcher.getFailure());
+            final Throwable failure = watcher.getFailure();
             assertTrue(
-                    watcher.getFailure().getMessage().contains("already closed"),
-                    "the stop must carry the closed-client cause");
+                    failure instanceof IllegalStateException
+                            || (failure instanceof MetadataTransportException
+                                    && causedBy(failure, AlreadyClosedException.class)),
+                    "the stop must carry the closed-client cause: " + failure);
+            assertTrue(failure.getMessage().contains("closed"), "the stop must name the closing");
+            watcher.close();
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * The no-way-back half of the watcher's transport classification: a stub client whose raft
+     * client cannot be rebuilt (the injected constructor) keeps its poisoned window forever, so
+     * the watcher must stop terminally instead of re-polling a window that can never deliver
+     * again. Pre-fix this is the defect itself: the chain loops at DEBUG forever, isRunning()
+     * stays true and getFailure() stays null.
+     */
+    @Test
+    void testWatcherStopsWhenTheAsyncWindowIsPoisoned() throws Exception {
+        final FailingTransportRpc rpc = new FailingTransportRpc();
+        final RaftMetadataClient client =
+                newStubClient(
+                        rpc,
+                        RetryPolicies.retryUpToMaximumCountWithFixedSleep(
+                                2, TimeDuration.valueOf(20, TimeUnit.MILLISECONDS)));
+        try {
+            final Recorder recorder = new Recorder();
+            final MetadataWatcher watcher =
+                    MetadataWatcher.newBuilder(client, recorder)
+                            .setSinceRevision(9)
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcher.start();
+            // The first poll exhausts its finite budget, which poisons the ordered window; the
+            // second poll then fails fast with AlreadyClosedException under an MTE.
+            waitUntil(
+                    () -> watcher.getFailure() != null && !watcher.isRunning(),
+                    OPERATION_TIMEOUT,
+                    "The watcher looped futilely over the poisoned async window instead of"
+                            + " stopping");
+            final Throwable failure = watcher.getFailure();
+            assertInstanceOf(MetadataTransportException.class, failure);
+            assertTrue(
+                    causedBy(failure, AlreadyClosedException.class),
+                    "the stop must carry the poisoned-window cause: " + failure);
+            assertEquals(9L, watcher.lastDeliveredRevision(), "the checkpoint stands for a resume");
+            assertTrue(recorder.deliveredEvents().isEmpty());
+            assertNull(recorder.needSnapshotLine());
+
+            // The stop is final on this client: the window fails inside submitNewRequest, before
+            // the transport, so the exhausted budget of the first poll stays the only traffic.
+            Thread.sleep(NEGATIVE_WINDOW.toMillis());
+            assertEquals(2, rpc.attempts.get(), "the stopped chain must not hammer the dead window");
+
+            // restartFrom cannot revive this watcher: it stays bound to the dead client, so the
+            // restarted chain stops the same way (pinned by the restartFrom javadoc).
+            watcher.restartFrom(9);
+            assertTrue(watcher.isRunning());
+            assertNull(watcher.getFailure());
+            waitUntil(
+                    () -> watcher.getFailure() != null && !watcher.isRunning(),
+                    OPERATION_TIMEOUT,
+                    "The restarted chain never met the poisoned window");
+            watcher.close();
+
+            // The documented resume: a NEW watcher on a rebuilt client, from the checkpoint.
+            final ScriptedReplyRpc healthyRpc = new ScriptedReplyRpc();
+            final RaftMetadataClient rebuilt = newStubClient(healthyRpc, null);
+            try {
+                final MetadataWatcher next =
+                        MetadataWatcher.newBuilder(rebuilt, new Recorder())
+                                .setSinceRevision(9)
+                                .setPollInterval(Duration.ofMillis(50))
+                                .build();
+                next.start();
+                waitUntil(
+                        () -> healthyRpc.countOf(RaftCommand.Op.POLL_CHANGES) >= 2,
+                        OPERATION_TIMEOUT,
+                        "The rebuilt chain never resumed polling");
+                assertTrue(next.isRunning(), "a rebuilt client resumes the stream");
+                assertNull(next.getFailure());
+                next.close();
+            } finally {
+                rebuilt.close();
+            }
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * The keep-polling half: a poll answered MALFORMED is a cause-less MetadataTransportException
+     * from a SUCCESSFUL raft reply, so the window stays healthy and no AlreadyClosedException can
+     * ever follow - the watcher must keep polling (the README failure contract documents the
+     * policy). Fails if the stop were widened to any transport failure.
+     */
+    @Test
+    void testWatcherKeepsPollingOnTransportFailuresWithoutClose() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        rpc.errorStatuses.put(RaftCommand.Op.POLL_CHANGES, RaftResult.Status.MALFORMED);
+        final RaftMetadataClient client = newStubClient(rpc, null);
+        try {
+            final MetadataWatcher watcher =
+                    MetadataWatcher.newBuilder(client, new Recorder())
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcher.start();
+            waitUntil(
+                    () -> rpc.countOf(RaftCommand.Op.POLL_CHANGES) >= 3,
+                    OPERATION_TIMEOUT,
+                    "The watcher never entered its transport-retry loop");
+            assertTrue(watcher.isRunning(), "a healthy window must keep the chain polling");
+            assertNull(watcher.getFailure());
             watcher.close();
         } finally {
             client.close();
@@ -405,6 +978,112 @@ public class TestRaftMetadataClient {
             watcher.close();
         } finally {
             pool.shutdownNow();
+            client.close();
+        }
+    }
+
+    /**
+     * Default-executor callbacks must be isolated from the client's machinery: two watchers
+     * built without an executor park their first callbacks, and while BOTH are parked the same
+     * client still settles an async read and keeps renewing a due lease. Inline delivery (the
+     * old default) ran each callback on one of the client's two completion-executor threads -
+     * two parked callbacks starved every settle: a renewal reply never completed,
+     * {@code LeaseSession#renewing} latched, and the lease expired server-side while its holder
+     * blocked on something else entirely.
+     */
+    @Test
+    void testDefaultWatcherCallbacksCannotStallTheClientMachinery() throws Exception {
+        final ImmediatePollRpc rpc = new ImmediatePollRpc();
+        final RaftMetadataClient client = newStubClient(rpc, null);
+        final ManualClock clock = new ManualClock(0L);
+        final LeaseSession session = new LeaseSession(client, 99L, 3_000L, clock);
+        final BlockingListener first = new BlockingListener();
+        final BlockingListener second = new BlockingListener();
+        MetadataWatcher watcherA = null;
+        MetadataWatcher watcherB = null;
+        try {
+            watcherA =
+                    MetadataWatcher.newBuilder(client, first)
+                            .setSinceRevision(0)
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcherB =
+                    MetadataWatcher.newBuilder(client, second)
+                            .setSinceRevision(0)
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcherA.start();
+            watcherB.start();
+            assertTrue(
+                    first.firstEntered.await(OPERATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
+                    "The first watcher's callback never started");
+            assertTrue(
+                    second.firstEntered.await(OPERATION_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS),
+                    "The second watcher's callback never started");
+
+            // Pin 1 - the routing: default callbacks land on the client's delivery pool, never
+            // on a completion-executor thread (those two threads settle every async reply).
+            for (BlockingListener listener : Arrays.asList(first, second)) {
+                assertTrue(
+                        listener.firstCallbackThread().startsWith("raft-metadata-delivery"),
+                        "a default-executor callback ran on " + listener.firstCallbackThread());
+            }
+
+            // Pin 2 - settles keep flowing while both callbacks are parked, on the client's own
+            // completion executor exactly as before. The probe's reply is withheld until the
+            // get is in flight, so the dependent stage provably runs on the settling thread -
+            // never on the thread that issued the call.
+            final CompletableFuture<String> settlingThread =
+                    client.getAsync("/isolation-probe")
+                            .thenApply(record -> Thread.currentThread().getName());
+            waitUntil(
+                    rpc::hasPendingGet,
+                    SETTLE_WINDOW,
+                    "The isolation probe never reached the rpc");
+            rpc.answerPendingGet();
+            waitUntil(
+                    settlingThread::isDone,
+                    SETTLE_WINDOW,
+                    "Two parked default callbacks starved the client's async settles");
+            assertTrue(
+                    settlingThread.join().startsWith("raft-metadata-async"),
+                    "settles keep running on the client's completion executor");
+
+            // Pin 3 - the lease angle: a due renewal settles (its session unlatches) and the
+            // NEXT renewal leaves. The stub counts at SEND time, so the second probe must keep
+            // making the renewal due inside the wait loop - a single fixed advance could land
+            // before the first renewal's settle and freeze the ManualClock base past all
+            // due-ness.
+            session.start();
+            clock.advanceTime(1_100L, TimeUnit.MILLISECONDS);
+            session.tick();
+            waitUntil(
+                    () -> rpc.renewals() == 1,
+                    OPERATION_TIMEOUT,
+                    "The first renewal never left the session");
+            waitUntil(
+                    () -> {
+                        clock.advanceTime(1_100L, TimeUnit.MILLISECONDS); // a full interval past any base
+                        session.tick();                                   // no-op while the settle is pending
+                        return rpc.renewals() >= 2;
+                    },
+                    OPERATION_TIMEOUT,
+                    "The parked callbacks starved the renewal settles: the session stopped"
+                            + " renewing");
+            assertTrue(session.isAlive(), "the lease outlived the parked callbacks");
+        } finally {
+            // BEFORE any close, and on every exit: unpark the delivery pool's threads whatever
+            // failed - a parked callback would otherwise pin them for the client's whole life
+            // and cascade into every later watcher of the client.
+            first.release();
+            second.release();
+            if (watcherA != null) {
+                watcherA.close();
+            }
+            if (watcherB != null) {
+                watcherB.close();
+            }
+            session.close();
             client.close();
         }
     }
@@ -595,7 +1274,7 @@ public class TestRaftMetadataClient {
                     rpc::hasInFlightPoll,
                     OPERATION_TIMEOUT,
                     "The watcher never issued its first poll");
-            rpc.answerNeedSnapshot(5L); // the report runs inline here
+            rpc.answerNeedSnapshot(5L); // the report runs on the client's default delivery pool
             waitUntil(
                     () -> recorder.needSnapshotLine() != null && !watcher.isRunning(),
                     OPERATION_TIMEOUT,
@@ -894,6 +1573,445 @@ public class TestRaftMetadataClient {
         session.tick();
         assertEquals(
                 renewals, rpc.countOf(RaftCommand.Op.LEASE_RENEW), "no renewal after stop");
+    }
+
+    /**
+     * Renewals of a session ride the client's own ttl-sized pipeline, never the general one
+     * shared with user operations: through a leader close the general pipeline's window can
+     * head-of-line-park a renewal far past its lease's ttl + ttl/3 budget, the exact defect
+     * class the renewal pipeline exists to bypass. Pre-fix (the dispatch on the shared {@code
+     * renewLeaseAsync}) the renewal appears on the main rpc and this pin fails.
+     */
+    @Test
+    void testSessionRenewalsRideTheirOwnPipelineNotTheGeneralOne() throws Exception {
+        final ScriptedReplyRpc mainRpc = new ScriptedReplyRpc();
+        final AtomicReference<ScriptedReplyRpc> renewalRpc = new AtomicReference<>();
+        final RaftMetadataClient client =
+                new RaftMetadataClient(
+                        stubRaftClientOf(mainRpc, null),
+                        SystemClock.getInstance(),
+                        ttlMs -> {
+                            final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+                            renewalRpc.set(rpc);
+                            return stubRaftClientOf(rpc, null);
+                        });
+        try {
+            final ManualClock clock = new ManualClock(0L);
+            final LeaseSession session = new LeaseSession(client, 9L, 3_000L, clock);
+            session.start();
+            clock.advanceTime(1_100L, TimeUnit.MILLISECONDS);
+            session.tick();
+            waitUntil(
+                    () -> renewalRpc.get() != null
+                                    && renewalRpc.get().countOf(RaftCommand.Op.LEASE_RENEW) >= 1,
+                    Duration.ofSeconds(5),
+                    "The renewal never went out on its own pipeline");
+            assertEquals(
+                    0,
+                    mainRpc.countOf(RaftCommand.Op.LEASE_RENEW),
+                    "a session renewal must not ride the general pipeline");
+            session.close();
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * A renewal client that exhausted its ttl-sized budget (or whose sliding window the
+     * exhaustion poisoned) is transport trouble, never session death: it is discarded and the
+     * next tick mints a fresh one. Pre-fix the equivalent exhaustion on the shared pipeline
+     * killed the session for good - the budget failure surfaced as {@code
+     * RaftRetryFailureException}, later sends failed with its {@code AlreadyClosedException}
+     * wrap, and {@code LeaseSession#onRenewalFailure} misread that cause as the client closing.
+     */
+    @Test
+    void testSpentRenewalPipelineIsReopenedNotFatal() throws Exception {
+        final List<ScriptedReplyRpc> pipelines = new CopyOnWriteArrayList<>();
+        final RaftMetadataClient client =
+                new RaftMetadataClient(
+                        stubRaftClientOf(new ScriptedReplyRpc(), null),
+                        SystemClock.getInstance(),
+                        ttlMs -> {
+                            final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+                            rpc.failAll = true; // every attempt fails at the transport level
+                            pipelines.add(rpc);
+                            return stubRaftClientOf(rpc, tightRenewalPolicy());
+                        });
+        try {
+            final ManualClock clock = new ManualClock(0L);
+            final LeaseSession session = new LeaseSession(client, 11L, 3_000L, clock);
+            session.start(); // registers with the 50ms scheduler tick
+            clock.advanceTime(1_100L, TimeUnit.MILLISECONDS); // due forever until a success
+            waitUntil(
+                    () -> pipelines.size() >= 2,
+                    Duration.ofSeconds(10),
+                    "the spent renewal pipeline was never reopened");
+            assertTrue(
+                    session.isAlive(),
+                    "a spent renewal pipeline is transport trouble, never session death");
+            session.close();
+        } finally {
+            client.close();
+        }
+    }
+
+    /** WRITE-only budget of 300ms, backoff 50ms - the shape the production factory builds. */
+    private static RetryPolicy tightRenewalPolicy() {
+        return RequestTypeDependentRetryPolicy.newBuilder()
+                .setRetryPolicy(
+                        RaftClientRequestProto.TypeCase.WRITE,
+                        ExponentialBackoffRetry.newBuilder()
+                                .setBaseSleepTime(TimeDuration.valueOf(50, TimeUnit.MILLISECONDS))
+                                .build())
+                .setTimeout(
+                        RaftClientRequestProto.TypeCase.WRITE,
+                        TimeDuration.valueOf(300, TimeUnit.MILLISECONDS))
+                .build();
+    }
+
+    /**
+     * The renewal sizing law: a third of the sizing ttl per attempt (floored at 250ms, capped
+     * by the request timeout), backoff from a sixth of the ttl up to a third, and a whole
+     * dispatch budget of the ttl plus the ttl/3 expiry grace. Any regression to the general
+     * pipeline's constants (3s attempt, 200ms-5s backoff, 24h budget) fails these values.
+     */
+    @Test
+    void testRenewalPacingIsDerivedFromTheTtl() {
+        assertEquals(2_000L, RaftMetadataClient.renewalAttemptTimeoutMs(6_000L, 3_000L));
+        assertEquals(3_000L, RaftMetadataClient.renewalAttemptTimeoutMs(30_000L, 3_000L));
+        assertEquals(250L, RaftMetadataClient.renewalAttemptTimeoutMs(300L, 3_000L));
+        assertEquals(200L, RaftMetadataClient.renewalBackoffBaseMs(6_000L));
+        assertEquals(2_000L, RaftMetadataClient.renewalBackoffMaxMs(6_000L));
+        assertEquals(8_000L, RaftMetadataClient.renewalRetryBudgetMs(6_000L)); // ttl + ttl/3
+    }
+
+    // ------------------------------------------------------------------
+    // A poisoned async pipeline is rebuilt, not lingered in
+    // ------------------------------------------------------------------
+
+    /**
+     * The M10 core, end to end on ratis' real ordered-async window (only the rpc is a stub):
+     * one exhausted retry budget poisons the window permanently, and pre-fix that death was the
+     * client's own - every later send failed fast with an {@code AlreadyClosedException} wrap,
+     * the session's renewal read the wrap as the client closing, stopped, and the leader's
+     * expiry cascade deleted its records. With the rebuild the poison costs one failed call:
+     * the client swaps in a fresh pipeline, the next renewal rides it, the session survives.
+     */
+    @Test
+    void testPoisonedAsyncPipelineIsRebuiltAndTheLeaseSessionSurvives() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final ManualClock clock = new ManualClock(0L);
+        final AtomicInteger builds = new AtomicInteger();
+        final RaftMetadataClient client =
+                newRecoverableStubClient(rpc, singleAttemptPolicy(), 200L, clock, builds);
+        final LeaseSession session = new LeaseSession(client, 99L, 3_000L, clock);
+        session.start();
+        final RaftClient first = raftClientOf(client);
+
+        rpc.failAll = true; // the single-attempt budget exhausts; the window keeps the death
+        final Throwable failure =
+                awaitFailureOf(
+                        client.putAsync("/burst", bytes("x")),
+                        "The poisoning put never settled after its budget ran out");
+        assertEquals(
+                MetadataTransportException.class,
+                failure.getClass(),
+                "the poisoning call still fails exactly as before");
+
+        rpc.failAll = false;
+        clock.advanceTime(1_100L, TimeUnit.MILLISECONDS); // the renewal comes due
+        session.tick(); // dies fast on the poisoned window - the detection that rebuilds
+        // Pre-fix this times out: nothing ever replaces the dead client, and the session
+        // never renews again.
+        waitUntil(
+                () -> raftClientOf(client) != first,
+                Duration.ofSeconds(5),
+                "The poisoned pipeline was never rebuilt");
+        assertEquals(2, builds.get(), "one poison, one rebuild");
+
+        session.tick(); // due-ness stands: the failed renewal left the session due
+        waitUntil(
+                () -> rpc.countOf(RaftCommand.Op.LEASE_RENEW) >= 1,
+                Duration.ofSeconds(5),
+                "The renewal never reached the healed stub through the rebuilt pipeline");
+        assertTrue(session.isAlive(), "the session rode out the poison instead of dying");
+        assertTrue(client.sessions.contains(session), "the surviving session stayed registered");
+    }
+
+    /**
+     * The poison source is the sessions' OWN traffic this time: one renewal exhausts its
+     * budget and kills the shared window, and pre-fix the sibling session died with it - its
+     * next renewal hit the dead window, whose {@code AlreadyClosedException} wrap read as the
+     * client closing. With the rebuild both sessions keep renewing through the fresh
+     * pipeline, whichever session's renewal set the poison. The single sender thread keeps
+     * the poison deterministic: the first-queued renewal fails raw at the transport, the
+     * second fails fast on the window it killed.
+     */
+    @Test
+    void testRenewalExhaustingItsOwnBudgetKeepsEverySessionAlive() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final ManualClock clock = new ManualClock(0L);
+        final RaftMetadataClient client =
+                newRecoverableStubClient(
+                        rpc, singleAttemptPolicy(), 200L, clock, new AtomicInteger());
+        final LeaseSession victim = new LeaseSession(client, 10L, 3_000L, clock);
+        final LeaseSession sibling = new LeaseSession(client, 11L, 3_000L, clock);
+        victim.start();
+        sibling.start();
+        final RaftClient first = raftClientOf(client);
+
+        rpc.failAll = true;
+        clock.advanceTime(1_100L, TimeUnit.MILLISECONDS);
+        victim.tick(); // queued first: its renewal exhausts the budget and poisons the window
+        waitUntil(
+                () -> {
+                    sibling.tick(); // queued second: dies fast on the dead window, and detects
+                    return raftClientOf(client) != first;
+                },
+                Duration.ofSeconds(10),
+                "The pipeline poisoned by a renewal was never rebuilt");
+
+        rpc.failAll = false;
+        waitUntil(
+                () -> {
+                    clock.advanceTime(1_100L, TimeUnit.MILLISECONDS); // keep both sessions due
+                    victim.tick();
+                    sibling.tick();
+                    return rpc.countOf(RaftCommand.Op.LEASE_RENEW, 10L) >= 2
+                            && rpc.countOf(RaftCommand.Op.LEASE_RENEW, 11L) >= 1;
+                },
+                Duration.ofSeconds(10),
+                "No session renewed through the rebuilt pipeline");
+        assertTrue(victim.isAlive(), "the session whose renewal poisoned the window survived");
+        assertTrue(sibling.isAlive(), "the sibling session survived the poison");
+        assertTrue(
+                client.sessions.contains(victim) && client.sessions.contains(sibling),
+                "both sessions stayed registered");
+    }
+
+    /**
+     * The watcher half of the same defect: pre-fix the poisoned window turned the watcher
+     * into a silent dead loop - it logged transport trouble and re-polled forever against a
+     * window that could never deliver again. With the rebuild the next failing poll swaps in
+     * a fresh pipeline and the poll after it delivers again; the watcher never even stops.
+     */
+    @Test
+    void testWatcherResumesAfterThePipelineIsPoisoned() throws Exception {
+        final FlakyPollRpc rpc = new FlakyPollRpc();
+        rpc.failAll = true; // set before start: the very first poll must be the poison source
+        final RaftMetadataClient client =
+                newRecoverableStubClient(
+                        rpc, singleAttemptPolicy(), 200L, SystemClock.getInstance(),
+                        new AtomicInteger());
+        try {
+            final Recorder recorder = new Recorder();
+            final MetadataWatcher watcher =
+                    MetadataWatcher.newBuilder(client, recorder)
+                            .setSinceRevision(5L)
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcher.start(); // poll 1 exhausts its budget and poisons the window
+            waitUntil(
+                    () -> rpc.failedSends() >= 1,
+                    Duration.ofSeconds(5),
+                    "The poisoning poll never reached the transport");
+
+            rpc.failAll = false;
+            // Pre-fix every later poll fails fast at the dead window: nothing is ever
+            // deliverable again and this wait times out.
+            waitUntil(
+                    () -> watcher.lastDeliveredRevision() == 6L,
+                    Duration.ofSeconds(10),
+                    "The watcher never delivered through the rebuilt pipeline");
+            assertTrue(watcher.isRunning(), "the watcher survived its pipeline's poison");
+            assertNull(watcher.getFailure(), "no failure may stop a healed watcher");
+            watcher.close();
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * The burst shape of one poison: ratis fails every outstanding request of the window at
+     * once, so a 24-deep burst lands two dozen concurrent failure settlements on the client's
+     * two completion threads. The recovery must stay single-flight - one factory invocation
+     * for the whole burst, not one build per detection - and no raft client close may ever
+     * run on a completion thread: the stale client's close parks in the transport, and a
+     * parked completion thread starves every settle of this client, renewals included.
+     */
+    @Test
+    void testABurstOfConcurrentFailuresRebuildsExactlyOnceAndNeverClosesOnACompletionThread()
+            throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final AtomicInteger builds = new AtomicInteger();
+        final RaftMetadataClient client =
+                newRecoverableStubClient(
+                        rpc, singleAttemptPolicy(), 200L, SystemClock.getInstance(), builds);
+        final RaftClient first = raftClientOf(client);
+
+        rpc.failAll = true;
+        final List<CompletableFuture<Long>> burst = new ArrayList<>();
+        for (int i = 0; i < 24; i++) {
+            burst.add(client.putAsync("/burst/" + i, bytes("x")));
+        }
+        for (CompletableFuture<Long> pending : burst) {
+            assertInstanceOf(
+                    MetadataTransportException.class,
+                    awaitFailureOf(pending, "A burst send never settled"),
+                    "the burst failures stay caller-visible");
+        }
+
+        waitUntil(
+                () -> raftClientOf(client) != first,
+                Duration.ofSeconds(5),
+                "The poisoned pipeline was never rebuilt");
+        assertEquals(
+                2, builds.get(), "one poison burst must build exactly one replacement client");
+
+        // The stale client closes only after the quiet-period grace, on the closer thread.
+        waitUntil(
+                () -> !rpc.closeThreads.isEmpty(),
+                Duration.ofSeconds(5),
+                "The replaced client was never closed after the grace period");
+        // Snapshot before any close of the metadata client itself: its inline close of the
+        // current reference legitimately runs on the caller's thread.
+        final List<String> closes = new ArrayList<>(rpc.closeThreads);
+        assertEquals(1, closes.size(), "only the replaced client closed");
+        assertTrue(
+                closes.get(0).startsWith("raft-metadata-pipeline-close"),
+                "the replaced client closed on " + closes.get(0) + ", not the closer thread");
+    }
+
+    /**
+     * A persistently re-poisoning root cause must not churn clients: the cool-down caps the
+     * rebuild rate at one per quiet period. The replacement window poisons too (every send
+     * still fails at the transport), so the pokes inside the quiet window rebuild nothing and
+     * swap nothing; once the clock passes the window, the next poison still recovers - the
+     * cool-down suppresses, it does not jam. Every poke's failure stays caller-visible: the
+     * budget-exhaustion contract.
+     */
+    @Test
+    void testRebuildCoolDownCapsTheChurnOfAPersistentlyPoisonedPipeline() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final ManualClock clock = new ManualClock(0L);
+        final AtomicInteger builds = new AtomicInteger();
+        final RaftMetadataClient client =
+                newRecoverableStubClient(rpc, singleAttemptPolicy(), 200L, clock, builds);
+
+        rpc.failAll = true;
+        awaitFailureOf(
+                client.putAsync("/poke/0", bytes("x")), "The poisoning poke never settled");
+        awaitFailureOf(
+                client.putAsync("/poke/1", bytes("x")),
+                "The poison-detecting poke never settled"); // fails fast: the rebuild trigger
+        waitUntil(
+                () -> builds.get() >= 2,
+                Duration.ofSeconds(5),
+                "The first poison never rebuilt the pipeline");
+        final RaftClient second = raftClientOf(client);
+
+        // Poke on through the cool-down window: the first poke poisons the replacement raw,
+        // every later one dies fast on it - suppressed, no rebuild, identity unchanged.
+        for (int poke = 2; poke <= 5; poke++) {
+            clock.advanceTime(40L, TimeUnit.MILLISECONDS);
+            assertInstanceOf(
+                    MetadataTransportException.class,
+                    awaitFailureOf(
+                            client.putAsync("/poke/" + poke, bytes("x")),
+                            "A suppressed poke never settled"),
+                    "suppression never hides the failure from the caller");
+            assertEquals(2, builds.get(), "the cool-down window rebuilt on poke " + poke);
+            assertSame(second, raftClientOf(client), "the cool-down window swapped on poke " + poke);
+        }
+
+        // Past the quiet period the same poison recovers: suppressed is not jammed.
+        clock.advanceTime(240L, TimeUnit.MILLISECONDS); // 400ms past the swap: past the window
+        awaitFailureOf(
+                client.putAsync("/poke/last", bytes("x")), "The post-window poke never settled");
+        waitUntil(
+                () -> builds.get() >= 3,
+                Duration.ofSeconds(5),
+                "A poison past the quiet period never rebuilt the pipeline");
+        assertNotSame(second, raftClientOf(client), "the post-window poison swapped nothing");
+    }
+
+    /**
+     * The non-rebuildable client keeps the pre-fix terminal semantics: an injected raft client
+     * (the stub seam) has no factory, so a poisoned window has no way back - its renewal
+     * surfaces the poison instead of promising a reopen that can never happen, and the
+     * session stops and detaches terminally rather than retrying a dead pipeline with {@code
+     * isAlive()} held true while the lease is long gone server-side.
+     */
+    @Test
+    void testPoisonedNonRebuildableClientStillStopsItsSessionTerminally() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final RaftMetadataClient client = newStubClient(rpc, singleAttemptPolicy());
+        try {
+            final ManualClock clock = new ManualClock(0L);
+            final LeaseSession session = new LeaseSession(client, 77L, 3_000L, clock);
+            session.start();
+
+            rpc.failAll = true; // the put poisons the only, injected, window
+            awaitFailureOf(
+                    client.putAsync("/poison", bytes("x")),
+                    "The poisoning put never settled");
+            rpc.failAll = false;
+
+            clock.advanceTime(1_100L, TimeUnit.MILLISECONDS);
+            session.tick(); // the renewal dies fast on the dead window - terminally
+            waitUntil(
+                    () -> !session.isAlive(),
+                    Duration.ofSeconds(5),
+                    "The session never stopped on its un-rebuildable pipeline");
+            waitUntil(
+                    () -> !client.sessions.contains(session),
+                    Duration.ofSeconds(5),
+                    "The terminal session stayed registered");
+            assertNull(sessionTickOf(client), "the final tick was not cancelled");
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * The replaced client also serves sync io() traffic, which never touches the window, so
+     * its close waits out the quiet-period grace: an attempt in flight when the poison landed
+     * keeps its per-attempt lifetime instead of being cut mid-retry. No close may land inside
+     * the grace; the close that lands after it runs on the closer thread.
+     */
+    @Test
+    void testTheReplacedClientIsClosedOnlyAfterTheGracePeriod() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final AtomicInteger builds = new AtomicInteger();
+        final RaftMetadataClient client =
+                newRecoverableStubClient(
+                        rpc, singleAttemptPolicy(), 150L, SystemClock.getInstance(), builds);
+        final RaftClient first = raftClientOf(client);
+
+        rpc.failAll = true;
+        awaitFailureOf(
+                client.putAsync("/poison/0", bytes("x")), "The poisoning put never settled");
+        awaitFailureOf(
+                client.putAsync("/poison/1", bytes("x")),
+                "The poison-detecting put never settled"); // the rebuild trigger
+        waitUntil(
+                () -> raftClientOf(client) != first && builds.get() == 2,
+                Duration.ofSeconds(5),
+                "The poisoned pipeline was never rebuilt exactly once");
+
+        assertNeverTripped(
+                rpc.closedOnce,
+                Duration.ofMillis(50),
+                "The replaced client was closed inside the grace period");
+        waitUntil(
+                () -> !rpc.closeThreads.isEmpty(),
+                Duration.ofSeconds(5),
+                "The replaced client was never closed after the grace period");
+        assertTrue(
+                rpc.closeThreads.get(0).startsWith("raft-metadata-pipeline-close"),
+                "the replaced client closed on "
+                        + rpc.closeThreads.get(0)
+                        + ", not the closer thread");
     }
 
     // ------------------------------------------------------------------
@@ -1345,7 +2463,8 @@ public class TestRaftMetadataClient {
                 // The prototype observed the single LIST request through a forwarding client
                 // rpc; the stock transports admit no such seam, so the same write now races the
                 // enumeration from a second thread and the outcome is asserted directly:
-                // whatever the interleaving, the result is exactly one consistent view.
+                // whatever the interleaving, the paged enumeration is one consistent view - it
+                // never misses a pre-existing record and never fabricates one.
                 final AtomicReference<Throwable> lateFailure = new AtomicReference<>();
                 final Thread lateWriter =
                         new Thread(
@@ -1364,7 +2483,8 @@ public class TestRaftMetadataClient {
                 assertNull(lateFailure.get());
                 assertTrue(
                         expectedWithLate.containsAll(listed),
-                        "the one-command enumeration is exactly one consistent view");
+                        "the paged enumeration is one consistent view: it never misses a"
+                                + " pre-existing record and never fabricates one");
                 assertTrue(
                         listed.containsAll(expected),
                         "the enumeration never misses a pre-existing record");
@@ -1496,10 +2616,10 @@ public class TestRaftMetadataClient {
                 assertTrue(client.exists("/eph/a"));
                 assertTrue(client.exists("/eph/b"));
 
-                // Past the last expiry plus the clock-domain grace (ttl/3), the scheduler takes
-                // over.
+                // Past the last expiry plus the clock-domain grace (ttl/3) plus the default
+                // skew tolerance (ttl/3), the scheduler takes over.
                 session.close();
-                cluster.clock.advanceTime(45, TimeUnit.SECONDS);
+                cluster.clock.advanceTime(55, TimeUnit.SECONDS);
                 waitUntil(
                         () ->
                                 !client.exists("/eph/a")
@@ -1562,7 +2682,7 @@ public class TestRaftMetadataClient {
                         new LeaseSession(client, deadLeaseId, ttlMs, cluster.clock);
                 assertFalse(
                         paused.isAlive(), "a session that was never started is not alive");
-                cluster.clock.advanceTime(45, TimeUnit.SECONDS);
+                cluster.clock.advanceTime(55, TimeUnit.SECONDS);
                 MetadataCluster.waitThroughTransientFailure(
                         () ->
                                 leaseOf(adminSendReadOnly(cluster, RaftCommand.leaseList()), deadLeaseId)
@@ -1679,6 +2799,11 @@ public class TestRaftMetadataClient {
                 final long leaseId = session.getLeaseId();
                 final long renewIndexAtOpen = lastRenewIndexOf(cluster, leaseId);
                 assertTrue(renewIndexAtOpen > 0L, "the registration stamped a renew index");
+                // The lease apply is monotone in expiry, and the leader stamps the expiry from
+                // its own (here frozen) clock - so a renewal only moves the fence once the
+                // server clock stands past the registration. One bounded advance keeps every
+                // renewal extending while staying far short of the expiry plus its grace.
+                cluster.clock.advanceTime(2, TimeUnit.SECONDS);
 
                 waitUntil(
                         () -> lastRenewIndexOf(cluster, leaseId) > renewIndexAtOpen,
@@ -1883,6 +3008,21 @@ public class TestRaftMetadataClient {
         }
     }
 
+    /**
+     * The client's current raft client, read reflectively the way {@link #sessionTickOf} is:
+     * the recovery suite pins the swap of a poisoned pipeline without widening the production
+     * surface. As there, a field rename breaks the probe loudly - the intended failure mode.
+     */
+    private static RaftClient raftClientOf(RaftMetadataClient client) {
+        try {
+            final Field field = RaftMetadataClient.class.getDeclaredField("raftClient");
+            field.setAccessible(true);
+            return (RaftClient) ((AtomicReference<?>) field.get(client)).get();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read the client's raft client", e);
+        }
+    }
+
     /** The lease's replicated last-renew index, read through the admin listing. */
     private static long lastRenewIndexOf(MetadataCluster cluster, long leaseId) throws IOException {
         final RaftResult.Lease lease =
@@ -1890,10 +3030,68 @@ public class TestRaftMetadataClient {
         return lease != null ? lease.getLastRenewIndex() : -1L;
     }
 
-    private static RaftMetadataClient newStubClient(RaftClientRpc rpc, RetryPolicy retryPolicy) {
-        // Mirrors the Builder's async wiring, so stub clients behave like built ones.
+    private RaftMetadataClient newStubClient(RaftClientRpc rpc, RetryPolicy retryPolicy) {
+        return newStubClient(
+                rpc, retryPolicy, RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT);
+    }
+
+    /**
+     * Mirrors the Builder's async wiring, so stub clients behave like built ones. The lowered
+     * outstanding-requests limit wedges ratis' pipeline deterministically: as many permits as
+     * the test withholds, no more.
+     */
+    private RaftMetadataClient newStubClient(
+            RaftClientRpc rpc, RetryPolicy retryPolicy, int outstandingRequestsMax) {
+        // Registered for the @AfterEach belt-and-braces close, so no stub client leaks a sender.
+        final RaftMetadataClient client =
+                new RaftMetadataClient(
+                        stubRaftClientOf(rpc, retryPolicy, outstandingRequestsMax),
+                        SystemClock.getInstance());
+        stubClients.add(client);
+        return client;
+    }
+
+    /**
+     * A stub client whose raft client the recovery can rebuild: the factory counts its
+     * invocations, and the renewals ride whatever the main pipeline currently is - the stub
+     * seam of {@link #newStubClient}, kept recoverable.
+     */
+    private RaftMetadataClient newRecoverableStubClient(
+            RaftClientRpc rpc,
+            RetryPolicy retryPolicy,
+            long quietPeriodMs,
+            Clock clock,
+            AtomicInteger factoryInvocations) {
+        final RaftMetadataClient client =
+                new RaftMetadataClient(
+                        () -> {
+                            factoryInvocations.incrementAndGet();
+                            return stubRaftClientOf(rpc, retryPolicy);
+                        },
+                        clock,
+                        quietPeriodMs);
+        stubClients.add(client);
+        return client;
+    }
+
+    /** The poison of the recovery suite: one attempt per send, so one failure kills the window. */
+    private static RetryPolicy singleAttemptPolicy() {
+        return RetryPolicies.retryUpToMaximumCountWithFixedSleep(
+                1, TimeDuration.valueOf(1, TimeUnit.MILLISECONDS));
+    }
+
+    /** The stub raft client the renewal seam builds its own pipeline from, with default permits. */
+    private static RaftClient stubRaftClientOf(RaftClientRpc rpc, RetryPolicy retryPolicy) {
+        return stubRaftClientOf(
+                rpc, retryPolicy, RaftClientConfigKeys.Async.OUTSTANDING_REQUESTS_MAX_DEFAULT);
+    }
+
+    /** The stub raft client of the given wiring, without the metadata-client wrap. */
+    private static RaftClient stubRaftClientOf(
+            RaftClientRpc rpc, RetryPolicy retryPolicy, int outstandingRequestsMax) {
         final RaftProperties properties = new RaftProperties();
         RaftClientConfigKeys.Async.Experimental.setSendDummyRequest(properties, false);
+        RaftClientConfigKeys.Async.setOutstandingRequestsMax(properties, outstandingRequestsMax);
         final RaftClient.Builder builder =
                 RaftClient.newBuilder()
                         .setRaftGroup(
@@ -1908,7 +3106,7 @@ public class TestRaftMetadataClient {
         if (retryPolicy != null) {
             builder.setRetryPolicy(retryPolicy);
         }
-        return new RaftMetadataClient(builder.build(), SystemClock.getInstance());
+        return builder.build();
     }
 
     /**
@@ -1930,6 +3128,20 @@ public class TestRaftMetadataClient {
 
     private static byte[] bytes(String value) {
         return value.getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Whether the failure's cause chain contains the given type. A manual, depth-bounded walk
+     * on purpose - never the production predicate - so the pins are not self-referential.
+     */
+    private static boolean causedBy(Throwable failure, Class<? extends Throwable> type) {
+        for (int depth = 0; failure != null && depth < 32; depth++) {
+            if (type.isInstance(failure)) {
+                return true;
+            }
+            failure = failure.getCause();
+        }
+        return false;
     }
 
     /** A bound-then-released port: connections are refused within ms, no connect-timeout wait. */
@@ -2133,7 +3345,7 @@ public class TestRaftMetadataClient {
         @Override
         public CompletableFuture<RaftClientReply> sendRequestAsync(RaftClientRequest request) {
             attempts.incrementAndGet();
-            return FutureUtils.completedExceptionally(
+            return JavaUtils.completeExceptionally(
                     new IOException("stub transport failure"));
         }
 
@@ -2174,6 +3386,7 @@ public class TestRaftMetadataClient {
         private final CountDownLatch firstEntered = new CountDownLatch(1);
         private final CountDownLatch releaseFirst = new CountDownLatch(1);
         private final CountDownLatch firstReturned = new CountDownLatch(1);
+        private volatile String firstThread;
         private volatile Long needSnapshotLine;
 
         @Override
@@ -2182,6 +3395,7 @@ public class TestRaftMetadataClient {
             try {
                 events.add(event);
                 if (firstPending.compareAndSet(true, false)) {
+                    firstThread = Thread.currentThread().getName();
                     firstEntered.countDown();
                     awaitReleased();
                 }
@@ -2214,18 +3428,29 @@ public class TestRaftMetadataClient {
             return overlap.get();
         }
 
+        /** The thread the first callback ran on; set before {@link #firstEntered} trips. */
+        String firstCallbackThread() {
+            return firstThread;
+        }
+
         private void enter() {
             if (inListener.incrementAndGet() != 1) {
                 overlap.set(true);
             }
         }
 
+        /** Parks the first callback until {@link #release()} - bounded, so no test can strand a
+         * delivery-pool thread behind a forgotten release. */
         private void awaitReleased() {
+            final boolean released;
             try {
-                releaseFirst.await();
+                released = releaseFirst.await(60, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IllegalStateException("Interrupted while parked in the listener", e);
+            }
+            if (!released) {
+                throw new IllegalStateException("A test listener parked 60s without release");
             }
         }
     }
@@ -2342,6 +3567,175 @@ public class TestRaftMetadataClient {
     }
 
     /**
+     * The transport of the poisoned-pipeline watcher suite: every POLL_CHANGES is answered at
+     * once - exceptionally while {@code failAll} (so the first poll can exhaust a one-attempt
+     * budget and kill the window), else with one fresh CREATE record past the polled revision
+     * (so a healed watcher immediately has something to deliver), following {@link
+     * GatedPollRpc#answerRecords}'s reply shape.
+     */
+    private static final class FlakyPollRpc implements RaftClientRpc {
+
+        /** Every request fails at the transport level when set. */
+        volatile boolean failAll;
+
+        private final AtomicInteger failedSends = new AtomicInteger();
+
+        /** Whether the one record this stub ever serves went out; every later poll idles. */
+        private boolean served;
+
+        @Override
+        public synchronized CompletableFuture<RaftClientReply> sendRequestAsync(
+                RaftClientRequest request) {
+            final RaftCommand command =
+                    RaftCommandCodec.decodeCommand(
+                            request.getMessage().getContent().toByteArray());
+            final CompletableFuture<RaftClientReply> reply = new CompletableFuture<>();
+            if (command.getOp() != RaftCommand.Op.POLL_CHANGES) {
+                reply.completeExceptionally(
+                        new AssertionError("The watcher speaks POLL_CHANGES only: " + command));
+                return reply;
+            }
+            if (failAll) {
+                failedSends.incrementAndGet();
+                reply.completeExceptionally(new IOException("scripted transport failure"));
+                return reply;
+            }
+            // Exactly one record ever, so the watcher's delivered revision settles at one
+            // stable value instead of racing upward poll over poll.
+            final RaftResult result = RaftResult.ok(RaftCommand.Op.POLL_CHANGES);
+            final long revision = command.getSinceRevision() + (served ? 0 : 1);
+            served = true;
+            setRaftResultField(result, "revision", revision);
+            if (revision > command.getSinceRevision()) {
+                setRaftResultField(
+                        result,
+                        "records",
+                        Collections.singletonList(
+                                new ChangeEvent(
+                                        revision,
+                                        Collections.singletonList(
+                                                new ChangeEvent.Change(
+                                                        ChangeEvent.ChangeOp.CREATE,
+                                                        "/rev-" + revision,
+                                                        new byte[0])))));
+            }
+            reply.complete(
+                    RaftClientReply.newBuilder()
+                            .setRequest(request)
+                            .setSuccess()
+                            .setMessage(
+                                    Message.valueOf(
+                                            ByteBuffer.wrap(
+                                                    RaftCommandCodec.encodeResult(result))))
+                            .build());
+            return reply;
+        }
+
+        synchronized int failedSends() {
+            return failedSends.get();
+        }
+
+        @Override
+        public RaftClientReply sendRequest(RaftClientRequest request) {
+            throw new UnsupportedOperationException("This stub speaks async only");
+        }
+
+        @Override
+        public void addRaftPeers(Collection<RaftPeer> peers) {}
+
+        @Override
+        public void close() {}
+    }
+
+    /**
+     * The transport of the isolation suite: every POLL_CHANGES is answered at once with one
+     * fresh record (each watcher immediately has a delivery to make), every other command is
+     * answered OK, and every LEASE_RENEW is counted - so a renewal whose settle never ran is
+     * caught as a count that never advances. The first GET is withheld until the test drives
+     * it, so the settle probe provably runs on whatever thread settles it.
+     */
+    private static final class ImmediatePollRpc implements RaftClientRpc {
+
+        private final AtomicInteger renewals = new AtomicInteger();
+        private final AtomicLong nextRevision = new AtomicLong();
+        private RaftClientRequest heldRequest;
+        private CompletableFuture<RaftClientReply> heldReply;
+
+        @Override
+        public synchronized CompletableFuture<RaftClientReply> sendRequestAsync(
+                RaftClientRequest request) {
+            final RaftCommand command =
+                    RaftCommandCodec.decodeCommand(
+                            request.getMessage().getContent().toByteArray());
+            if (command.getOp() == RaftCommand.Op.LEASE_RENEW) {
+                renewals.incrementAndGet(); // counted at SEND time - the settle lands later
+            }
+            final RaftResult result = RaftResult.ok(command.getOp());
+            if (command.getOp() == RaftCommand.Op.POLL_CHANGES) {
+                final long revision = nextRevision.incrementAndGet();
+                setRaftResultField(result, "revision", revision);
+                setRaftResultField(result, "records", recordsOf(revision));
+            }
+            final CompletableFuture<RaftClientReply> reply = new CompletableFuture<>();
+            if (command.getOp() == RaftCommand.Op.GET && heldReply == null) {
+                heldRequest = request;
+                heldReply = reply;
+                return reply;
+            }
+            reply.complete(replyOf(request, result));
+            return reply;
+        }
+
+        synchronized boolean hasPendingGet() {
+            return heldReply != null && !heldReply.isDone();
+        }
+
+        /** Answers the withheld GET; its settle then provably runs on the completion executor. */
+        synchronized void answerPendingGet() {
+            if (heldReply == null || heldReply.isDone()) {
+                return;
+            }
+            heldReply.complete(replyOf(heldRequest, RaftResult.ok(RaftCommand.Op.GET)));
+        }
+
+        private static RaftClientReply replyOf(RaftClientRequest request, RaftResult result) {
+            return RaftClientReply.newBuilder()
+                    .setRequest(request)
+                    .setSuccess()
+                    .setMessage(
+                            Message.valueOf(
+                                    ByteBuffer.wrap(RaftCommandCodec.encodeResult(result))))
+                    .build();
+        }
+
+        private static List<ChangeEvent> recordsOf(long revision) {
+            return Collections.singletonList(
+                    new ChangeEvent(
+                            revision,
+                            Collections.singletonList(
+                                    new ChangeEvent.Change(
+                                            ChangeEvent.ChangeOp.CREATE,
+                                            "/rev-" + revision,
+                                            new byte[0]))));
+        }
+
+        synchronized int renewals() {
+            return renewals.get();
+        }
+
+        @Override
+        public RaftClientReply sendRequest(RaftClientRequest request) {
+            throw new UnsupportedOperationException("This stub speaks async only");
+        }
+
+        @Override
+        public void addRaftPeers(Collection<RaftPeer> peers) {}
+
+        @Override
+        public void close() {}
+    }
+
+    /**
      * Sets one {@link RaftResult} payload field for a scripted reply: the fluent setters are
      * package-private to the state machine while the watcher stubs live here. A field rename
      * breaks this probe loudly, which is the intended failure mode.
@@ -2353,6 +3747,36 @@ public class TestRaftMetadataClient {
             field.set(result, value);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException("Cannot script RaftResult." + name, e);
+        }
+    }
+
+    /**
+     * Builds one {@link RaftResult.Entry} for a scripted reply: the constructor is package-private
+     * to the state machine. As above, a rename breaks this probe loudly.
+     */
+    private static RaftResult.Entry listEntryOf(String path) {
+        try {
+            final Constructor<RaftResult.Entry> constructor =
+                    RaftResult.Entry.class.getDeclaredConstructor(String.class, long.class);
+            constructor.setAccessible(true);
+            return constructor.newInstance(path, 1L);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot construct RaftResult.Entry", e);
+        }
+    }
+
+    /**
+     * Reads one private static field: the probes above pin private constants (the client's page
+     * size, the state machine's path cap) without widening production visibility. As above, a
+     * rename breaks the probe loudly.
+     */
+    private static Object staticFieldOf(Class<?> type, String name) {
+        try {
+            final Field field = type.getDeclaredField(name);
+            field.setAccessible(true);
+            return field.get(null);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("Cannot read " + type.getSimpleName() + "." + name, e);
         }
     }
 
@@ -2412,6 +3836,12 @@ public class TestRaftMetadataClient {
 
         /** Every request fails at the transport level when set. */
         volatile boolean failAll;
+
+        /** Every close of this stub, with the thread it ran on - the off-thread-close probe. */
+        final CopyOnWriteArrayList<String> closeThreads = new CopyOnWriteArrayList<>();
+
+        /** Trips on the first close - the grace-period observation window's anchor. */
+        final CountDownLatch closedOnce = new CountDownLatch(1);
 
         private final List<SentCommand> sent = new CopyOnWriteArrayList<>();
         private final List<RaftClientRequest> heldRequests = new CopyOnWriteArrayList<>();
@@ -2494,6 +3924,17 @@ public class TestRaftMetadataClient {
             return count;
         }
 
+        /** How many commands of this op carried the given lease id. */
+        int countOf(RaftCommand.Op op, long leaseId) {
+            int count = 0;
+            for (SentCommand command : sent) {
+                if (command.op == op && command.leaseId == leaseId) {
+                    count++;
+                }
+            }
+            return count;
+        }
+
         /** The lease id of the first command of this op; 0 when none was sent. */
         long sentLeaseIdOf(RaftCommand.Op op) {
             for (SentCommand command : sent) {
@@ -2537,7 +3978,10 @@ public class TestRaftMetadataClient {
         public void addRaftPeers(Collection<RaftPeer> peers) {}
 
         @Override
-        public void close() {}
+        public synchronized void close() {
+            closeThreads.add(Thread.currentThread().getName());
+            closedOnce.countDown();
+        }
     }
 
     private static final class UndecodableReplyRpc implements RaftClientRpc {
@@ -2554,6 +3998,102 @@ public class TestRaftMetadataClient {
         @Override
         public CompletableFuture<RaftClientReply> sendRequestAsync(RaftClientRequest request) {
             return CompletableFuture.completedFuture(sendRequest(request));
+        }
+
+        @Override
+        public void addRaftPeers(Collection<RaftPeer> peers) {}
+
+        @Override
+        public void close() {}
+    }
+
+    /**
+     * Serves LIST the way the state machine's queryList does, on both rpc surfaces: one prepared
+     * sorted prefix, sliced strictly after the cursor up to the requested cap, with {@code
+     * hasMore} set only when the cap cut the range with a matching key left. Every request's
+     * cap, cursor and issuing thread is recorded, so a page chain that is unbounded, never
+     * advancing or issued from a completion thread is caught.
+     */
+    private static final class ListServingRpc implements RaftClientRpc {
+
+        /** One LIST the client issued: its wire shape and the thread that sent it. */
+        static final class ServedList {
+            final long maxResults;
+            final String startAfter;
+            final String thread;
+            final String lastPath;
+
+            ServedList(long maxResults, String startAfter, String thread, String lastPath) {
+                this.maxResults = maxResults;
+                this.startAfter = startAfter;
+                this.thread = thread;
+                this.lastPath = lastPath;
+            }
+        }
+
+        private final List<String> keys;
+        private final List<ServedList> served = new CopyOnWriteArrayList<>();
+
+        ListServingRpc(List<String> sortedKeys) {
+            this.keys = sortedKeys;
+        }
+
+        @Override
+        public synchronized RaftClientReply sendRequest(RaftClientRequest request) {
+            return replyOf(request);
+        }
+
+        @Override
+        public synchronized CompletableFuture<RaftClientReply> sendRequestAsync(
+                RaftClientRequest request) {
+            return CompletableFuture.completedFuture(replyOf(request));
+        }
+
+        void resetRecordings() {
+            served.clear();
+        }
+
+        synchronized List<ServedList> served() {
+            return new ArrayList<>(served);
+        }
+
+        private RaftClientReply replyOf(RaftClientRequest request) {
+            final RaftCommand command =
+                    RaftCommandCodec.decodeCommand(
+                            request.getMessage().getContent().toByteArray());
+            assertEquals(RaftCommand.Op.LIST, command.getOp(), "this stub serves LIST only");
+            final List<RaftResult.Entry> entries = new ArrayList<>();
+            boolean more = false;
+            // The server's rule: the first cap keys strictly after the cursor, hasMore only when
+            // the cap stopped the scan with a matching key left. Sizing by count, never by index
+            // arithmetic, keeps an uncapped Long.MAX_VALUE request answerable whole.
+            final int cap = (int) Math.max(0L, Math.min(command.getMaxResults(), keys.size()));
+            for (String path : keys) {
+                if (path.compareTo(command.getStartAfter()) <= 0) {
+                    continue;
+                }
+                if (entries.size() >= cap) {
+                    more = true;
+                    break;
+                }
+                entries.add(listEntryOf(path));
+            }
+            served.add(
+                    new ServedList(
+                            command.getMaxResults(),
+                            command.getStartAfter(),
+                            Thread.currentThread().getName(),
+                            entries.isEmpty() ? "" : entries.get(entries.size() - 1).getPath()));
+            final RaftResult result = RaftResult.ok(RaftCommand.Op.LIST);
+            setRaftResultField(result, "entries", entries);
+            setRaftResultField(result, "hasMore", more);
+            return RaftClientReply.newBuilder()
+                    .setRequest(request)
+                    .setSuccess()
+                    .setMessage(
+                            Message.valueOf(
+                                    ByteBuffer.wrap(RaftCommandCodec.encodeResult(result))))
+                    .build();
         }
 
         @Override
@@ -2581,7 +4121,15 @@ public class TestRaftMetadataClient {
             return pendingReply;
         }
 
+        /** Whether a request has reached the stub and is still unanswered. */
+        synchronized boolean hasPending() {
+            return pendingReply != null && !pendingReply.isDone();
+        }
+
         synchronized void completePendingGet() {
+            if (pendingReply == null || pendingReply.isDone()) {
+                return; // no pending get (or already settled): a stray drive must not NPE
+            }
             pendingReply.complete(
                     RaftClientReply.newBuilder()
                             .setRequest(pendingRequest)
@@ -2592,6 +4140,47 @@ public class TestRaftMetadataClient {
                                                     RaftCommandCodec.encodeResult(
                                                             RaftResult.ok(RaftCommand.Op.GET)))))
                             .build());
+        }
+
+        @Override
+        public void addRaftPeers(Collection<RaftPeer> peers) {}
+
+        @Override
+        public void close() {}
+    }
+
+    /**
+     * Never answers its first request. With ratis' outstanding-requests limit lowered by the
+     * test, the FIRST send reaches this stub and is withheld; every later send is DELAYED
+     * inside ratis' sliding window (each still holds a permit but never reaches this stub) until
+     * the first settles - so {@link #failAllPending()} on the withheld reply cascades through
+     * the window (SlidingWindow.fail) and frees every permit. Both facts matter when wedging a
+     * client: the withheld reply is the only lever, and releasing it unwedges everything.
+     */
+    private static final class WithholdingRpc implements RaftClientRpc {
+        private final List<CompletableFuture<RaftClientReply>> pending = new CopyOnWriteArrayList<>();
+
+        @Override
+        public RaftClientReply sendRequest(RaftClientRequest request) {
+            throw new UnsupportedOperationException("This stub speaks async only");
+        }
+
+        @Override
+        public synchronized CompletableFuture<RaftClientReply> sendRequestAsync(
+                RaftClientRequest request) {
+            final CompletableFuture<RaftClientReply> reply = new CompletableFuture<>();
+            pending.add(reply);
+            return reply;
+        }
+
+        /** Fails every withheld reply; the sliding window then fails its delayed sends too. */
+        synchronized void failAllPending() {
+            for (CompletableFuture<RaftClientReply> reply : pending) {
+                if (!reply.isDone()) {
+                    reply.completeExceptionally(new IOException("released by the test"));
+                }
+            }
+            pending.clear();
         }
 
         @Override

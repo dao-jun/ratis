@@ -103,7 +103,8 @@ public class MetadataStateMachine extends BaseStateMachine {
         STATE_CF, COUNTERS_CF, LEASES_CF, LEASE_PATHS_CF, CHANGES_CF, RESULTS_CF
     };
 
-    private static final byte[] APPLIED_REVISION_KEY =
+    /** Default-family key for the applied revision; shared with {@link InvocationResultStore}. */
+    static final byte[] APPLIED_REVISION_KEY =
             "applied-revision".getBytes(StandardCharsets.UTF_8);
 
     /** Default-family key holding the smallest revision whose change records are retained. */
@@ -115,9 +116,6 @@ public class MetadataStateMachine extends BaseStateMachine {
 
     /** ZooKeeper bounds path length only via jute.maxbuffer; partition specs can exceed 1024. */
     private static final int MAX_PATH_LENGTH = 8192;
-
-    /** How many change-record keys one GC batch deletes; bounds batch memory and lock time. */
-    private static final int GC_BATCH_SIZE = 1024;
 
     /** Revisions of change records the retention window keeps, independent of snapshot timing. */
     static final long DEFAULT_CHANGE_RECORD_RETENTION_REVISIONS = 65_536L;
@@ -155,6 +153,8 @@ public class MetadataStateMachine extends BaseStateMachine {
     private ColumnFamilyHandle leasePathsHandle;
     private ColumnFamilyHandle changesHandle;
     private ColumnFamilyHandle resultsHandle;
+    /** Every column-family handle in open order; set by openDb. */
+    private List<ColumnFamilyHandle> cfHandles;
     private WriteOptions writeOptions;
     private InvocationResultStore resultStore;
 
@@ -610,6 +610,7 @@ public class MetadataStateMachine extends BaseStateMachine {
         leasePathsHandle = handles.get(4);
         changesHandle = handles.get(5);
         resultsHandle = handles.get(6);
+        cfHandles = handles;
 
         // The raft log is the WAL; the RocksDB WAL buys nothing (batches survive process death at
         // memtable granularity, not power loss).
@@ -636,13 +637,12 @@ public class MetadataStateMachine extends BaseStateMachine {
 
     private void closeDb() {
         // Native column-family handles must be released before their owning DB.
-        IOUtils.closeQuietly(defaultHandle);
-        IOUtils.closeQuietly(stateHandle);
-        IOUtils.closeQuietly(countersHandle);
-        IOUtils.closeQuietly(leasesHandle);
-        IOUtils.closeQuietly(leasePathsHandle);
-        IOUtils.closeQuietly(changesHandle);
-        IOUtils.closeQuietly(resultsHandle);
+        if (cfHandles != null) {
+            for (ColumnFamilyHandle handle : cfHandles) {
+                IOUtils.closeQuietly(handle);
+            }
+            cfHandles = null;
+        }
         defaultHandle = null;
         stateHandle = null;
         countersHandle = null;
@@ -673,13 +673,16 @@ public class MetadataStateMachine extends BaseStateMachine {
         final TransactionContext.Builder builder =
                 TransactionContext.newBuilder().setStateMachine(this).setClientRequest(request);
         final byte[] rawCommand = request.getMessage().getContent().toByteArray();
-        final MetadataLogEnvelope envelope;
+        final byte[] logData;
         try {
-            envelope = MetadataLogEnvelope.create(rawCommand, clock, resultRetentionMillis);
+            // create() decoded the command, so its strings are decode-origin: readString never
+            // yields an unpaired surrogate and encode() cannot reject. Encoding inside the same
+            // catch keeps that invariant belt-and-braces rather than load-bearing.
+            logData = MetadataLogEnvelope.create(rawCommand, clock, resultRetentionMillis).encode();
         } catch (IllegalArgumentException invalidCommand) {
             return builder.build().setException(invalidCommand);
         }
-        builder.setLogData(ByteString.copyFrom(envelope.encode()));
+        builder.setLogData(ByteString.copyFrom(logData));
         return builder.build();
     }
 
@@ -1162,7 +1165,7 @@ public class MetadataStateMachine extends BaseStateMachine {
 
         final FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true);
         try {
-            db.flush(flushOptions, allColumnFamilyHandles());
+            db.flush(flushOptions, cfHandles);
         } catch (RocksDBException e) {
             throw new IOException(
                     "Failed to flush metadata RocksDB for snapshot " + snapshotDir, e);
@@ -1201,18 +1204,6 @@ public class MetadataStateMachine extends BaseStateMachine {
         return snapshotIndex;
     }
 
-    private List<ColumnFamilyHandle> allColumnFamilyHandles() {
-        final List<ColumnFamilyHandle> handles = new ArrayList<>(7);
-        handles.add(defaultHandle);
-        handles.add(stateHandle);
-        handles.add(countersHandle);
-        handles.add(leasesHandle);
-        handles.add(leasePathsHandle);
-        handles.add(changesHandle);
-        handles.add(resultsHandle);
-        return handles;
-    }
-
     /** Every cadence revisions, advance the line to {@code revision + 1 - window}. */
     private void maybeGcChangeRecords(long revision) {
         if (revision % changeRecordGcCadenceRevisions != 0) {
@@ -1248,35 +1239,19 @@ public class MetadataStateMachine extends BaseStateMachine {
         oldestRetainedRevision = newOldestRetained;
 
         try {
-            // Collect doomed keys first - iterators are not stable under concurrent writes.
-            final List<byte[]> doomed = new ArrayList<>();
-            final RocksIterator iterator = db.newIterator(changesHandle);
+            // Every changes-family key is an 8-byte big-endian revision long, so the doomed set
+            // is one contiguous prefix range: a single range tombstone, no key iteration.
+            final WriteBatch batch = new WriteBatch();
             try {
-                for (iterator.seekToFirst();
-                        iterator.isValid() && bytesToLong(iterator.key(), 0) < newOldestRetained;
-                        iterator.next()) {
-                    doomed.add(iterator.key().clone());
-                }
+                batch.deleteRange(
+                        changesHandle, new byte[Long.BYTES], longToBytes(newOldestRetained));
+                db.write(writeOptions, batch);
             } finally {
-                iterator.close();
-            }
-            // Delete in batches, so one WriteBatch never grows with the whole history.
-            for (int from = 0; from < doomed.size(); from += GC_BATCH_SIZE) {
-                final int to = Math.min(from + GC_BATCH_SIZE, doomed.size());
-                final WriteBatch batch = new WriteBatch();
-                try {
-                    for (int i = from; i < to; i++) {
-                        batch.delete(changesHandle, doomed.get(i));
-                    }
-                    db.write(writeOptions, batch);
-                } finally {
-                    batch.close();
-                }
+                batch.close();
             }
             LOG.info(
-                    "{}: garbage collected {} change records below revision {}",
+                    "{}: garbage collected change records below revision {}",
                     this,
-                    doomed.size(),
                     newOldestRetained);
         } catch (RocksDBException e) {
             throw new IOException(
@@ -1704,12 +1679,39 @@ public class MetadataStateMachine extends BaseStateMachine {
             if (command.getPath() == null || command.getPath().isEmpty()) {
                 return RaftResult.error(RaftCommand.Op.INCREMENT, RaftResult.Status.BAD_PATH);
             }
+            final RaftResult.Status guard = checkIncrementGuard(command);
+            if (guard != null) {
+                return RaftResult.error(RaftCommand.Op.INCREMENT, guard);
+            }
             final byte[] counterKey = counterKey(USER_COUNTER_TAG, command.getPath());
             // Long wrap-around on overflow is deterministic on every replica, which matters.
             final long value = getCounter(counterKey) + command.getDelta();
             setCounter(counterKey, value);
             addChange(ChangeEvent.ChangeOp.INCREMENT, command.getPath(), longToBytes(value));
             return RaftResult.ok(RaftCommand.Op.INCREMENT).counterValue(value);
+        }
+
+        /**
+         * The guard of a lease-guarded INCREMENT (fencing-token traffic): a non-zero leaseId
+         * must name a live lease that owns the record at the counter's path right now — the
+         * replicated fact the lock's create established, read through this batch's overlay so a
+         * same-batch create satisfies it. A contender whose lease expired (the cascade deletes
+         * lease and record in one revision) or whose record was deleted or re-bound fails here,
+         * so its late token can never overtake the current holder's. {@code null} passes.
+         */
+        private RaftResult.Status checkIncrementGuard(RaftCommand command)
+                throws RocksDBException {
+            if (command.getLeaseId() == 0) {
+                return null; // plain counter arithmetic, ungated as before
+            }
+            final RaftResult.Status leaseError = checkLeaseExists(command.getLeaseId());
+            if (leaseError != null) {
+                return leaseError; // UNKNOWN_LEASE: the contender's lease died
+            }
+            final StateRecord owner = getRecord(command.getPath());
+            return owner != null && owner.leaseId == command.getLeaseId()
+                    ? null
+                    : RaftResult.Status.STALE_LEASE;
         }
 
         private RaftResult applyLeaseRegister(RaftCommand command) throws RocksDBException {
@@ -1729,6 +1731,15 @@ public class MetadataStateMachine extends BaseStateMachine {
             if (lease == null) {
                 return RaftResult.error(
                         RaftCommand.Op.LEASE_RENEW, RaftResult.Status.UNKNOWN_LEASE);
+            }
+            // Monotone expiry: a duplicate renewal that committed late (the client gave up on
+            // its dispatch and re-sent under a new call id, which no retry cache dedups across)
+            // carries a stale expireAtMs; overwriting would retroactively shorten a live lease
+            // while bumping lastRenewIndex. A renewal that does not extend the expiry changes
+            // nothing - the expiry fence and any pending expiry proposal stay valid against the
+            // unchanged state.
+            if (command.getExpireAtMs() <= lease.expireAtMs) {
+                return RaftResult.ok(RaftCommand.Op.LEASE_RENEW).revision(revision);
             }
             // Renewal carries the new TTL as well as the normalized absolute expiry.
             final LeaseState renewed =

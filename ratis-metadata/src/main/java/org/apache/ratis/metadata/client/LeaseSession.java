@@ -23,8 +23,6 @@ import org.apache.ratis.protocol.exceptions.AlreadyClosedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.time.Duration;
-
 /**
  * A client-side handle keeping one registered lease alive - the ephemeral-record half of the
  * ZooKeeper session semantics this layer ports. Records written through a session (the {@code
@@ -35,20 +33,26 @@ import java.time.Duration;
  * {@link Clock#nanoseconds()} - never by wall time, so a skewed or frozen wall clock can neither
  * starve nor flood the renewals. Renewals run on the module's shared scheduler and the client's
  * asynchronous machinery - a session owns no thread of its own, so any number of them costs no
- * extra threads. Transient transport trouble is retried, and any renewal landing within one ttl
- * keeps the lease alive - so a leader failover resolving inside the ttl is transparent. When
- * renewals stop - the holder crashed, the partition outlasted the ttl, an {@code UNKNOWN_LEASE}
- * renewal landed, or {@link #close()} ran - the session detaches from the client's registry and
- * the leader's expiry scheduler deletes every record bound to the lease after the ttl, emitting
- * {@code LEASE_EXPIRE} change events for watchers.
+ * extra threads. Renewals ride the client's dedicated renewal pipeline, sized by the most urgent
+ * live session's ttl - a per-attempt timeout and backoff of a third of that ttl, a dispatch
+ * budget of that ttl plus the expiry grace - and never the pipeline of user operations; renewals
+ * of sessions on one client may still queue briefly behind one another (bounded by that sizing),
+ * and ttls below ~750ms remain best-effort against the pacing floors. Transient transport
+ * trouble is retried, and any renewal landing within one ttl keeps the lease alive - so a leader
+ * failover resolving inside the ttl is transparent. When renewals stop - the holder crashed, the
+ * partition outlasted the ttl, an {@code UNKNOWN_LEASE} renewal landed, or {@link #close()} ran -
+ * the session detaches from the client's registry and the leader's expiry scheduler deletes
+ * every record bound to the lease after the ttl, emitting {@code LEASE_EXPIRE} change events for
+ * watchers.
  *
- * <p>Lifecycle: obtained from {@link RaftMetadataClient#openLease(Duration)} or its async twin,
- * never constructed directly. {@link #close()} is idempotent and never blocks: it stops the
- * renewals and detaches from the client; a renewal still in flight completes and is ignored.
- * The bound records then die through the scheduler, at most one ttl later - closing does not
- * delete them outright. {@link #isAlive()} is the holder's checkpoint: false after {@link
- * #close()} or once a renewal returned {@code UNKNOWN_LEASE} (the lease expired underneath and
- * cannot be resurrected). {@link #close()} and {@link #isAlive()} may be called from any thread.
+ * <p>Lifecycle: obtained from {@link RaftMetadataClient#openLease(java.time.Duration)} or its
+ * async twin, never constructed directly. {@link #close()} is idempotent and never blocks: it
+ * stops the renewals and detaches from the client; a renewal still in flight completes and is
+ * ignored. The bound records then die through the scheduler, at most one ttl later - closing
+ * does not delete them outright. {@link #isAlive()} is the holder's checkpoint: false after
+ * {@link #close()} or once a renewal returned {@code UNKNOWN_LEASE} (the lease expired
+ * underneath and cannot be resurrected). {@link #close()} and {@link #isAlive()} may be called
+ * from any thread.
  */
 public final class LeaseSession implements AutoCloseable {
 
@@ -75,11 +79,8 @@ public final class LeaseSession implements AutoCloseable {
     private boolean stopped;
     private boolean renewing;
 
-    /**
-     * Set once a renewal came back {@code UNKNOWN_LEASE}; volatile - the renewal completion
-     * writes it, {@link #isAlive()} reads it.
-     */
-    private volatile boolean expired;
+    /** Set once a renewal came back {@code UNKNOWN_LEASE}; read under {@link #lock} by {@link #isAlive()}. */
+    private boolean expired;
 
     LeaseSession(RaftMetadataClient client, long leaseId, long ttlMs, Clock clock) {
         this.client = client;
@@ -96,6 +97,11 @@ public final class LeaseSession implements AutoCloseable {
     /** The lease id this session keeps alive; bind ephemeral records to it. */
     public long getLeaseId() {
         return leaseId;
+    }
+
+    /** This session's ttl in ms; the client sizes its renewal pipeline by the cohort minimum. */
+    long ttlMs() {
+        return ttlMs;
     }
 
     /**
@@ -164,7 +170,7 @@ public final class LeaseSession implements AutoCloseable {
             }
             renewing = true;
         }
-        client.renewLeaseAsync(leaseId, Duration.ofMillis(ttlMs))
+        client.renewLeaseForSessionAsync(leaseId, ttlMs)
                 .whenComplete(
                         (ignored, failure) -> {
                             if (failure == null) {
@@ -203,15 +209,20 @@ public final class LeaseSession implements AutoCloseable {
                         "Lease {} expired before its session could renew it; stopping renewals",
                         leaseId);
             } else if (failure instanceof IllegalStateException
-                    || failure.getCause() instanceof AlreadyClosedException) {
-                // The client closed under us (IllegalStateException, or ratis AlreadyClosed) -
-                // stop. The client's own sweep unregisters its copy of the list; the detach here
-                // covers a session that registered before the sweep cleared it.
+                    || (ExceptionUtils.causedBy(failure, AlreadyClosedException.class)
+                            && (client.isClosed() || !client.canRebuildRaftClient()))) {
+                // The client closed under us (IllegalStateException, or ratis
+                // AlreadyClosedException with no way back: the client really closed, or its
+                // dead pipeline can never be rebuilt) - stop. The client's own sweep
+                // unregisters its copy of the list; the detach here covers a session that
+                // registered before the sweep cleared it.
                 stopped = true;
                 detach = true;
             } else {
-                // Transport trouble: the due-ness stands, the next tick retries - a renewal
-                // within one ttl keeps the lease alive. No other protocol failure is expected.
+                // Transport trouble - including the poisoned async window of an open,
+                // rebuildable client: the client swaps in a fresh pipeline, and the due-ness
+                // stands, so the next tick renews through it - a renewal within one ttl keeps
+                // the lease alive. No other protocol failure is expected.
                 detach = false;
                 LOG.debug("Renewing lease {} failed; retrying", leaseId, failure);
             }

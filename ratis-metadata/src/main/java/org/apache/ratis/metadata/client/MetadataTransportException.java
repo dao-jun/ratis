@@ -17,10 +17,13 @@
 package org.apache.ratis.metadata.client;
 
 /**
- * The transport-level failure of a {@link RaftMetadataClient} operation: the request never went
- * through - it exhausted its retries, the transport broke underneath it, or the reply could not
- * be trusted. Contrast {@link RaftMetadataException}, the user-visible rejection of a committed
- * command.
+ * The transport-level failure of a {@link RaftMetadataClient} operation: the request failed
+ * beneath the committed-command layer - the transport broke underneath it, or the reply could
+ * not be trusted. A mutation abandoned with its outcome unknown answers the subclass {@link
+ * PossiblyCommittedException} instead. The plain type still does not certify non-delivery for
+ * a mutation in the two residual shapes {@link PossiblyCommittedException} enumerates -
+ * reconcile by reading state rather than re-running it. Contrast {@link RaftMetadataException},
+ * the user-visible rejection of a committed command.
  */
 public class MetadataTransportException extends RuntimeException {
 

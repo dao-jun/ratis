@@ -19,7 +19,10 @@ package org.apache.ratis.metadata.statemachine;
 import org.apache.ratis.RaftConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.metadata.util.Clock;
 import org.apache.ratis.metadata.util.FileUtils;
+import org.apache.ratis.metadata.util.ManualClock;
+import org.apache.ratis.metadata.util.SystemClock;
 import org.apache.ratis.proto.RaftProtos.LogEntryProto;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
@@ -39,20 +42,33 @@ import org.apache.ratis.util.LifeCycle;
 import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -65,8 +81,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
  * Storage-safety tests of the metadata state machine on hand-driven, thread-free standalone
@@ -98,10 +117,14 @@ public class TestMetadataStateMachineStorageSafety {
         private RaftServer server;
 
         Member(String name, UUID groupUuid, File dbDir) {
+            this(name, groupUuid, dbDir, SystemClock.getInstance());
+        }
+
+        Member(String name, UUID groupUuid, File dbDir, Clock clock) {
             this.groupId = RaftGroupId.valueOf(groupUuid);
             this.raftDir = new File(tempDir, name + "-raft");
             this.dbDir = dbDir;
-            this.stateMachine = new MetadataStateMachine(dbDir);
+            this.stateMachine = new MetadataStateMachine(dbDir, clock, Duration.ofDays(7));
         }
 
         /**
@@ -180,6 +203,36 @@ public class TestMetadataStateMachineStorageSafety {
         member.open();
         member.stateMachine.notifyTermIndexUpdated(1L, 1L);
         assertEquals(1L, member.stateMachine.takeSnapshot());
+    }
+
+    /**
+     * Opens the member and applies seven hand-numbered entries - two leases, two lease
+     * bindings, a user counter and a sequential cursor - then snapshots at (1, 7). The
+     * fixed clock makes every stored lease literal: the log envelope normalizes each
+     * expiry to clock + ttl (MetadataLogEnvelope), so lease 11 reads 5000/15000/2 and
+     * lease 12 reads 7000/17000/3 (lastRenewIndex = the registering revision).
+     */
+    private static long populateLeasesReverseIndexAndCounters(Member member) throws Exception {
+        member.open();
+        apply(member, 1L, RaftCommand.create("/data", "root".getBytes(StandardCharsets.UTF_8), false, 0L, 1L));
+        apply(member, 2L, RaftCommand.leaseRegister(11L, 5_000L, 0L));
+        apply(member, 3L, RaftCommand.leaseRegister(12L, 7_000L, 0L));
+        apply(member, 4L,
+                RaftCommand.create("/data/ephemeral-a", "a".getBytes(StandardCharsets.UTF_8), false, 11L, 4L));
+        apply(member, 5L,
+                RaftCommand.create("/data/ephemeral-b", "b".getBytes(StandardCharsets.UTF_8), false, 11L, 5L));
+        apply(member, 6L, RaftCommand.increment("/counters/hits", 5L));
+        apply(member, 7L, RaftCommand.create("/data/seq-", "s".getBytes(StandardCharsets.UTF_8), true, 0L, 7L));
+        assertEquals(7L, member.stateMachine.takeSnapshot());
+        return 7L;
+    }
+
+    private static void apply(Member member, long revision, RaftCommand command) throws Exception {
+        final byte[] reply = applyEntry(member, prepareEntry(member, 1L, revision, revision, command));
+        assertEquals(
+                RaftResult.Status.OK,
+                RaftCommandCodec.decodeResult(reply).getStatus(),
+                () -> command.getOp() + " at revision " + revision + " applies");
     }
 
     private static LogEntryProto prepareEntry(
@@ -270,6 +323,70 @@ public class TestMetadataStateMachineStorageSafety {
         assertNotNull(manifests, "the working database holds a MANIFEST file");
         assertTrue(manifests.length > 0, "the working database holds a MANIFEST file");
         Files.write(manifests[0].toPath(), JUNK_BYTES);
+    }
+
+    /** The exact three-family content of a closed metadata database, dumped read-only. */
+    private static void assertLeasesReverseIndexAndCounters(File dbDir) throws IOException {
+        final Options options = new Options();
+        final List<AutoCloseable> toClose = new ArrayList<>();
+        toClose.add(options);
+        try {
+            final List<byte[]> cfNames = RocksDB.listColumnFamilies(options, dbDir.getAbsolutePath());
+            final List<String> columnFamilies = new ArrayList<>();
+            for (byte[] name : cfNames) {
+                columnFamilies.add(new String(name, StandardCharsets.UTF_8));
+            }
+            final List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+            for (byte[] name : cfNames) {
+                final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
+                toClose.add(cfOptions);
+                descriptors.add(new ColumnFamilyDescriptor(name, cfOptions));
+            }
+            final List<ColumnFamilyHandle> handles = new ArrayList<>();
+            final RocksDB db = RocksDB.openReadOnly(dbDir.getAbsolutePath(), descriptors, handles);
+            toClose.add(db);
+            try {
+                MetadataTableDumpAsserts.assertLeaseIndexAndCounterContent(
+                        db,
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "leases"),
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "lease-paths"),
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "counters"),
+                        expectedLeases(),
+                        new TreeSet<>(Arrays.asList("11:/data/ephemeral-a", "11:/data/ephemeral-b")),
+                        expectedCounters());
+            } finally {
+                for (ColumnFamilyHandle handle : handles) {
+                    handle.close();
+                }
+            }
+        } catch (RocksDBException e) {
+            throw new IOException("Failed to inspect the metadata tables of " + dbDir, e);
+        } finally {
+            for (int i = toClose.size() - 1; i >= 0; i--) {
+                quietClose(toClose.get(i));
+            }
+        }
+    }
+
+    private static Map<Long, String> expectedLeases() {
+        final Map<Long, String> leases = new TreeMap<>();
+        leases.put(11L, "5000/15000/2");
+        leases.put(12L, "7000/17000/3");
+        return leases;
+    }
+
+    private static Map<String, Long> expectedCounters() {
+        final Map<String, Long> counters = new TreeMap<>();
+        counters.put("user:/counters/hits", 5L);
+        counters.put("sequential:/data/seq-", 1L);
+        return counters;
+    }
+
+    private static void quietClose(AutoCloseable closeable) {
+        try {
+            closeable.close();
+        } catch (Exception ignored) {
+        }
     }
 
     @Test
@@ -602,6 +719,81 @@ public class TestMetadataStateMachineStorageSafety {
     }
 
     @Test
+    void testCheckpointCarriesLeasesReverseIndexAndCounters() throws Exception {
+        final File dbDir = new File(tempDir, "rocksdb");
+        final File snapshotDir;
+        try (Member member = new Member("member", GROUP_A, dbDir, new ManualClock(10_000L))) {
+            assertEquals(7L, populateLeasesReverseIndexAndCounters(member));
+            snapshotDir = member.snapshotDir(1L, 7L);
+        }
+        assertLeasesReverseIndexAndCounters(dbDir); // the closed working database
+        assertLeasesReverseIndexAndCounters(snapshotDir); // the published checkpoint
+    }
+
+    @Test
+    void testStartupRestoreBehindSnapshotKeepsLeasesReverseIndexAndCounters() throws Exception {
+        final File dbDir = new File(tempDir, "rocksdb");
+        try (Member member = new Member("member", GROUP_A, dbDir, new ManualClock(10_000L))) {
+            populateLeasesReverseIndexAndCounters(member);
+        }
+        // A lost working database forces restoreIfBehindSnapshot at startup.
+        FileUtils.deleteDirectoryQuietly(dbDir);
+        try (Member member = new Member("member", GROUP_A, dbDir, new ManualClock(10_000L))) {
+            member.open();
+            assertEquals(
+                    7L,
+                    revisionOf(member.stateMachine).getRevision(),
+                    "the restored database keeps its applied-revision marker");
+        }
+        assertLeasesReverseIndexAndCounters(dbDir);
+    }
+
+    @Test
+    void testTornWorkingDatabaseSelfHealKeepsLeasesReverseIndexAndCounters() throws Exception {
+        final File dbDir = new File(tempDir, "rocksdb");
+        try (Member member = new Member("member", GROUP_A, dbDir, new ManualClock(10_000L))) {
+            populateLeasesReverseIndexAndCounters(member);
+        }
+        corruptManifest(dbDir);
+        try (Member member = new Member("member", GROUP_A, dbDir, new ManualClock(10_000L))) {
+            member.open();
+            assertEquals(
+                    7L,
+                    revisionOf(member.stateMachine).getRevision(),
+                    "the healed database carries the snapshot's applied-revision marker");
+        }
+        assertLeasesReverseIndexAndCounters(dbDir);
+    }
+
+    @Test
+    void testReinitializeFromInstalledSnapshotKeepsLeasesReverseIndexAndCounters() throws Exception {
+        // The receiver "receives" the snapshot the way ratis finalizes an install: the directory
+        // appears below its own sm dir, then reinitialize() rebuilds the working database from it.
+        final File donorDb = new File(tempDir, "donor-rocksdb");
+        final Member donor = new Member("donor", GROUP_A, donorDb, new ManualClock(10_000L));
+        try {
+            populateLeasesReverseIndexAndCounters(donor);
+        } finally {
+            donor.close();
+        }
+        final File receiverDb = new File(tempDir, "receiver-rocksdb");
+        final Member receiver = new Member("receiver", GROUP_A, receiverDb, new ManualClock(10_000L));
+        try {
+            receiver.open();
+            copyTree(donor.snapshotDir(1L, 7L), receiver.snapshotDir(1L, 7L));
+            receiver.stateMachine.pause();
+            receiver.stateMachine.reinitialize();
+            assertEquals(
+                    7L,
+                    receiver.stateMachine.getLastAppliedTermIndex().getIndex(),
+                    "the watermark lifts to the installed snapshot's index");
+        } finally {
+            receiver.close();
+        }
+        assertLeasesReverseIndexAndCounters(receiverDb);
+    }
+
+    @Test
     void testReinitializeRethrowsWhenTheSnapshotStaysBroken() throws Exception {
         final File donorDb = new File(tempDir, "donor-rocksdb");
         final Member donor = new Member("donor", GROUP_A, donorDb);
@@ -628,6 +820,112 @@ public class TestMetadataStateMachineStorageSafety {
             assertTrue(failure.getMessage().contains(StateMachineIdentity.SNAPSHOT_FILE));
         } finally {
             receiver.close();
+        }
+    }
+
+    private static void assumePosixOwnerPermissions() {
+        assumeTrue(
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"),
+                "the scan failure is produced by an owner-permission flip (POSIX only)");
+        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores permission bits");
+    }
+
+    /** Door 1: the snapshot dir can be traversed but not listed - the scan itself throws. */
+    @Test
+    void testUnscannableSnapshotDirRefusesStartup() throws Exception {
+        assumePosixOwnerPermissions();
+        final File dbDir = new File(tempDir, "rocksdb");
+        final Member prototype = new Member("member", GROUP_A, dbDir);
+        try {
+            openAndSnapshotAtOne(prototype);
+        } finally {
+            prototype.close();
+        }
+        final File snapshotDir = prototype.snapshotDir(1, 1);
+        final Set<PosixFilePermission> original =
+                Files.getPosixFilePermissions(snapshotDir.toPath());
+        // Execute without read: the dir stays discoverable and its manifest stays stat-able,
+        // but Files.newDirectoryStream inside it throws.
+        Files.setPosixFilePermissions(
+                snapshotDir.toPath(), EnumSet.of(PosixFilePermission.OWNER_EXECUTE));
+        try {
+            try (Member member = new Member("member", GROUP_A, dbDir)) {
+                final IOException failure = assertThrows(IOException.class, member::open);
+                assertTrue(failure.getMessage().contains(prototype.stateMachineDir().getPath()));
+            }
+
+            // The refusal is about the scan, not the artifacts: the same pair opens once the
+            // snapshot area is readable again.
+            Files.setPosixFilePermissions(snapshotDir.toPath(), original);
+            try (Member member = new Member("member", GROUP_A, dbDir)) {
+                member.open();
+                assertEquals(LifeCycle.State.RUNNING, member.stateMachine.getLifeCycleState());
+                assertEquals(1L, revisionOf(member.stateMachine).getRevision());
+            }
+        } finally {
+            Files.setPosixFilePermissions(snapshotDir.toPath(), original);
+        }
+    }
+
+    /**
+     * Door 2: no execute bit at all - File.isFile() cannot distinguish an absent manifest
+     * from an unstat-able one, so the dir is invisible to the scan with no exception. The
+     * verify pass must refuse, and cleanup must NOT have deleted what it could not verify.
+     */
+    @Test
+    void testUnverifiableSnapshotDirRefusesStartup() throws Exception {
+        assumePosixOwnerPermissions();
+        final File dbDir = new File(tempDir, "rocksdb");
+        final Member prototype = new Member("member", GROUP_A, dbDir);
+        try {
+            openAndSnapshotAtOne(prototype);
+        } finally {
+            prototype.close();
+        }
+        final File snapshotDir = prototype.snapshotDir(1, 1);
+        final Set<PosixFilePermission> original =
+                Files.getPosixFilePermissions(snapshotDir.toPath());
+        Files.setPosixFilePermissions(
+                snapshotDir.toPath(), EnumSet.noneOf(PosixFilePermission.class));
+        try {
+            try (Member member = new Member("member", GROUP_A, dbDir)) {
+                final IOException failure = assertThrows(IOException.class, member::open);
+                assertTrue(failure.getMessage().contains(prototype.stateMachineDir().getPath()));
+                assertNotNull(failure.getCause(), "the refusal chains the verification failure");
+                assertTrue(String.valueOf(failure.getCause()).contains(snapshotDir.getPath()));
+            }
+        } finally {
+            Files.setPosixFilePermissions(snapshotDir.toPath(), original);
+        }
+        assertTrue(
+                snapshotDir.isDirectory(), "cleanup did not delete a snapshot it could not verify");
+        try (Member member = new Member("member", GROUP_A, dbDir)) {
+            member.open();
+            assertEquals(LifeCycle.State.RUNNING, member.stateMachine.getLifeCycleState());
+            assertEquals(1L, revisionOf(member.stateMachine).getRevision());
+        }
+    }
+
+    /** At runtime the same scan failure degrades to "no snapshot" - never kills a server. */
+    @Test
+    void testRuntimeScanFailureDegradesToNoSnapshot() throws Exception {
+        assumePosixOwnerPermissions();
+        final File dbDir = new File(tempDir, "rocksdb");
+        try (Member member = new Member("member", GROUP_A, dbDir)) {
+            member.open();
+            final MetadataStateMachineStorage storage =
+                    (MetadataStateMachineStorage) member.stateMachine.getStateMachineStorage();
+            final File smDir = member.stateMachineDir();
+            Files.createDirectories(smDir.toPath());
+            final Set<PosixFilePermission> original =
+                    Files.getPosixFilePermissions(smDir.toPath());
+            Files.setPosixFilePermissions(
+                    smDir.toPath(), EnumSet.of(PosixFilePermission.OWNER_EXECUTE));
+            try {
+                assertNull(storage.loadLatestSnapshot());
+            } finally {
+                Files.setPosixFilePermissions(smDir.toPath(), original);
+            }
         }
     }
 }

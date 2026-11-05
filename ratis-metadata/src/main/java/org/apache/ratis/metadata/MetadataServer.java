@@ -34,6 +34,7 @@ import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.server.storage.RaftStorage;
 import org.apache.ratis.thirdparty.com.google.common.annotations.VisibleForTesting;
+import org.apache.ratis.util.ExitUtils;
 import org.apache.ratis.util.TimeDuration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -49,6 +50,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 
@@ -81,6 +83,8 @@ public final class MetadataServer implements AutoCloseable {
     private final RaftGroupId groupId;
     private final List<RaftPeer> peers;
     private final InetSocketAddress selfEndpoint;
+    /** The port a port-0 self entry resolved to, pinned as the transport listen port; else -1. */
+    private final int selfListenPort;
     private final File raftDir;
     private final File rocksdbDir;
     private final Clock clock;
@@ -89,6 +93,7 @@ public final class MetadataServer implements AutoCloseable {
     private final java.time.Duration resultRetention;
     private final TimeDuration retryCacheExpiry;
     private final java.time.Duration leaseScanInterval;
+    private final java.time.Duration leaseClockSkewTolerance;
     private final boolean snapshotAutoTrigger;
     private final long snapshotAutoTriggerThreshold;
     private final int snapshotRetentionFileNum;
@@ -120,6 +125,10 @@ public final class MetadataServer implements AutoCloseable {
                                         ("ratis-metadata:" + String.join(",", sortedIds))
                                                 .getBytes()));
         this.selfEndpoint = selfEndpointOf(peers, selfId);
+        // A port-0 self entry had its endpoint substituted (probed or builder-set): that port
+        // is also this member's listen port - raftProperties() pins it into the transport key.
+        this.selfListenPort =
+                selfEntryCarriesPortZero(builder.quorum, selfId) ? selfEndpoint.getPort() : -1;
         this.raftDir = new File(builder.dataDir, "raft");
         this.rocksdbDir = new File(builder.dataDir, "rocksdb");
         this.clock = builder.clock;
@@ -128,6 +137,7 @@ public final class MetadataServer implements AutoCloseable {
         this.resultRetention = builder.resultRetention;
         this.retryCacheExpiry = builder.retryCacheExpiry;
         this.leaseScanInterval = builder.leaseScanInterval;
+        this.leaseClockSkewTolerance = builder.leaseClockSkewTolerance;
         this.snapshotAutoTrigger = builder.snapshotAutoTrigger;
         this.snapshotAutoTriggerThreshold = builder.snapshotAutoTriggerThreshold;
         this.snapshotRetentionFileNum = builder.snapshotRetentionFileNum;
@@ -144,9 +154,27 @@ public final class MetadataServer implements AutoCloseable {
         return groupId;
     }
 
+    /**
+     * This member's advertised endpoint - concrete even when its quorum entry carried port 0
+     * (probed, or {@link Builder#setSelfPort(int)}); that port is what the transport listens
+     * on and what peers and external clients dial. Available before {@link #start()}.
+     */
+    public InetSocketAddress getSelfEndpoint() {
+        return selfEndpoint;
+    }
+
     /** Starts the raft metadata group; the ordering of the steps is load-bearing. */
     public synchronized void start() throws IOException {
         checkState(raftServer == null, "metadata server already started");
+
+        // Ratis' grpc transport answers a server-start failure with ExitUtils.terminate - a
+        // System.exit that takes every co-hosted service of the embedding JVM down
+        // (GrpcServicesImpl.startImpl is the only terminate call site in main-scope ratis).
+        // This module embeds by contract, so disarm the process exit process-wide (ratis'
+        // own test harnesses flip the same switch); the guard on the raft start below keeps
+        // the failure on this call stack instead. One-way and JVM-global - a member gone
+        // silent is observable via getTerminateException().
+        ExitUtils.disableSystemExit();
 
         // A fresh log over a kept RocksDB would alias generations: the applied-revision
         // marker would swallow the new log's early commands. Refuse before ratis formats.
@@ -160,6 +188,10 @@ public final class MetadataServer implements AutoCloseable {
                             + " directory or deleting the RocksDB with it requires an explicit"
                             + " decision: keep the pair together or rebuild both.");
         }
+
+        // The advertised port is probed before any ratis resource exists, so the common
+        // conflict fails fast here instead of inside the transport's own start.
+        checkPortAvailable(selfEndpoint);
 
         final RaftProperties properties = raftProperties();
 
@@ -183,10 +215,33 @@ public final class MetadataServer implements AutoCloseable {
 
         this.leaseScheduler =
                 new LeaseExpiryScheduler(
-                        raftServer, stateMachine, groupId, clock, leaseScanInterval);
+                        raftServer,
+                        stateMachine,
+                        groupId,
+                        clock,
+                        leaseScanInterval,
+                        leaseClockSkewTolerance);
         leaseScheduler.start();
 
-        raftServer.start();
+        try {
+            raftServer.start();
+        } catch (IOException | RuntimeException e) {
+            // The raft start failed: grpc routes e.g. a bind conflict through
+            // ExitUtils.terminate (with the exit disarmed above it lands here as an
+            // ExitException); netty's bind failure arrives as a plain IOException; a
+            // division-start failure - e.g. the state machine's storage refusing the
+            // snapshot area - arrives wrapped in a CompletionException (the proxy starts its
+            // divisions asynchronously and joins them). Close what start() opened - the
+            // client is still null here - and fail this call, not the process. The lease
+            // scheduler's close joins a scan loop only if a raft-1 division already
+            // self-elected before the failure; it stops promptly, bounded by the scheduler's
+            // 10s join timeout.
+            LOG.error(
+                    "Starting the raft server of group {} failed; closing the metadata server.",
+                    groupId,
+                    e);
+            throw closeAndSuppress(toStartFailure(e));
+        }
         LOG.info(
                 "Started the metadata group {} (self={}) on {}.",
                 groupId,
@@ -212,12 +267,7 @@ public final class MetadataServer implements AutoCloseable {
                     "Building the metadata client of group {} failed; closing the raft server.",
                     groupId,
                     e);
-            try {
-                close();
-            } catch (IOException closeFailure) {
-                e.addSuppressed(closeFailure);
-            }
-            throw e;
+            throw closeAndSuppress(e);
         }
     }
 
@@ -229,6 +279,18 @@ public final class MetadataServer implements AutoCloseable {
     /** The state machine this server applies commands on; null until start(). */
     public synchronized MetadataStateMachine getStateMachine() {
         return stateMachine;
+    }
+
+    /**
+     * The first terminate condition ratis recorded in this JVM since the process exit was
+     * disarmed by {@link #start()} - e.g. a transport start failure routed through
+     * {@code ExitUtils.terminate}, or the record of a ratis background thread's uncaught
+     * exception - or null. A MetadataServer never exits its JVM: poll this when a member
+     * goes silent to find the recorded reason. The record is JVM-global (any ratis component
+     * in the process may have set it) and sticky.
+     */
+    public ExitUtils.ExitException getTerminateException() {
+        return ExitUtils.getFirstExitException();
     }
 
     /** This member's raft term; a read failure is loud. */
@@ -263,6 +325,44 @@ public final class MetadataServer implements AutoCloseable {
         }
     }
 
+    /** Closes what start() opened, keeping the close's own failure as a suppressed exception. */
+    private <T extends Throwable> T closeAndSuppress(T failure) {
+        try {
+            close();
+        } catch (IOException closeFailure) {
+            failure.addSuppressed(closeFailure);
+        }
+        return failure;
+    }
+
+    /**
+     * What start() throws for a raft-start failure. An IOException is returned unchanged -
+     * netty's bind failure as-is, and a division-start failure unwrapped from the proxy's
+     * async CompletionException wrapper, so the original message and cause chain stay intact.
+     * Every other flavor - grpc's disarmed ExitException, a CompletionException of some other
+     * cause, any other bug - becomes a descriptive IOException carrying the original as its
+     * direct cause.
+     */
+    private IOException toStartFailure(Exception e) {
+        if (e instanceof IOException) {
+            return (IOException) e;
+        }
+        if (e instanceof CompletionException && e.getCause() instanceof IOException) {
+            return (IOException) e.getCause();
+        }
+        return new IOException(
+                "Starting the raft server of group "
+                        + groupId
+                        + " (self="
+                        + selfId
+                        + ", advertised "
+                        + peerAddress(selfEndpoint)
+                        + ") failed in the "
+                        + rpcType
+                        + " transport; a port or address conflict is the usual cause.",
+                e);
+    }
+
     // ------------------------------------------------------------------
     // assembly
     // ------------------------------------------------------------------
@@ -277,11 +377,13 @@ public final class MetadataServer implements AutoCloseable {
                 TimeDuration.valueOf(requestTimeout.toMillis(), TimeUnit.MILLISECONDS));
         RaftServerConfigKeys.setStorageDir(properties, Collections.singletonList(raftDir));
         setSnapshotPolicy(properties);
-        // The flush index still advances only after the actual FileChannel.force completes
-        // (ratis BufferedWriteChannel.asyncFlush), so a commit keeps meaning majority-fsync;
-        // async only stops the log worker blocking behind a force, overlapping consecutive
-        // flushes instead of serializing them.
-        RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, true);
+        // Pinned to ratis' default synchronous segment flush. The async-flush path of this
+        // build never coalesces queued appends into one force, and the metadata benchmark
+        // measures it ten times slower (three members, 256 in flight: ~0.3k ops/s against
+        // ~3.3k for the synchronous flush); the synchronous path batches the in-flight
+        // entries into one flush cycle and still fsyncs before the flush index advances,
+        // so a commit keeps meaning majority-fsync.
+        RaftServerConfigKeys.Log.setAsyncFlushEnabled(properties, false);
         // Ratis otherwise appends a METADATA entry per commit advance: two log entries and
         // two flushes for every one-command commit on this metadata-sized workload. Those
         // entries only seed the commit index at restart, which the new leader re-advertises
@@ -297,10 +399,29 @@ public final class MetadataServer implements AutoCloseable {
         // store the state machine commits with every command. A builder knob exists for
         // test harnesses, which keep the burden of choosing a defensible expiry themselves.
         RaftServerConfigKeys.RetryCache.setExpiryTime(properties, retryCacheExpiry);
+        // A port-0 self entry resolved to a concrete endpoint that the group and the local
+        // metadata client both advertise; pin it as the transport's listen port so a listener
+        // actually sits behind that address. Raw key names - the transport artifacts are
+        // deliberately not on this module's compile classpath; these are their public, stable
+        // *ConfigKeys.Server.PORT_KEY values. Pinned before the customizer: the last word
+        // stays with an embedder that owns the network setup.
+        final String listenPortKey = transportListenPortKey(rpcType);
+        if (selfListenPort > 0 && listenPortKey != null) {
+            properties.setInt(listenPortKey, selfListenPort);
+        }
         // Transport-specific keys (e.g. the grpc listen port) belong to the transport artifact,
         // which this module deliberately does not depend on; the customizer supplies them.
         if (propertiesCustomizer != null) {
             propertiesCustomizer.accept(properties);
+        }
+        if (selfListenPort > 0
+                && listenPortKey != null
+                && properties.getInt(listenPortKey, 0) != selfListenPort) {
+            LOG.warn(
+                    "The properties customizer moved the transport listen port off the"
+                            + " advertised {}; the group and the metadata client still"
+                            + " advertise it.",
+                    peerAddress(selfEndpoint));
         }
         return properties;
     }
@@ -349,6 +470,8 @@ public final class MetadataServer implements AutoCloseable {
         private java.time.Duration resultRetention = DEFAULT_RESULT_RETENTION;
         private TimeDuration retryCacheExpiry = DEFAULT_RETRY_CACHE_EXPIRY;
         private java.time.Duration leaseScanInterval = java.time.Duration.ofSeconds(1);
+        /** Null means the per-lease default: one renewal interval (ttl / 3). */
+        private java.time.Duration leaseClockSkewTolerance;
         private boolean snapshotAutoTrigger = true;
         private long snapshotAutoTriggerThreshold = 400_000L;
         private int snapshotRetentionFileNum = 2;
@@ -462,6 +585,25 @@ public final class MetadataServer implements AutoCloseable {
             return this;
         }
 
+        /**
+         * Sets how much cross-leader wall-clock skew the expiry scan tolerates before judging a
+         * lease due, on top of the ttl / 3 renewal grace. The leader that sequenced a lease's
+         * last renewal stamped its expiry with that leader's wall clock; whoever leads later
+         * judges it with its own - a successor clock running this far ahead of its
+         * predecessor's expires otherwise healthy leases at takeover. One renewal interval
+         * (ttl / 3) per lease by default; zero opts out (NTP-disciplined fleets), larger values
+         * trade dead-holder expiry latency for skew headroom.
+         */
+        public Builder setLeaseClockSkewTolerance(java.time.Duration clockSkewTolerance) {
+            checkNotNull(clockSkewTolerance, "clockSkewTolerance");
+            checkArgument(
+                    clockSkewTolerance.toMillis() >= 0,
+                    "clockSkewTolerance must not be negative, got %s",
+                    clockSkewTolerance);
+            this.leaseClockSkewTolerance = clockSkewTolerance;
+            return this;
+        }
+
         /** Enables or disables the snapshot auto-trigger and sets its log-distance threshold. */
         public Builder setSnapshotAutoTrigger(boolean enabled, long threshold) {
             checkArgument(threshold > 0, "snapshot threshold must be positive, got %s", threshold);
@@ -514,6 +656,8 @@ public final class MetadataServer implements AutoCloseable {
         /**
          * Supplies the concrete port to bind when this member's own quorum entry carries port
          * 0 - for embedders that own the network setup; otherwise an ephemeral port is probed.
+         * Either way the resolved port is pinned as the transport listen port before the
+         * properties customizer runs, so the customizer keeps the last word on it.
          */
         public Builder setSelfPort(int selfPort) {
             checkArgument(selfPort > 0, "selfPort must be positive, got %s", selfPort);
@@ -612,6 +756,33 @@ public final class MetadataServer implements AutoCloseable {
         throw new IllegalArgumentException("Self id " + selfId + " missing from the peer list");
     }
 
+    /** Whether this member's own quorum entry carries port 0 (its endpoint is substituted). */
+    private static boolean selfEntryCarriesPortZero(List<String> quorum, RaftPeerId selfId) {
+        for (String rawEntry : quorum) {
+            final String entry = rawEntry.trim();
+            final int at = entry.lastIndexOf('@');
+            if (at > 0 && RaftPeerId.valueOf(entry.substring(0, at)).equals(selfId)) {
+                return peerEndpoint(entry.substring(at + 1)).getPort() == 0;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The transport listen-port property key of the rpc type, or null when the transport is
+     * none of the ones known here (grpc, netty) - its listen wiring then stays wholly with
+     * the customizer. Raw names: the transport artifacts are off this module's classpath.
+     */
+    private static String transportListenPortKey(SupportedRpcType rpcType) {
+        if (rpcType == SupportedRpcType.GRPC) {
+            return "raft.grpc.server.port";
+        }
+        if (rpcType == SupportedRpcType.NETTY) {
+            return "raft.netty.server.port";
+        }
+        return null;
+    }
+
     /**
      * A free port probed by bind-and-release; a test/embedding convenience with a small race
      * window - production members carry concrete ports in their quorum entries.
@@ -621,6 +792,34 @@ public final class MetadataServer implements AutoCloseable {
             return socket.getLocalPort();
         } catch (IOException e) {
             throw new IllegalStateException("Probing a free quorum port failed", e);
+        }
+    }
+
+    /**
+     * Refuses a start on a port this member cannot bind: the transport would otherwise
+     * surface the conflict only at its own start (and grpc terminates the embedding JVM on
+     * it). Binds the wildcard address - where the grpc server binds by default - with
+     * SO_REUSEADDR explicitly on, i.e. exactly the listener semantics the transport itself
+     * inherits (ratis sets no reuse option on the listening channel), so the probe is never
+     * stricter than the transport: a live listener on the port is refused, while a
+     * same-port restart over draining TIME_WAIT sockets passes as it does today. The
+     * bind-and-release race and any customizer-repinned transport port are closed by the
+     * guard around the raft start.
+     */
+    private static void checkPortAvailable(InetSocketAddress endpoint) throws IOException {
+        if (endpoint.getPort() <= 0) {
+            return;
+        }
+        try (ServerSocket socket = new ServerSocket()) {
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress(endpoint.getPort()), 1);
+        } catch (IOException e) {
+            throw new IOException(
+                    "The port of "
+                            + peerAddress(endpoint)
+                            + " is not bindable in this process (a live listener holds it);"
+                            + " refusing to start the metadata server on it.",
+                    e);
         }
     }
 }

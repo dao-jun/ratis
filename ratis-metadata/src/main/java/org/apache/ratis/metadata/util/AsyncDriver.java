@@ -25,8 +25,13 @@ import java.util.concurrent.TimeUnit;
  * The single daemon scheduler every periodic background step of this module runs on - lease
  * renewals, watcher poll pacing, lock watchdogs. No component owns a blocking thread of its
  * own: each drives its state machine with asynchronous calls whose completions schedule the
- * next step here. Tasks must be short and must never block; a slow task only delays the
- * others' ticks, it cannot deadlock them.
+ * next step here. Tasks must be short and must never block: this one thread is shared by every
+ * component in the process, so a task that parks here (e.g. in ratis' outstanding-request
+ * backpressure) freezes every other component's ticks with it. The client's async twins
+ * enforce that: {@code RaftMetadataClient.sendAsync} is the only code allowed to touch the
+ * raft client, and it enqueues each send on the client's sender thread - the only thread that
+ * may park in ratis' backpressure. Adding another raft-client call site here silently
+ * reintroduces the defect; change this contract and the README threading model together.
  */
 public final class AsyncDriver {
 
@@ -34,7 +39,7 @@ public final class AsyncDriver {
 
     private static final ScheduledExecutorService SCHEDULER =
             Executors.newSingleThreadScheduledExecutor(
-                    new NamedThreadFactory("ratis-metadata-scheduler", true));
+                    new NamedThreadFactory("ratis-metadata-scheduler"));
 
     /** Runs {@code task} once, {@code delayMs} from now. */
     public static ScheduledFuture<?> schedule(Runnable task, long delayMs) {

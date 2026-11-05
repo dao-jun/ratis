@@ -23,7 +23,11 @@ import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.protocol.SetConfigurationRequest;
+import org.apache.ratis.protocol.exceptions.NotLeaderException;
+import org.apache.ratis.protocol.exceptions.ReconfigurationTimeoutException;
 import org.apache.ratis.server.impl.RetryCacheImpl.CacheEntry;
 import org.apache.ratis.server.impl.RetryCacheImpl.CacheQueryResult;
 import org.apache.ratis.server.protocol.TermIndex;
@@ -31,6 +35,7 @@ import org.apache.ratis.server.raftlog.RaftLog;
 import org.apache.ratis.util.TimeDuration;
 import org.junit.jupiter.api.Test;
 
+import java.util.Collections;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -132,18 +137,63 @@ class TestRetryCacheImpl {
     final ClientInvocationId key = newKey();
     final TermIndex olderPosition = TermIndex.valueOf(1, 10);
     final TermIndex currentPosition = TermIndex.valueOf(1, 11);
-    final CacheEntry current = cache.getOrCreateEntry(key, currentPosition);
-    current.failWithReply(currentPosition, reply(key, 11));
 
-    assertSame(current, cache.getOrCreateEntry(key, olderPosition),
-        "a larger current index must survive even when it has failed");
+    // A pending entry at a higher index still owns a live append: it survives
+    // an older applying position.
+    final CacheEntry pending = cache.getOrCreateEntry(key, currentPosition);
+    assertSame(pending, cache.getOrCreateEntry(key, olderPosition),
+        "a pending higher-index entry must survive an older applying position");
 
-    final CacheEntry sameIndex = cache.getOrCreateEntry(key, currentPosition);
-    assertNotSame(current, sameIndex, "a failed entry must be replaceable at the same index");
+    // Once that position is truncated - the only way a bound entry fails -
+    // the entry is terminal and must yield even to a lower committed index.
+    pending.failWithReply(currentPosition, reply(key, currentPosition.getIndex()));
+    final CacheEntry replacement = cache.getOrCreateEntry(key, olderPosition);
+    assertNotSame(pending, replacement,
+        "a failed entry must be replaceable even at a higher index");
+    assertEquals(olderPosition.getIndex(), replacement.getLogIndex());
+    replacement.updateResult(reply(key, olderPosition.getIndex()));
+    assertTrue(replacement.isCompletedNormally());
+    assertSame(replacement, cache.getIfPresent(key));
 
-    sameIndex.failWithReply(currentPosition, reply(key, 11));
+    replacement.failWithReply(olderPosition, reply(key, olderPosition.getIndex()));
     final CacheEntry newer = cache.getOrCreateEntry(key, TermIndex.valueOf(1, 12));
-    assertNotSame(sameIndex, newer, "a failed older entry must be replaceable by a newer index");
+    assertNotSame(replacement, newer, "a failed entry must be replaceable by a newer index");
+  }
+
+  /**
+   * A cache entry bound at a position that a leader change truncates must
+   * yield to the same invocation applied at the new leader's lower index;
+   * otherwise the committed reply is swallowed and the next retry is treated
+   * as a first attempt, re-appending an already committed invocation.
+   */
+  @Test
+  void testTruncatedEntryYieldsToReappliedCommittedPosition() {
+    final RetryCacheImpl cache = newCache();
+    final ClientInvocationId key = newKey();
+    final RaftClientRequest request = request(key);
+
+    // Leader in term 2 accepts the write and appends it at (2, 101).
+    final CacheEntry appended = cache.queryCache(request).getEntry();
+    appended.bind(TermIndex.valueOf(2, 101));
+
+    // A leader change truncates (2, 101): notifyTruncatedLogEntry fails the
+    // entry bound to exactly that position.
+    appended.failWithReply(TermIndex.valueOf(2, 101), reply(key, 101));
+
+    // The new leader commits the same invocation at (3, 100); this server
+    // applies it: replyPendingRequest -> getOrCreateEntry(key, (3, 100)).
+    final CacheEntry applying = cache.getOrCreateEntry(key, TermIndex.valueOf(3, 100));
+    assertNotSame(appended, applying,
+        "the truncated entry must yield to the committed position");
+    applying.updateResult(reply(key, 100));
+    assertTrue(applying.isCompletedNormally());
+
+    // The next retry must be deduped against the committed reply, not
+    // re-appended as a first attempt.
+    final CacheQueryResult retry = cache.queryCache(request);
+    assertTrue(retry.isRetry(), "a retry of a committed invocation must be a cache hit");
+    assertSame(applying, retry.getEntry());
+    assertEquals(100, retry.getEntry().getReplyFuture().join().getLogIndex());
   }
 
   @Test
@@ -281,5 +331,25 @@ class TestRetryCacheImpl {
         () -> pending.setReply(reply(key, 11)));
     assertTrue(exception.getMessage().contains("PendingRequest already completed"));
     assertEquals(10, pending.getFuture().join().getLogIndex());
+  }
+
+  @Test
+  void testSetConfPendingRequestToleratesSecondCompletion() {
+    final SetConfigurationRequest request = new SetConfigurationRequest(
+        ClientId.randomId(), RaftPeerId.valueOf("s0"), RaftGroupId.randomId(), 0,
+        Collections.singletonList(RaftPeer.newBuilder().setId("s0").build()));
+    final NotLeaderException nle = new NotLeaderException(RaftServerTestUtil.TEST_MEMBER_ID, null, null);
+
+    // replySetConfiguration wins; the concurrently stopping leader state loses
+    final PendingRequest pending = new PendingRequest(request);
+    pending.setReply(RaftClientReply.newBuilder().setRequest(request).setSuccess().build());
+    pending.setNotLeaderException(nle, Collections.emptyList());
+    assertTrue(pending.getFuture().join().isSuccess());
+
+    // failSetConfiguration wins; the concurrently stopping leader state loses
+    final PendingRequest failed = new PendingRequest(request);
+    failed.setException(new ReconfigurationTimeoutException("test timeout"));
+    failed.setNotLeaderException(nle, Collections.emptyList());
+    assertTrue(failed.getFuture().isCompletedExceptionally());
   }
 }

@@ -19,6 +19,7 @@ package org.apache.ratis.metadata.client;
 import org.apache.ratis.metadata.statemachine.ChangeEvent;
 import org.apache.ratis.metadata.util.AsyncDriver;
 import org.apache.ratis.metadata.util.ExceptionUtils;
+import org.apache.ratis.protocol.exceptions.AlreadyClosedException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -27,6 +28,7 @@ import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
 import static org.apache.ratis.metadata.util.Preconditions.checkArgument;
 import static org.apache.ratis.metadata.util.Preconditions.checkNotNull;
@@ -42,11 +44,16 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  * never at queue time. {@link #lastDeliveredRevision()} therefore names a batch the listener
  * actually returned from, not one merely queued.
  *
- * <p>Callbacks run inline on the client's completion executor (or on the {@link Builder#setExecutor
- * executor} supplied instead) - keep them short: a blocking callback parks its thread until it
- * returns, and on the client's completion executor that also delays the client's other
- * asynchronous calls. Callbacks of one watcher never overlap - not even on a multithreaded
- * executor, because no second poll exists while a delivery is outstanding.
+ * <p>Callbacks run on the client's delivery pool (or on the {@link Builder#setExecutor executor}
+ * supplied instead) - never on the client's completion executor, whose two threads settle every
+ * async reply: listeners parked there would starve the settles, and a lease renewal whose reply
+ * never settles stops its session renewing - the lease dies while its holder blocks on something
+ * else entirely. Keep callbacks short anyway, and never let one block waiting on another
+ * watcher's delivery (a lock acquire included): default-executor watchers of one client share
+ * its delivery pool, and such re-entrant waits can starve each other. Callbacks of one watcher
+ * never overlap - not even on a multithreaded executor, because no second poll exists while a
+ * delivery is outstanding. A listener Error on the client pool is logged and the worker
+ * survives; on a supplied executor it surfaces wherever that executor puts it.
  *
  * <p>Admission: each callback unit (record batch or NEED_SNAPSHOT report) admits itself under a
  * short internal lock immediately before invoking the listener - a unit admitted only after
@@ -56,6 +63,9 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
 public final class MetadataWatcher implements AutoCloseable {
 
     private static final Logger LOG = LoggerFactory.getLogger(MetadataWatcher.class);
+
+    /** Queue waits this long mean the delivery threads are parked, not slow. */
+    private static final long QUEUED_DELIVERY_WARN_MS = 10_000L;
 
     /** Receives the watcher's stream; see {@link MetadataWatcher}'s javadoc for the contract. */
     public interface Listener {
@@ -69,7 +79,13 @@ public final class MetadataWatcher implements AutoCloseable {
 
     private final RaftMetadataClient client;
     private final Listener listener;
+
+    /** Where delivery units run: the builder's executor, or the client's delivery pool. */
     private final Executor executor;
+
+    /** True when the builder set no executor - the client's pool carries listener Errors for us. */
+    private final boolean defaultDelivery;
+
     private final long pollIntervalMs;
     private final long maxPollBytes;
 
@@ -105,7 +121,8 @@ public final class MetadataWatcher implements AutoCloseable {
             long sinceRevision) {
         this.client = client;
         this.listener = listener;
-        this.executor = executor;
+        this.defaultDelivery = executor == null;
+        this.executor = defaultDelivery ? client.deliveryExecutor() : executor;
         this.pollIntervalMs = pollIntervalMs;
         this.maxPollBytes = maxPollBytes;
         this.checkpoint = sinceRevision;
@@ -157,9 +174,10 @@ public final class MetadataWatcher implements AutoCloseable {
         }
 
         /**
-         * Where {@link Listener} callbacks run, one delivery unit at a time; default is inline
-         * on the client's completion executor - the poll chain waits for each callback to
-         * return before polling again.
+         * Where {@link Listener} callbacks run, one delivery unit at a time; default is the
+         * client's delivery pool, isolated from the client's completion executor - give a
+         * blocking or re-entrant listener its own executor. The poll chain waits for each
+         * callback to return before polling again.
          */
         public Builder setExecutor(Executor executor) {
             this.executor = checkNotNull(executor, "executor");
@@ -189,6 +207,11 @@ public final class MetadataWatcher implements AutoCloseable {
      * exception - and exactly one new chain leaves from the last accepted revision once the
      * report completed; with no recorded request the chain stays stopped. A chain that is
      * polling rejects the request, as before.
+     *
+     * <p>One failure is not resumable here: a chain stopped because the client's async
+     * pipeline failed permanently with no way back (see the transport failure in the README's
+     * failure contract) stays bound to that dead client, so a restart stops the same way -
+     * build a new watcher on a rebuilt client from {@link #lastDeliveredRevision()} instead.
      */
     public void restartFrom(long sinceRevision) {
         checkArgument(sinceRevision >= 0, "sinceRevision must be >= 0, got %s", sinceRevision);
@@ -257,9 +280,10 @@ public final class MetadataWatcher implements AutoCloseable {
 
     /**
      * Fires one poll on the shared scheduler's thread - never on a poll's own completion thread:
-     * under ratis' async backpressure (the outstanding-requests semaphore) the send can block its
-     * issuer, and blocking a completion thread risks wedging the very replies that free the
-     * permits. The scheduler stalling instead only delays ticks, never deadlocks.
+     * the send itself is enqueued on the client's sender thread, the only thread allowed to
+     * park in ratis' outstanding-request backpressure, so a wedged pipeline delays this
+     * watcher's poll alone - never the scheduler every other component's ticks run on, and
+     * never the completion threads that settle the very replies which free the permits.
      */
     private void pollNow() {
         final long from;
@@ -323,7 +347,34 @@ public final class MetadataWatcher implements AutoCloseable {
                                 + " their client");
                 return;
             }
-            // Longer outage: ratis already retried in-call; keep polling after the interval.
+            if (ExceptionUtils.causedBy(cause, AlreadyClosedException.class)
+                    && (client.isClosed() || !client.canRebuildRaftClient())) {
+                // The client's ordered async pipeline is dead for good, with no way back. Ratis
+                // fails an async request terminally only together with failAllAsyncRequests
+                // (OrderedAsync.handleException: closed client, non-retryable, or budget
+                // exhausted), which sticks the failure into the sliding window so every later
+                // async call of this client fails fast with AlreadyClosedException. An
+                // AlreadyClosed from the transport itself (thrown to trigger reconnection) only
+                // ever reaches here as the last attempt inside that same terminal call - until
+                // then it is an ordinary retryable IOException. So this cause cannot mean an
+                // outage that waiting heals; on a closed or non-rebuildable client, polling
+                // again can never succeed. This watcher stays bound to this client, so
+                // restartFrom cannot revive it - the resume is a new watcher on a rebuilt
+                // client, started from lastDeliveredRevision().
+                stopAfterFailure(
+                        cause,
+                        "the client's async pipeline failed permanently (a request exhausted its"
+                                + " finite retry budget, or the client closed); resume by"
+                                + " building a new watcher on a rebuilt client from"
+                                + " lastDeliveredRevision()");
+                return;
+            }
+            // Longer outage, replies persistently rejected as malformed, or the poisoned window
+            // of an open client that rebuilds its pipeline: ratis already retried in-call, an
+            // arriving reply keeps the pipeline healthy, and a rebuilt one carries the next
+            // poll - so a later poll may yet succeed. Keep polling after the interval (the
+            // README failure contract documents this: isRunning() stays true, no failure is
+            // set).
             LOG.debug("Polling for changes failed; retrying", cause);
             scheduleRetry(pollIntervalMs);
         } else {
@@ -450,8 +501,10 @@ public final class MetadataWatcher implements AutoCloseable {
      * complete after the close.
      */
     private void runUnit(final Runnable listenerWork, final Runnable completion, final String what) {
+        final long queuedAtNanos = System.nanoTime();
         final Runnable unit =
                 () -> {
+                    warnIfDeliveryWaited(queuedAtNanos, what);
                     synchronized (gate) {
                         if (closed) {
                             // Close won the race: this unit was never admitted - no listener
@@ -460,19 +513,48 @@ public final class MetadataWatcher implements AutoCloseable {
                         }
                     }
                     try {
-                        listenerWork.run();
+                        runListenerWork(listenerWork, what);
                     } finally {
                         completion.run();
                     }
                 };
-        if (executor == null) {
-            unit.run();
-        } else {
-            try {
-                executor.execute(unit);
-            } catch (RejectedExecutionException e) {
-                onExecutorRejection(e, what);
-            }
+        try {
+            executor.execute(unit);
+        } catch (RejectedExecutionException e) {
+            onExecutorRejection(e, what);
+        }
+    }
+
+    /**
+     * The client pool's worker survives a dying listener - the Error is logged, matching the
+     * quiet containment the old inline default landed in. An executor the embedder supplied
+     * keeps the contract: the Error surfaces wherever that executor puts it.
+     */
+    private void runListenerWork(final Runnable listenerWork, final String what) {
+        if (!defaultDelivery) {
+            listenerWork.run();
+            return;
+        }
+        try {
+            listenerWork.run();
+        } catch (Throwable t) {
+            LOG.warn("The change listener died with an Error during {}; the worker survives", what, t);
+        }
+    }
+
+    /**
+     * Warns when this unit sat queued beyond the wait bound: the delivery threads are parked by
+     * blocked listener callbacks, so other callbacks of the same client are being delayed.
+     */
+    private static void warnIfDeliveryWaited(long queuedAtNanos, String what) {
+        final long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - queuedAtNanos);
+        if (waitedMs > QUEUED_DELIVERY_WARN_MS) {
+            LOG.warn(
+                    "The {} waited {} ms for a delivery thread; a blocked listener callback is"
+                            + " delaying other callbacks - hand blocking watchers an explicit"
+                            + " executor",
+                    what,
+                    waitedMs);
         }
     }
 

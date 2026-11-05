@@ -22,11 +22,17 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
-/** The TLV wire codec of the metadata commands and results (the protobuf seam). */
+/**
+ * The TLV wire codec of the metadata commands and results (the protobuf seam). Strings on the wire
+ * are UTF-8 and lossless by construction: the encoder rejects unpaired UTF-16 surrogates instead
+ * of letting UTF-8 substitute {@code '?'}, which would alias distinct names. Decode-side,
+ * malformed bytes fold to U+FFFD, so raw hand-crafted payloads can still alias - writing log
+ * entries directly already implies full trust (see the module README).
+ */
 public final class RaftCommandCodec {
 
     /** The format version every payload starts with; any other version is malformed. */
-    public static final int CURRENT_FORMAT_VERSION = 2;
+    public static final int CURRENT_FORMAT_VERSION = 3;
 
     /** Default cap of LIST results when the command passes 0. */
     public static final long DEFAULT_MAX_LIST_RESULTS = 1024;
@@ -40,7 +46,12 @@ public final class RaftCommandCodec {
     // Commands
     // ------------------------------------------------------------------
 
-    /** Encodes one command (write or read) onto the wire. */
+    /**
+     * Encodes one command (write or read) onto the wire.
+     *
+     * @throws IllegalArgumentException when a string field (path, counter name, start-after
+     *     cursor) carries an unpaired surrogate, which UTF-8 cannot represent losslessly
+     */
     public static byte[] encodeCommand(RaftCommand command) {
         Encoder out = new Encoder();
         out.writeByte(CURRENT_FORMAT_VERSION);
@@ -89,6 +100,9 @@ public final class RaftCommandCodec {
             case INCREMENT:
                 out.writeString(command.getPath());
                 out.writeZigzag(command.getDelta());
+                // v3: the lease guard (0 = plain counter arithmetic); v2 payloads die on the
+                // version byte, never as a silent unguarded increment.
+                out.writeVarlong(command.getLeaseId());
                 break;
             case LEASE_REGISTER:
                 out.writeVarlong(command.getLeaseId());
@@ -194,7 +208,9 @@ public final class RaftCommandCodec {
                 }
                 return command.writerTerm(writerTerm).ops(ops);
             case INCREMENT:
-                return command.path(in.readString()).delta(in.readZigzag());
+                return command.path(in.readString())
+                        .delta(in.readZigzag())
+                        .leaseId(in.readVarlong());
             case LEASE_REGISTER:
                 return command.leaseId(in.readVarlong())
                         .ttlMs(in.readVarlong())
@@ -227,7 +243,12 @@ public final class RaftCommandCodec {
     // Results
     // ------------------------------------------------------------------
 
-    /** Encodes one command result onto the wire. */
+    /**
+     * Encodes one command result onto the wire.
+     *
+     * @throws IllegalArgumentException when a string field (a result or list-entry path) carries
+     *     an unpaired surrogate, which UTF-8 cannot represent losslessly
+     */
     public static byte[] encodeResult(RaftResult result) {
         final Encoder out = new Encoder();
         writeResult(out, result);
@@ -461,7 +482,12 @@ public final class RaftCommandCodec {
     // Change records
     // ------------------------------------------------------------------
 
-    /** Encodes a change record: the {@code changes} column family value. */
+    /**
+     * Encodes a change record: the {@code changes} column family value.
+     *
+     * @throws IllegalArgumentException when a change path carries an unpaired surrogate, which
+     *     UTF-8 cannot represent losslessly
+     */
     public static byte[] encodeChangeRecord(ChangeEvent record) {
         final Encoder out = new Encoder();
         writeChangeRecord(out, record);
@@ -518,6 +544,14 @@ public final class RaftCommandCodec {
         private static final long serialVersionUID = 1L;
     }
 
+    /** The reject signal of {@code writeString}: the wire only carries lossless strings. */
+    private static IllegalArgumentException unencodableString(int surrogateIndex) {
+        return new IllegalArgumentException(
+                "Cannot encode a string with an unpaired surrogate at index "
+                        + surrogateIndex
+                        + ": UTF-8 would substitute it with '?', aliasing distinct names");
+    }
+
     /** A single growable byte buffer; every encoded message is copied out exactly once. */
     private static final class Encoder {
         private byte[] buffer = new byte[64];
@@ -565,6 +599,20 @@ public final class RaftCommandCodec {
         }
 
         void writeString(String value) {
+            // getBytes(UTF_8) substitutes an unpaired surrogate with '?' - a legal name character
+            // - so two distinct names would encode to the same bytes and alias. Reject instead:
+            // every string written here must round-trip through readString unchanged.
+            for (int i = 0; i < value.length(); i++) {
+                final char c = value.charAt(i);
+                if (Character.isHighSurrogate(c)) {
+                    if (i + 1 == value.length() || !Character.isLowSurrogate(value.charAt(i + 1))) {
+                        throw unencodableString(i);
+                    }
+                    i++; // a surrogate pair is one code point and encodes losslessly
+                } else if (Character.isLowSurrogate(c)) {
+                    throw unencodableString(i);
+                }
+            }
             writeBytes(value.getBytes(StandardCharsets.UTF_8));
         }
     }
@@ -583,7 +631,7 @@ public final class RaftCommandCodec {
         }
 
         private void need(int count) {
-            if (count < 0 || remaining() < count) {
+            if (remaining() < count) {
                 throw new MalformedPayloadException();
             }
         }

@@ -16,19 +16,17 @@
  */
 package org.apache.ratis.metadata.util;
 
+import org.apache.ratis.util.PlatformUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
-import java.util.Comparator;
-import java.util.stream.Stream;
 
 /** File utilities for the metadata module: quiet deletes, atomic publishes, emptiness checks. */
 public final class FileUtils {
@@ -48,37 +46,8 @@ public final class FileUtils {
             return;
         }
         try {
-            deleteDirectory(directory);
+            org.apache.ratis.util.FileUtils.deleteFully(directory);
         } catch (Exception ignored) {
-        }
-    }
-
-    /**
-     * Deletes the given directory recursively.
-     *
-     * <p>If the directory does not exist, this does not throw an exception, but simply does
-     * nothing. It considers the fact that a directory-to-be-deleted is not present a success.
-     *
-     * @param directory The directory to be deleted.
-     * @throws IOException Thrown if the directory could not be deleted for some reason, for
-     *     example due to missing access/write permissions.
-     */
-    public static void deleteDirectory(File directory) throws IOException {
-        final Path dir = directory.toPath();
-        if (!Files.exists(dir)) {
-            return;
-        }
-        try (Stream<Path> paths = Files.walk(dir)) {
-            // children before parents, so a failure leaves a deletable prefix behind
-            paths.sorted(Comparator.reverseOrder()).forEach(p -> {
-                try {
-                    Files.deleteIfExists(p);
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            });
-        } catch (UncheckedIOException e) {
-            throw e.getCause();
         }
     }
 
@@ -102,41 +71,24 @@ public final class FileUtils {
                 throw inner;
             }
         } finally {
-            flushDirIfExists(target.toAbsolutePath().normalize().getParent());
+            flushParentIfExists(target.toAbsolutePath().normalize().getParent());
         }
     }
 
     /**
-     * Flushes a directory to guarantee crash consistency, swallowing {@link NoSuchFileException}
-     * and {@link DirectoryNotEmptyException}: fsync of an unlinked or renamed-over path is not an
-     * error for the publisher that already renamed it.
+     * Flushes a directory to guarantee crash consistency, warning on failure: fsync of an
+     * unlinked or renamed-over path is not an error for the publisher that already renamed it.
+     * A no-op on Windows (or with no parent), where opening a directory channel does not apply.
      */
-    public static void flushDirIfExists(Path path) {
-        try {
-            flushDir(path);
-        } catch (IOException e) {
-            LOG.warn("Failed to flush directory {}", path, e);
-        }
-    }
-
-    /**
-     * Flushes a dirty directory to guarantee crash consistency. A no-op on Windows, where opening
-     * a directory channel is not supported.
-     *
-     * @throws IOException if flushing the directory fails.
-     */
-    public static void flushDir(Path path) throws IOException {
-        if (path == null || isWindows()) {
+    private static void flushParentIfExists(Path parent) {
+        if (parent == null || PlatformUtils.WINDOWS) {
             return;
         }
-        try (FileChannel dir = FileChannel.open(path, StandardOpenOption.READ)) {
+        try (FileChannel dir = FileChannel.open(parent, StandardOpenOption.READ)) {
             dir.force(true);
+        } catch (IOException e) {
+            LOG.warn("Failed to flush directory {}", parent, e);
         }
-    }
-
-    /** Whether the JVM runs on Windows. */
-    public static boolean isWindows() {
-        return System.getProperty("os.name", "").toLowerCase().startsWith("windows");
     }
 
     /**

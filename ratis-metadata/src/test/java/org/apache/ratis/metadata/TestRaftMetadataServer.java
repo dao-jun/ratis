@@ -26,15 +26,18 @@ import org.apache.ratis.metadata.util.SystemClock;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
 import org.apache.ratis.grpc.GrpcConfigKeys;
+import org.apache.ratis.netty.NettyConfigKeys;
 import org.apache.ratis.protocol.ClientId;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.RaftConfigKeys;
+import org.apache.ratis.rpc.SupportedRpcType;
 import org.apache.ratis.server.RaftServerConfigKeys;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.statemachine.impl.TransactionContextImpl;
+import org.apache.ratis.util.ExitUtils;
 import org.apache.ratis.util.NetUtils;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -42,20 +45,33 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.File;
 import java.io.IOException;
 import java.net.ServerSocket;
+import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Configuration wiring of {@link MetadataServer}: quorum parsing and ratis properties. */
 public class TestRaftMetadataServer {
@@ -152,8 +168,90 @@ public class TestRaftMetadataServer {
                 Collections.singletonList(new File(new File(tempDir, "data"), "raft")),
                 RaftServerConfigKeys.storageDir(properties));
         assertEquals("GRPC", properties.get(RaftConfigKeys.Rpc.TYPE_KEY));
-        // the transport port key stays unset - only the customizer may set transport keys
+        // this self entry carries a concrete port - nothing was substituted, so the transport
+        // port key stays unset and only the customizer may set transport keys; a port-0 entry
+        // pins its substituted port (testRaftPropertiesPinTheSubstitutedSelfPort...)
         assertNull(properties.get(GrpcConfigKeys.Server.PORT_KEY));
+    }
+
+    @Test
+    void testRaftPropertiesPinTheSubstitutedSelfPortAsTheTransportListenPort() {
+        final MetadataServer set =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:0")
+                        .setDataDir(new File(tempDir, "data-set"))
+                        .setSelfPort(4242)
+                        .build();
+        assertEquals(4242, set.getSelfEndpoint().getPort());
+        assertEquals(4242, GrpcConfigKeys.Server.port(set.raftProperties()));
+        // only the active transport's key is pinned
+        assertNull(set.raftProperties().get(NettyConfigKeys.Server.PORT_KEY));
+
+        final MetadataServer netty =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:0")
+                        .setDataDir(new File(tempDir, "data-netty"))
+                        .setRpcType(SupportedRpcType.NETTY)
+                        .setSelfPort(4242)
+                        .build();
+        assertEquals(4242, NettyConfigKeys.Server.port(netty.raftProperties()));
+        assertNull(netty.raftProperties().get(GrpcConfigKeys.Server.PORT_KEY));
+
+        // no setSelfPort: the probed ephemeral port is pinned and exposed
+        final MetadataServer probed =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:0")
+                        .setDataDir(new File(tempDir, "data-probed"))
+                        .build();
+        assertTrue(probed.getSelfEndpoint().getPort() > 0);
+        assertEquals(
+                probed.getSelfEndpoint().getPort(),
+                GrpcConfigKeys.Server.port(probed.raftProperties()));
+
+        // the customizer runs after the pinning and keeps the last word
+        final MetadataServer overridden =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:0")
+                        .setDataDir(new File(tempDir, "data-overridden"))
+                        .setSelfPort(4242)
+                        .setPropertiesCustomizer(
+                                properties -> GrpcConfigKeys.Server.setPort(properties, 5555))
+                        .build();
+        assertEquals(5555, GrpcConfigKeys.Server.port(overridden.raftProperties()));
+    }
+
+    /**
+     * The port-0 self entry mode must serve, not merely start: the probed port is pinned as
+     * the transport listen port, so the address the group and the built-in client advertise
+     * has a listener behind it. Without the pinning the transport binds an arbitrary
+     * ephemeral port and the create exhausts its retries - the preemptive timeout fails the
+     * test.
+     */
+    @Test
+    void testPortZeroSelfEntryServesWithoutACustomizer() throws Exception {
+        final MetadataServer server =
+                MetadataServer.newBuilder()
+                        .setSelfId("n1")
+                        .setQuorum("n1@localhost:0")
+                        .setDataDir(new File(tempDir, "data-served"))
+                        .build();
+        try {
+            server.start();
+            assertEquals(
+                    server.getSelfEndpoint().getPort(),
+                    GrpcConfigKeys.Server.port(server.raftProperties()));
+            assertTimeoutPreemptively(
+                    Duration.ofSeconds(60),
+                    () -> assertEquals(
+                            "/served/a",
+                            server.getClient().create("/served/a", new byte[] {1}, true)));
+        } finally {
+            server.close();
+        }
     }
 
     @Test
@@ -174,8 +272,9 @@ public class TestRaftMetadataServer {
         assertEquals(400000L, RaftServerConfigKeys.Snapshot.autoTriggerThreshold(properties));
         assertEquals(2, RaftServerConfigKeys.Snapshot.retentionFileNum(properties));
         assertTrue(RaftServerConfigKeys.Snapshot.triggerWhenStopEnabled(properties));
-        // commit still means majority-fsync with async flush, and no METADATA entry per commit
-        assertTrue(RaftServerConfigKeys.Log.asyncFlushEnabled(properties));
+        // ratis' default synchronous segment flush (the async path never coalesces queued
+        // appends and measures ten times slower), and no METADATA entry per commit
+        assertFalse(RaftServerConfigKeys.Log.asyncFlushEnabled(properties));
         assertFalse(RaftServerConfigKeys.Log.logMetadataEnabled(properties));
         // a five-minute memory fast path; the durable result store is the fallback
         assertEquals(
@@ -224,6 +323,16 @@ public class TestRaftMetadataServer {
         assertThrows(
                 IllegalArgumentException.class,
                 () -> builder.setResultRetention(Duration.ofMillis(-1)));
+    }
+
+    @Test
+    void testLeaseClockSkewToleranceMustNotBeNegative() {
+        final MetadataServer.Builder builder = MetadataServer.newBuilder();
+        // zero is the NTP-fleet opt-out: a legal explicit value, unlike a negative one
+        assertEquals(builder, builder.setLeaseClockSkewTolerance(Duration.ZERO));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> builder.setLeaseClockSkewTolerance(Duration.ofMillis(-1)));
     }
 
     @Test
@@ -375,10 +484,202 @@ public class TestRaftMetadataServer {
         }
     }
 
+    /**
+     * A live listener on the advertised port must fail start() before any ratis resource
+     * exists - the raft storage below the data dir is never even formatted.
+     */
+    @Test
+    void testStartRefusesATakenPortBeforeAnyRaftResource() throws Exception {
+        final File dataDir = new File(tempDir, "data");
+        final int port = probedPort();
+        try (ServerSocket taken = new ServerSocket(port)) {
+            final MetadataServer server = newServer(dataDir, port);
+            try {
+                final IOException refusal = assertThrows(IOException.class, server::start);
+                assertTrue(refusal.getMessage().contains("localhost:" + port));
+            } finally {
+                server.close();
+            }
+        }
+        assertFalse(
+                new File(dataDir, "raft").exists(),
+                "the refusal happens before the raft storage formats anything");
+    }
+
+    /**
+     * A transport bind conflict inside the raft start - here the customizer points the grpc
+     * port at an occupied port while the advertised one is free - must surface as this
+     * call's IOException (the disarmed grpc terminate lands as its cause), never as the
+     * grpc transport's System.exit, and the failed start must leave no client behind.
+     */
+    @Test
+    void testStartConvertsATransportBindFailureIntoAnIOException() throws Exception {
+        final File dataDir = new File(tempDir, "data");
+        final int advertised = probedPort();
+        final int occupied = probedPort();
+        try (ServerSocket taken = new ServerSocket(occupied)) {
+            final MetadataServer server =
+                    MetadataServer.newBuilder()
+                            .setSelfId("n1")
+                            .setQuorum("n1@localhost:" + advertised)
+                            .setDataDir(dataDir)
+                            .setPropertiesCustomizer(
+                                    properties ->
+                                            GrpcConfigKeys.Server.setPort(properties, occupied))
+                            .build();
+            try {
+                final long begin = System.nanoTime();
+                final IOException failure = assertThrows(IOException.class, server::start);
+                assertTrue(
+                        Duration.ofNanos(System.nanoTime() - begin)
+                                        .compareTo(Duration.ofSeconds(10))
+                                < 0,
+                        "the failed start returns promptly (the catch-path close does not block)");
+                assertTrue(
+                        failure.getCause() instanceof ExitUtils.ExitException,
+                        "the grpc bind failure routed through ratis' terminate path");
+                assertNotNull(ExitUtils.getFirstExitException());
+                assertNull(server.getClient(), "a failed start leaves no client");
+            } finally {
+                ExitUtils.clear();
+                server.close();
+            }
+        }
+    }
+
+    /**
+     * The port probe must never be stricter than the transport's own listener: after a stop,
+     * the member's port is typically still draining (sockets in TIME_WAIT whose local port
+     * is the member port), and the transport itself rebinds over them - so must the probe.
+     */
+    @Test
+    void testStartAllowsASamePortRestartOverDrainingSockets() throws Exception {
+        final File dataDir = new File(tempDir, "data");
+        final int port = probedPort();
+        final MetadataServer first = newServer(dataDir, port);
+        try {
+            first.start();
+            assertEquals(
+                    "/restart/a", first.getClient().create("/restart/a", new byte[] {1}, true));
+
+            // Connections the way peer proxies hold them: close() force-closes them
+            // server-side, leaving draining sockets whose local port is the member port.
+            final List<Socket> held = new ArrayList<>();
+            try {
+                for (int i = 0; i < 3; i++) {
+                    held.add(new Socket("localhost", port));
+                }
+                first.close();
+            } finally {
+                for (Socket socket : held) {
+                    socket.close();
+                }
+            }
+
+            final MetadataServer second = newServer(dataDir, port);
+            try {
+                second.start();
+                assertEquals(
+                        "/restart/b",
+                        second.getClient().create("/restart/b", new byte[] {2}, true));
+            } finally {
+                second.close();
+            }
+        } finally {
+            first.close();
+        }
+    }
+
+    /**
+     * The production hop of the storage refusal: a real raft-1 member whose only snapshot
+     * dir cannot even be verified (no stat possible) must refuse start() with the declared
+     * IOException - unwrapped from the proxy's CompletionException - carrying the snapshot
+     * path in its cause chain, and the failed start must really have closed everything it
+     * opened: a third server on the same data dir and port starts and serves again.
+     */
+    @Test
+    void testStartRefusesAnUnverifiableSnapshotAreaAndCleansUpAfterwards() throws Exception {
+        assumeTrue(
+                FileSystems.getDefault().supportedFileAttributeViews().contains("posix"),
+                "the failure is produced by a permission flip (POSIX only)");
+        assumeFalse("root".equals(System.getProperty("user.name")), "root ignores permission bits");
+        final File dataDir = new File(tempDir, "data");
+        final int port = probedPort();
+        final MetadataServer first = newServer(dataDir, port);
+        first.start();
+        assertEquals("/residue/a", first.getClient().create("/residue/a", new byte[] {1}, true));
+        first.close(); // snapshot-on-stop publishes exactly one snapshot.<t>_<i>
+
+        final File snapshotDir = theOnlySnapshotDir(dataDir);
+        final Set<PosixFilePermission> original =
+                Files.getPosixFilePermissions(snapshotDir.toPath());
+        Files.setPosixFilePermissions(
+                snapshotDir.toPath(), EnumSet.noneOf(PosixFilePermission.class));
+        try {
+            final MetadataServer second = newServer(dataDir, port);
+            try {
+                // Pre-fix this start SUCCEEDS (the snapshot is invisible, no exception is
+                // thrown); post-fix it refuses with the declared IOException and the failed
+                // start has closed everything it opened.
+                final IOException refusal = assertThrows(IOException.class, second::start);
+                assertTrue(refusal.getMessage().contains(dataDir.getPath()));
+                assertTrue(String.valueOf(refusal.getCause()).contains(snapshotDir.getPath()));
+            } finally {
+                second.close(); // idempotent after the guard's close
+            }
+
+            Files.setPosixFilePermissions(snapshotDir.toPath(), original);
+            final MetadataServer third = newServer(dataDir, port);
+            try {
+                third.start(); // same dir, same port: the lock and scheduler were really released
+                assertEquals("/residue/b",
+                        third.getClient().create("/residue/b", new byte[] {2}, true));
+            } finally {
+                third.close();
+            }
+        } finally {
+            Files.setPosixFilePermissions(snapshotDir.toPath(), original);
+        }
+    }
+
     /** A bind-and-release free port for the single-member grpc group of this test. */
     private static int probedPort() throws IOException {
         try (ServerSocket socket = new ServerSocket(0)) {
             return socket.getLocalPort();
         }
     }
+
+    /** A raft-1 member on the concrete port: quorum entry and grpc listen port both carry it. */
+    private static MetadataServer newServer(File dataDir, int port) {
+        return MetadataServer.newBuilder()
+                .setSelfId("n1")
+                .setQuorum("n1@localhost:" + port)
+                .setDataDir(dataDir)
+                .setPropertiesCustomizer(
+                        properties -> GrpcConfigKeys.Server.setPort(properties, port))
+                .build();
+    }
+
+    /**
+     * Locates the single published snapshot dir below the data dir, wherever the group-uuid
+     * storage layout puts the sm dir. Mirrors the state machine storage's snapshot-dir
+     * pattern, which stays package-private to the statemachine package.
+     */
+    private static File theOnlySnapshotDir(File dataDir) throws IOException {
+        try (Stream<Path> files = Files.walk(dataDir.toPath())) {
+            final List<Path> matches =
+                    files.filter(
+                                    path ->
+                                            path.getFileName() != null
+                                                    && SNAPSHOT_DIR_NAME
+                                                            .matcher(path.getFileName().toString())
+                                                            .matches())
+                            .collect(Collectors.toList());
+            assertEquals(1, matches.size(), "exactly one stop-snapshot is published");
+            return matches.get(0).toFile();
+        }
+    }
+
+    /** {@code snapshot.<term>_<index>}, the state machine's snapshot directory name. */
+    private static final Pattern SNAPSHOT_DIR_NAME = Pattern.compile("snapshot\\.\\d+_\\d+");
 }

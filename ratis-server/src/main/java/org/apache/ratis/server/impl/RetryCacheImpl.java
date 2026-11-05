@@ -251,11 +251,17 @@ class RetryCacheImpl implements RetryCache {
       if (!current.isDone() && currentIndex == RaftLog.INVALID_LOG_INDEX) {
         return current;
       }
+      if (current.isFailed()) {
+        // A failed entry is terminal: its reply future is already completed
+        // with the failure, and a bound failure can only point at a truncated
+        // log position which can never commit.  Whatever its index, replace
+        // it with the position being applied so the committed reply is
+        // recorded instead of being swallowed by the index check in
+        // CacheEntry#updateResult.
+        return new CacheEntry(key, applying);
+      }
       if (currentIndex > applying.getIndex()) {
         return current;
-      }
-      if (current.isFailed()) {
-        return new CacheEntry(key, applying);
       }
       return currentIndex == applying.getIndex()
           ? current : new CacheEntry(key, applying);

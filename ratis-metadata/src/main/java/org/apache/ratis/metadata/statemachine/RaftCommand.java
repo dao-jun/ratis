@@ -196,9 +196,20 @@ public final class RaftCommand {
 
     /** Creates an INCREMENT command: adds {@code delta} (may be negative) to the named counter. */
     public static RaftCommand increment(String name, long delta) {
+        return increment(name, delta, 0L);
+    }
+
+    /**
+     * Creates a lease-guarded INCREMENT (fencing-token traffic, e.g. {@code MetadataLock}'s bump):
+     * a non-zero {@code leaseId} requires the lease to exist and to own the record at {@code name}
+     * when the command applies, else it rejects with {@code UNKNOWN_LEASE} or {@code STALE_LEASE}
+     * and moves no counter. {@code 0} keeps the plain, unguarded counter semantics.
+     */
+    public static RaftCommand increment(String name, long delta, long leaseId) {
         RaftCommand c = new RaftCommand(Op.INCREMENT);
         c.path = name;
         c.delta = delta;
+        c.leaseId = leaseId;
         return c;
     }
 
@@ -207,17 +218,6 @@ public final class RaftCommand {
         RaftCommand c = new RaftCommand(Op.LEASE_REGISTER);
         c.leaseId = leaseId;
         c.ttlMs = ttlMs;
-        c.expireAtMs = expireAtMs;
-        return c;
-    }
-
-    /**
-     * Creates the legacy LEASE_RENEW form with a proposer-computed expiry and no TTL. Leaders and
-     * replicas reject this form; it is retained only to keep the old factory signature unambiguous.
-     */
-    public static RaftCommand leaseRenew(long leaseId, long expireAtMs) {
-        RaftCommand c = new RaftCommand(Op.LEASE_RENEW);
-        c.leaseId = leaseId;
         c.expireAtMs = expireAtMs;
         return c;
     }
@@ -308,7 +308,8 @@ public final class RaftCommand {
         return data;
     }
 
-    /** The lease a record binds to (0 = persistent); or the lease a lease op acts on. */
+    /** The lease a record binds to (0 = persistent); the lease a lease op acts on; or the guard
+     * of a lease-guarded INCREMENT (0 = unguarded). */
     public long getLeaseId() {
         return leaseId;
     }

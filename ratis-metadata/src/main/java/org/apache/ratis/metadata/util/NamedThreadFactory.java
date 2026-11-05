@@ -19,22 +19,20 @@ package org.apache.ratis.metadata.util;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 
-/** Names worker threads after their owner, so thread dumps stay attributable. */
+/** Names daemon worker threads after their owner, so thread dumps stay attributable. */
 public final class NamedThreadFactory implements ThreadFactory {
 
     private final String prefix;
-    private final boolean daemon;
     private final AtomicInteger next = new AtomicInteger(1);
 
-    public NamedThreadFactory(String prefix, boolean daemon) {
+    public NamedThreadFactory(String prefix) {
         this.prefix = prefix;
-        this.daemon = daemon;
     }
 
     @Override
     public Thread newThread(Runnable runnable) {
         Thread thread = new Thread(runnable, prefix + "-" + next.getAndIncrement());
-        thread.setDaemon(daemon);
+        thread.setDaemon(true);
         return thread;
     }
 }

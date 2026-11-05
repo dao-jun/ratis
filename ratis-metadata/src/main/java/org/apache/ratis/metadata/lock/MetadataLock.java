@@ -56,7 +56,10 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  * expiry scheduler within roughly one ttl.
  *
  * <p>{@link Hold#getToken()} is a fencing token: after each successful create the lock bumps a
- * counter named after the lock path, so tokens are strictly increasing across holders. External
+ * counter named after the lock path, so tokens are strictly increasing across holders. The bump
+ * itself is lease-guarded in the replicated apply: a contender whose lease dies between its
+ * create and its bump is refused ({@code UNKNOWN_LEASE} / {@code STALE_LEASE}) and re-enters
+ * the race, so a completed acquire's token can never overtake a later holder's. External
  * resources guarded by the lock should reject work carrying a token lower than the last seen one
  * - during a lease expiry the old holder may briefly believe it still holds.
  *
@@ -65,8 +68,12 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  * the same name belong to the lock exclusively. {@link #acquireAsync()} never throws and never
  * blocks - the acquire is an event-driven state machine on the client's asynchronous calls, and
  * every failure lands in the future as {@link RaftMetadataException} (misconfiguration), a
- * {@code MetadataTransportException} (the request never went through), or a {@link
- * TimeoutException}.
+ * {@code MetadataTransportException} (the request never went through; a mutation whose retry
+ * budget ran out answers its subclass {@code PossiblyCommittedException} - reconcile by
+ * reading state before re-acquiring; the acquire's unwind below is already ownership-safe
+ * either way), or a {@link TimeoutException}. A path that cannot ride the UTF-8 wire (an
+ * unpaired surrogate) is a programmer error and settles the future with {@code
+ * IllegalArgumentException}, like the non-positive-timeout checkArgument.
  */
 public final class MetadataLock implements AutoCloseable {
 
@@ -148,8 +155,11 @@ public final class MetadataLock implements AutoCloseable {
 
     /**
      * Acquires the lock, indefinitely; completes with the {@link Hold}, or exceptionally with a
-     * {@link RaftMetadataException}, a {@link MetadataTransportException}, or an {@link
-     * IllegalStateException} after {@link #close()}.
+     * {@link RaftMetadataException}, a {@link MetadataTransportException} (an exhausted create
+     * answers its subclass {@code PossiblyCommittedException}), or an {@link
+     * IllegalStateException} after {@link #close()}. A path that cannot ride the UTF-8 wire (an
+     * unpaired surrogate) is a programmer error and settles the future with {@link
+     * IllegalArgumentException}.
      */
     public CompletableFuture<Hold> acquireAsync() {
         return acquireAsync(null);
@@ -159,7 +169,9 @@ public final class MetadataLock implements AutoCloseable {
      * Acquires the lock with a deadline; on expiry the future completes with {@link
      * TimeoutException} and the contender unwinds by revoking its private lease - a create that
      * committed anyway is swept by the lease's expiry cascade, so a timed-out contender never
-     * leaks the lock and never touches another holder's record.
+     * leaks the lock and never touches another holder's record. A path that cannot ride the
+     * UTF-8 wire (an unpaired surrogate) is a programmer error and settles the future with
+     * {@link IllegalArgumentException}, like the non-positive timeout below.
      */
     public CompletableFuture<Hold> acquireAsync(Duration timeout) {
         if (timeout != null) {
@@ -412,14 +424,7 @@ public final class MetadataLock implements AutoCloseable {
             // The contender's own lease died (a partition outlasted the ttl); a new one keeps it
             // in the race. This create was rejected, not committed - but the dead lease may still
             // own records from an earlier attempt, so retire it rather than just stop renewing.
-            synchronized (state) {
-                if (settled()) {
-                    return;
-                }
-                session = null;
-            }
-            retireLeaseOf(current);
-            AsyncDriver.schedule(this::attempt, 0);
+            reopenWithFreshLease(current);
             return;
         }
         // A definitive rejection (this contender's create never committed) or transport trouble
@@ -428,13 +433,13 @@ public final class MetadataLock implements AutoCloseable {
         fail(failure);
     }
 
-    /** The record exists; the counter bump of the same name yields the fencing token. */
+    /** The record exists; the guarded counter bump of the same name yields the fencing token. */
     private void takeToken(final LeaseSession current) {
-        client.incrementAsync(path, 1)
+        client.incrementAsync(path, 1, current)
                 .whenComplete(
                         (token, failure) -> {
                             if (failure != null) {
-                                fail(unwrap(failure));
+                                onTokenOutcome(current, unwrap(failure));
                                 return;
                             }
                             final MetadataWatcher toClose;
@@ -456,6 +461,38 @@ public final class MetadataLock implements AutoCloseable {
                                 toCancel.cancel(false);
                             }
                         });
+    }
+
+    /**
+     * The token bump was refused: this contender's lease died or the record at the path stopped
+     * speaking for it between its committed create and its token — it was superseded, and
+     * completing with that token could overtake the new holder. The refusal left no effect, so
+     * the ownership-safe unwind (retire this lease; its cascade deletes exactly this contender's
+     * record) and a fresh round keep the contender in the race.
+     */
+    private void onTokenOutcome(final LeaseSession current, Throwable failure) {
+        if (isRejectionOf(failure, RaftResult.Status.UNKNOWN_LEASE)
+                || isRejectionOf(failure, RaftResult.Status.STALE_LEASE)) {
+            reopenWithFreshLease(current);
+            return;
+        }
+        fail(failure);
+    }
+
+    /**
+     * The lease died under this contender: drop the session under the state lock, retire the
+     * lease outside it (its cascade deletes exactly this contender's records), and re-enter
+     * the race with a fresh lease.
+     */
+    private void reopenWithFreshLease(LeaseSession current) {
+        synchronized (state) {
+            if (settled()) {
+                return;
+            }
+            session = null;
+        }
+        retireLeaseOf(current);
+        AsyncDriver.schedule(this::attempt, 0);
     }
 
     /** A delete of the lock record arrived (or the retention line tripped): try again now. */
@@ -528,12 +565,12 @@ public final class MetadataLock implements AutoCloseable {
      * guaranteed to apply before the revocation, so the cascade covers a create that committed
      * anyway; a create of any OTHER holder is bound to a different lease and survives.
      */
-    private void retireLeaseOf(LeaseSession session) {
-        if (session == null) {
+    private void retireLeaseOf(LeaseSession toRetire) {
+        if (toRetire == null) {
             return;
         }
-        session.close();
-        final long leaseId = session.getLeaseId();
+        toRetire.close();
+        final long leaseId = toRetire.getLeaseId();
         client.revokeLeaseAsync(leaseId)
                 .whenComplete(
                         (ignored, failure) -> {

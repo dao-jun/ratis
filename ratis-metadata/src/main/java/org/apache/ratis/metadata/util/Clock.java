@@ -16,8 +16,6 @@
  */
 package org.apache.ratis.metadata.util;
 
-import java.time.Instant;
-
 /**
  * The time source of the metadata module: the client stamps commands with it and the lease
  * machinery schedules against it. The state machine itself never reads it - proposers supply all
@@ -32,13 +30,6 @@ public interface Clock {
      * Returns the current time in milliseconds, similar to {@link System#currentTimeMillis()}.
      */
     long milliseconds();
-
-    /**
-     * Returns the current time as an {@link Instant}.
-     */
-    default Instant instant() {
-        return Instant.ofEpochMilli(milliseconds());
-    }
 
     /**
      * Returns the current value of the JVM's high-resolution time source in nanoseconds, similar

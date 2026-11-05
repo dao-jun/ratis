@@ -17,6 +17,7 @@
 
 package org.apache.ratis.metadata.statemachine;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -127,20 +128,12 @@ public final class ChangeEvent {
 
         /** The new counter value, valid only for {@link ChangeOp#INCREMENT}. */
         public long getCounterValue() {
-            return readLong(data, 0);
+            return ByteBuffer.wrap(data).getLong();
         }
 
         /** The lease id, valid only for the lease operations. */
         public long getLeaseId() {
-            return readLong(data, 0);
-        }
-
-        private static long readLong(byte[] bytes, int offset) {
-            long value = 0;
-            for (int i = 0; i < 8; i++) {
-                value = (value << 8) | (bytes[offset + i] & 0xFFL);
-            }
-            return value;
+            return ByteBuffer.wrap(data).getLong();
         }
 
         @Override

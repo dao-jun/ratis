@@ -56,7 +56,10 @@ public final class RaftResult {
         /** The retained invocation result is no longer available for this replayed entry. */
         RESULT_EXPIRED((byte) 13),
         /** An invocation was replayed with bytes different from its original raw command. */
-        INVOCATION_MISMATCH((byte) 14);
+        INVOCATION_MISMATCH((byte) 14),
+        /** A lease-guarded INCREMENT found the path no longer owned by its lease (deleted or
+         * re-bound); the counter stands untouched. */
+        STALE_LEASE((byte) 15);
 
         private final byte code;
 

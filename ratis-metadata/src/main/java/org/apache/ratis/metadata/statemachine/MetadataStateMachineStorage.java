@@ -34,7 +34,9 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -61,6 +63,10 @@ public class MetadataStateMachineStorage implements StateMachineStorage {
     /** Suffix of the aside copy of a replaced target; deleted after publish and at startup. */
     static final String SNAPSHOT_TRASH_SUFFIX = ".trash";
 
+    /** Startup scan attempts and pause between them: transient disk errors get a short chance. */
+    private static final int STARTUP_SCAN_ATTEMPTS = 3;
+    private static final long STARTUP_SCAN_RETRY_INTERVAL_MS = 250L;
+
     /** The raft storage's state machine directory; set by {@link #init(RaftStorage)}. */
     private volatile File stateMachineDir;
 
@@ -70,8 +76,52 @@ public class MetadataStateMachineStorage implements StateMachineStorage {
     @Override
     public void init(RaftStorage raftStorage) throws IOException {
         this.stateMachineDir = raftStorage.getStorageDir().getStateMachineDir();
-        cleanupCrashLeftovers();
-        loadLatestSnapshot();
+        IOException lastFailure = null;
+        for (int attempt = 1; attempt <= STARTUP_SCAN_ATTEMPTS; attempt++) {
+            try {
+                cleanupCrashLeftovers();
+                scanLatestSnapshot();
+                verifySnapshotAreaScannable();
+                return;
+            } catch (IOException failure) {
+                lastFailure = failure;
+                LOG.warn(
+                        "Scanning {} for snapshots failed (attempt {}/{})",
+                        stateMachineDir,
+                        attempt,
+                        STARTUP_SCAN_ATTEMPTS,
+                        failure);
+                if (attempt < STARTUP_SCAN_ATTEMPTS) {
+                    try {
+                        Thread.sleep(STARTUP_SCAN_RETRY_INTERVAL_MS);
+                    } catch (InterruptedException interrupted) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(
+                                "Interrupted while scanning "
+                                        + stateMachineDir
+                                        + " for snapshots; refusing to start",
+                                interrupted);
+                    }
+                }
+            }
+        }
+        // Startup fails loud: the raft log seeds its snapshot index from this scan, and a member
+        // whose log was purged into its snapshots has nothing else to replay. An unverifiable
+        // snapshot area is an operator decision - fix the storage (permissions, disk) or rebuild
+        // the rocksdb/raft pair - never something the server may degrade through.
+        LOG.error(
+                "Failed to scan {} for snapshots after {} attempts; refusing to start. Fix the"
+                        + " storage (permissions or disk) or rebuild the rocksdb/raft pair.",
+                stateMachineDir,
+                STARTUP_SCAN_ATTEMPTS,
+                lastFailure);
+        throw new IOException(
+                "Failed to scan "
+                        + stateMachineDir
+                        + " for snapshots after "
+                        + STARTUP_SCAN_ATTEMPTS
+                        + " attempts; refusing to start",
+                lastFailure);
     }
 
     @Override
@@ -90,27 +140,72 @@ public class MetadataStateMachineStorage implements StateMachineStorage {
             return null;
         }
         try {
-            final File newest = findLatestSnapshotDir(dir);
-            if (newest == null) {
-                return null;
-            }
-            final TermIndex termIndex = termIndexOf(newest);
-            final List<FileInfo> files = listSnapshotFiles(newest.toPath());
-            if (files.isEmpty()) {
-                LOG.warn("Snapshot directory {} is empty; ignoring it as a snapshot", newest);
-                return null;
-            }
-            final FileListSnapshotInfo info = new FileListSnapshotInfo(files, termIndex);
-            latestSnapshot.updateAndGet(
-                    previous ->
-                            previous == null || info.getIndex() >= previous.getIndex()
-                                    ? info
-                                    : previous);
-            return info;
+            return scanLatestSnapshot();
         } catch (IOException e) {
-            // A broken listing must not kill the server; ratis logs and returns null here too.
+            // A broken listing must not kill a running server; ratis logs and returns null
+            // here too. Startup is the exception - see init().
             LOG.warn("Failed to scan {} for snapshots", dir, e);
             return null;
+        }
+    }
+
+    /** The scan itself; the caller decides how a failure lands. */
+    private FileListSnapshotInfo scanLatestSnapshot() throws IOException {
+        final File newest = findLatestSnapshotDir(stateMachineDir);
+        if (newest == null) {
+            return null;
+        }
+        final TermIndex termIndex = termIndexOf(newest);
+        final List<FileInfo> files = listSnapshotFiles(newest.toPath());
+        if (files.isEmpty()) {
+            // A manifested snapshot always lists at least the manifest itself; empty means the
+            // listing raced a vanishing dir. Treat it as a scan failure, not "no snapshot".
+            throw new IOException("Snapshot directory " + newest + " listed no files");
+        }
+        final FileListSnapshotInfo info = new FileListSnapshotInfo(files, termIndex);
+        latestSnapshot.updateAndGet(
+                previous ->
+                        previous == null || info.getIndex() >= previous.getIndex()
+                                ? info
+                                : previous);
+        return info;
+    }
+
+    /**
+     * Startup-only companion to the scan. java.io.File#isFile() returns false both when the
+     * manifest is absent and when its stat failed, so a snapshot directory stripped of its
+     * execute bit would be invisible to the scan with no exception anywhere - the exact
+     * member this module must refuse to start. Every snapshot-shaped entry must be
+     * verifiable: manifest present as a regular file, or confirmed absent (a torn
+     * publication cleanup already removed).
+     */
+    private void verifySnapshotAreaScannable() throws IOException {
+        final File dir = stateMachineDir;
+        if (dir == null || !dir.isDirectory()) {
+            return;
+        }
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir.toPath())) {
+            for (Path entry : stream) {
+                if (!SNAPSHOT_DIR_REGEX.matcher(entry.getFileName().toString()).matches()) {
+                    continue; // .tmp/.trash leftovers and junk are cleanup's business
+                }
+                final Path manifest = entry.resolve(StateMachineIdentity.SNAPSHOT_FILE);
+                try {
+                    if (!Files.readAttributes(manifest, BasicFileAttributes.class)
+                            .isRegularFile()) {
+                        throw new IOException(manifest + " is not a regular file");
+                    }
+                } catch (NoSuchFileException confirmedAbsent) {
+                    // Torn publication or junk: cleanupCrashLeftovers already handled it.
+                } catch (IOException cannotVerify) {
+                    throw new IOException(
+                            "Snapshot directory "
+                                    + entry
+                                    + " exists but its manifest cannot be verified; refusing"
+                                    + " to start",
+                            cannotVerify);
+                }
+            }
         }
     }
 
@@ -137,13 +232,32 @@ public class MetadataStateMachineStorage implements StateMachineStorage {
                 LOG.warn("Deleting {} - leftover of an interrupted snapshot publication", entry);
                 FileUtils.deleteDirectoryQuietly(entry);
             } else if (SNAPSHOT_DIR_REGEX.matcher(name).matches()
-                    && !new File(entry, StateMachineIdentity.SNAPSHOT_FILE).isFile()) {
+                    && manifestConfirmedAbsent(entry)) {
                 LOG.warn(
                         "Deleting {} - snapshot-shaped directory without the {} manifest",
                         entry,
                         StateMachineIdentity.SNAPSHOT_FILE);
                 FileUtils.deleteDirectoryQuietly(entry);
             }
+        }
+    }
+
+    /** True only when the manifest's absence is confirmed - a failed stat is not absence. */
+    private static boolean manifestConfirmedAbsent(File snapshotDir) {
+        try {
+            Files.readAttributes(
+                    new File(snapshotDir, StateMachineIdentity.SNAPSHOT_FILE).toPath(),
+                    BasicFileAttributes.class);
+            return false;
+        } catch (NoSuchFileException absent) {
+            return true;
+        } catch (IOException cannotTell) {
+            LOG.warn(
+                    "Cannot verify the manifest of {}; leaving it in place - the startup scan"
+                            + " will refuse if this persists",
+                    snapshotDir,
+                    cannotTell);
+            return false;
         }
     }
 

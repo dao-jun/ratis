@@ -17,8 +17,10 @@
 package org.apache.ratis.metadata.lock;
 
 import org.apache.ratis.metadata.MetadataCluster;
+import org.apache.ratis.metadata.client.LeaseSession;
 import org.apache.ratis.metadata.client.RaftMetadataClient;
 import org.apache.ratis.metadata.client.RaftMetadataException;
+import org.apache.ratis.metadata.statemachine.ChangeEvent;
 import org.apache.ratis.metadata.statemachine.RaftCommand;
 import org.apache.ratis.metadata.statemachine.RaftCommandCodec;
 import org.apache.ratis.metadata.statemachine.RaftResult;
@@ -108,8 +110,9 @@ public class TestMetadataLock {
 
     /**
      * A holder whose client has stopped renewing loses the record through the leader's expiry
-     * scheduler; the waiter wakes on the record's delete. Closing only the holder's client is
-     * essential: a clock jump also makes every live session due for renewal.
+     * scheduler within two ttls (the ttl plus the ttl/3 grace plus the ttl/3 skew tolerance);
+     * the waiter wakes on the record's delete. Closing only the holder's client is essential:
+     * a clock jump also makes every live session due for renewal.
      */
     @Test
     void testCrashReleaseExpiresRecordAndWaiterTakesOver() throws Exception {
@@ -120,7 +123,7 @@ public class TestMetadataLock {
 
         holderClient.close();
         assertFalse(holder.isHeld(), "the crashed holder cannot renew its lease");
-        cluster.clock.advanceTime(LEASE_TTL.plusSeconds(1).toMillis(), TimeUnit.MILLISECONDS);
+        cluster.clock.advanceTime(LEASE_TTL.multipliedBy(2).toMillis(), TimeUnit.MILLISECONDS);
 
         final MetadataLock.Hold taker = pending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
         assertTrue(taker.getToken() > holder.getToken(), "the waiter takes over with a higher token");
@@ -212,6 +215,12 @@ public class TestMetadataLock {
      * exactly the command the leader's scheduler proposes in production after a crashed holder
      * (see {@code testCrashReleaseExpiresRecordAndWaiterTakesOver}); the property under test is
      * what the old holder's LATE cleanup does to the record that replaced its own.
+     *
+     * <p>Every negative assertion here is anchored, never timed: the late release's revocation
+     * commit is observed through the leader's applied revision (with the harness clock frozen it
+     * is the only command that can commit), its whole window is swept through the change stream,
+     * and the third contender is proven parked and past one watchdog re-attempt by revision
+     * arithmetic - no fixed sleeps.
      */
     @Test
     void testLateReleaseByAnExpiredHolderCannotTakeTheNewHoldersRecord() throws Exception {
@@ -247,19 +256,58 @@ public class TestMetadataLock {
                 "The expired holder's session did not surface its lease's death");
 
         // The late release of the long-dead hold: whatever it does may not touch the new holder's
-        // record at the shared path.
+        // record at the shared path. Anchored deterministically, never slept past: with the
+        // harness clock frozen nothing is due to expire and the holder's dead session sends
+        // nothing, so the ONLY command that can commit after this point is the release's own
+        // revocation - the leader's applied revision moving past this point IS that revocation
+        // having committed, carrying with it every command the release issued before it.
+        final long revisionAtLateRelease = adminRevisionOf(cluster);
         first.release();
-        Thread.sleep(500); // lets any ownership-unsafe delete land before the asserts below
+        waitUntil(
+                () -> adminRevisionOf(cluster) > revisionAtLateRelease,
+                SETTLE,
+                "The late release's revocation never committed");
         final RaftMetadataClient.MetadataRecord survivor = contenderClient.get(path);
         assertEquals(
                 takersLease,
                 survivor.getLeaseId(),
                 "the new holder's record survives the old holder's late release");
+        // The change stream closes the window behind the get: every revision up to a watermark
+        // sampled after it is delivered, and none of them removes the shared record.
+        final long revisionAfterSurvivor = adminRevisionOf(cluster);
+        final RaftMetadataClient.PollResult lateReleaseWindow =
+                contenderClient.poll(revisionAtLateRelease, Long.MAX_VALUE);
+        assertTrue(
+                lateReleaseWindow.getWatermark() >= revisionAfterSurvivor,
+                "the change stream covered the late release's whole window");
+        assertFalse(
+                removesPath(lateReleaseWindow, path),
+                "the late release never removed the record at the shared path");
 
-        // And the lock still excludes: a third contender cannot take over a live holder.
+        // And the lock still excludes: a third contender cannot take over a live holder. Its
+        // parked state is proven by revision arithmetic - rejected parent create, lease
+        // registration, rejected lock create - and one further committed step of its own pacing
+        // (with the clock frozen that step is a watchdog re-attempt) proves the retry machinery
+        // keeps cycling. The negative assertion is anchored by the record-alive read right
+        // before it: with the harness clock frozen nothing is due to expire, and a contender
+        // cannot complete while the holder's record exists.
+        final long revisionAtThirdContender = adminRevisionOf(cluster);
         final CompletableFuture<MetadataLock.Hold> thirdPending =
                 newLock(contenderClient, path).acquireAsync();
-        Thread.sleep(700);
+        waitUntil(
+                () -> adminRevisionOf(cluster) >= revisionAtThirdContender + 3,
+                SETTLE,
+                "The third contender never parked on the held record");
+        final long parkedRevision = adminRevisionOf(cluster);
+        waitUntil(
+                () -> adminRevisionOf(cluster) > parkedRevision,
+                SETTLE,
+                "The parked contender's own pacing went silent - no re-attempt committed");
+        assertEquals(
+                takersLease,
+                contenderClient.get(path).getLeaseId(),
+                "a live holder's record still guards the lock after another holder's late"
+                        + " release");
         assertFalse(
                 thirdPending.isDone(),
                 "a live holder still excludes later contenders after another holder's late"
@@ -269,6 +317,59 @@ public class TestMetadataLock {
         final MetadataLock.Hold third = thirdPending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
         assertTrue(third.getToken() > second.getToken(), "the handover after release still works");
         third.release();
+    }
+
+    /**
+     * THE fencing-inversion scenario: a stalled contender's lease-bound CREATE commits, its lease
+     * dies before its token bump applies, and a new holder takes over with a token of its own -
+     * the stalled contender's late bump must then be refused by the replicated guard (a refused
+     * bump leaves no effect), so the next token strictly follows the incumbent's instead of
+     * overtaking it. The lease's death is forced deterministically through the admin client, as
+     * in {@code testLateReleaseByAnExpiredHolderCannotTakeTheNewHoldersRecord}.
+     */
+    @Test
+    void testALateTokenIncrementCannotOvertakeTheNewHolder() throws Exception {
+        final String path = "/locks/t1";
+        holderClient.create("/locks", new byte[0], true);
+        final LeaseSession stalled = holderClient.openLease(LEASE_TTL);
+        assertEquals(path, holderClient.create(path, new byte[0], stalled));
+
+        final CompletableFuture<MetadataLock.Hold> pending =
+                newLock(contenderClient, path).acquireAsync();
+        assertFalse(
+                pending.isDone(),
+                "the contender parks while the stalled contender's record exists");
+
+        // the stall outlasted the ttl: the cascade frees the path and the waiter takes over
+        adminExpireLease(stalled.getLeaseId());
+        final MetadataLock.Hold incumbent =
+                pending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
+        final long incumbentToken = incumbent.getToken();
+
+        // the stalled contender's own bump, issued after the takeover: refused, never applied
+        final CompletableFuture<Long> lateBump = holderClient.incrementAsync(path, 1, stalled);
+        final ExecutionException rejected =
+                assertThrows(
+                        ExecutionException.class,
+                        () -> lateBump.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS));
+        assertTrue(
+                rejected.getCause() instanceof RaftMetadataException,
+                "the late bump is refused by the store, not lost in transport");
+        assertEquals(
+                RaftResult.Status.UNKNOWN_LEASE,
+                ((RaftMetadataException) rejected.getCause()).getStatus());
+        assertEquals(
+                incumbentToken + 1,
+                contenderClient.increment(path, 1),
+                "the refused bump left no effect: the next token strictly follows the"
+                        + " incumbent's");
+
+        incumbent.release();
+        final MetadataLock.Hold next = newLock(holderClient, path).acquire();
+        assertTrue(
+                next.getToken() > incumbentToken,
+                "a fresh acquire's token still advances past the incumbent's");
+        next.release();
     }
 
     /**
@@ -416,6 +517,28 @@ public class TestMetadataLock {
                 RaftCommandCodec.decodeResult(reply.getMessage().getContent().toByteArray());
         assertEquals(RaftResult.Status.OK, result.getStatus());
         return result.getRevision();
+    }
+
+    /**
+     * Whether any change in {@code window} removes the record at {@code path}: an explicit
+     * delete, or a subtree delete covering it - the two mutations that could take a later
+     * holder's record at the shared path.
+     */
+    private static boolean removesPath(RaftMetadataClient.PollResult window, String path) {
+        for (ChangeEvent event : window.getRecords()) {
+            for (ChangeEvent.Change change : event.getChanges()) {
+                if (change.getOp() == ChangeEvent.ChangeOp.DELETE
+                        && path.equals(change.getPath())) {
+                    return true;
+                }
+                if (change.getOp() == ChangeEvent.ChangeOp.DELETE_SUBTREE
+                        && (path.equals(change.getPath())
+                                || path.startsWith(change.getPath() + "/"))) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /**

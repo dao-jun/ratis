@@ -34,21 +34,6 @@ public final class Preconditions {
 
     /**
      * Ensures that the given object reference is not null. Upon violation, a {@code
-     * NullPointerException} with no message is thrown.
-     *
-     * @param reference The object reference
-     * @return The object reference itself (generically typed).
-     * @throws NullPointerException Thrown, if the passed reference was null.
-     */
-    public static <T> T checkNotNull(T reference) {
-        if (reference == null) {
-            throw new NullPointerException();
-        }
-        return reference;
-    }
-
-    /**
-     * Ensures that the given object reference is not null. Upon violation, a {@code
      * NullPointerException} with the given message is thrown.
      *
      * @param reference The object reference
@@ -64,47 +49,9 @@ public final class Preconditions {
         return reference;
     }
 
-    /**
-     * Ensures that the given object reference is not null. Upon violation, a {@code
-     * NullPointerException} with the given message is thrown.
-     *
-     * <p>The error message is constructed from a template and an arguments array, after a similar
-     * fashion as {@link String#format(String, Object...)}, but supporting only {@code %s} as a
-     * placeholder.
-     *
-     * @param reference The object reference
-     * @param errorMessageTemplate The message template for the {@code NullPointerException} that is
-     *     thrown if the check fails. The template substitutes its {@code %s} placeholders with the
-     *     error message arguments.
-     * @param errorMessageArgs The arguments for the error message, to be inserted into the message
-     *     template for the {@code %s} placeholders.
-     * @return The object reference itself (generically typed).
-     * @throws NullPointerException Thrown, if the passed reference was null.
-     */
-    public static <T> T checkNotNull(
-            T reference, String errorMessageTemplate, Object... errorMessageArgs) {
-        if (reference == null) {
-            throw new NullPointerException(format(errorMessageTemplate, errorMessageArgs));
-        }
-        return reference;
-    }
-
     // ------------------------------------------------------------------------
     //  Boolean Condition Checking (Argument)
     // ------------------------------------------------------------------------
-
-    /**
-     * Checks the given boolean condition, and throws an {@code IllegalArgumentException} if the
-     * condition is not met (evaluates to {@code false}).
-     *
-     * @param condition The condition to check
-     * @throws IllegalArgumentException Thrown, if the condition is violated.
-     */
-    public static void checkArgument(boolean condition) {
-        if (!condition) {
-            throw new IllegalArgumentException();
-        }
-    }
 
     /**
      * Checks the given boolean condition, and throws an {@code IllegalArgumentException} if the
@@ -131,19 +78,6 @@ public final class Preconditions {
 
     /**
      * Checks the given boolean condition, and throws an {@code IllegalStateException} if the
-     * condition is not met (evaluates to {@code false}).
-     *
-     * @param condition The condition to check
-     * @throws IllegalStateException Thrown, if the condition is violated.
-     */
-    public static void checkState(boolean condition) {
-        if (!condition) {
-            throw new IllegalStateException();
-        }
-    }
-
-    /**
-     * Checks the given boolean condition, and throws an {@code IllegalStateException} if the
      * condition is not met (evaluates to {@code false}). The exception will have the given error
      * message.
      *
@@ -155,25 +89,6 @@ public final class Preconditions {
     public static void checkState(boolean condition, Object errorMessage) {
         if (!condition) {
             throw new IllegalStateException(String.valueOf(errorMessage));
-        }
-    }
-
-    /**
-     * Checks the given boolean condition, and throws an {@code IllegalStateException} if the
-     * condition is not met (evaluates to {@code false}).
-     *
-     * @param condition The condition to check
-     * @param errorMessageTemplate The message template for the {@code IllegalStateException} that
-     *     is thrown if the check fails. The template substitutes its {@code %s} placeholders with
-     *     the error message arguments.
-     * @param errorMessageArgs The arguments for the error message, to be inserted into the message
-     *     template for the {@code %s} placeholders.
-     * @throws IllegalStateException Thrown, if the condition is violated.
-     */
-    public static void checkState(
-            boolean condition, String errorMessageTemplate, Object... errorMessageArgs) {
-        if (!condition) {
-            throw new IllegalStateException(format(errorMessageTemplate, errorMessageArgs));
         }
     }
 

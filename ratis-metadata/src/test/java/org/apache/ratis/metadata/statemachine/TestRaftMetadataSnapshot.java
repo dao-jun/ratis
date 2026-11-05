@@ -44,9 +44,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -106,8 +108,20 @@ public class TestRaftMetadataSnapshot {
                                             RaftCommand.put(
                                                     "/snap/root/multi-b", bytes("b"), 0, 100L))))
                             .getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.increment("/snap/counter", 5L)).getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.create("/snap/root/seq-", bytes("s"), true, 0L, 100L))
+                            .getStatus());
             final long preSnapshotRevision = committedRevision(cluster);
             awaitAllReplicasAt(cluster, preSnapshotRevision);
+            final List<RaftResult.Lease> leasesAtSnapshotPoint =
+                    MetadataCluster.directQuery(
+                                    cluster.stateMachine(leaderIndex), RaftCommand.leaseList())
+                            .getLeases();
+            assertEquals(1, leasesAtSnapshotPoint.size());
 
             final long snapshotIndex = cluster.takeSnapshotOnLeader();
             assertTrue(
@@ -116,7 +130,8 @@ public class TestRaftMetadataSnapshot {
 
             assertCheckpointContent(
                     findSnapshotDirectory(raftDirOf(tempDir, leaderIndex), snapshotIndex),
-                    snapshotIndex);
+                    snapshotIndex,
+                    leasesAtSnapshotPoint);
 
             // NEED_SNAPSHOT is sinceRevision + 1 < line; snapshotIndex is the first live poll.
             final RaftResult collected =
@@ -186,8 +201,20 @@ public class TestRaftMetadataSnapshot {
                             Arrays.asList(
                                     RaftCommand.put("/catchup/m1", bytes("m1"), 0, 100L),
                                     RaftCommand.put("/catchup/m2", bytes("m2"), 0, 100L))));
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.increment("/catchup/counter", 5L)).getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.create("/catchup/seq-", bytes("s"), true, 0L, 100L))
+                            .getStatus());
             final long phase1Revision = committedRevision(cluster);
             awaitAllReplicasAt(cluster, phase1Revision);
+            final List<RaftResult.Lease> leasesAtFollowerKill =
+                    MetadataCluster.directQuery(
+                                    cluster.stateMachine(leaderIndex), RaftCommand.leaseList())
+                            .getLeases();
+            assertEquals(1, leasesAtFollowerKill.size());
 
             cluster.killServer(followerIndex);
             // The leader's committed revision bounds the follower's durable end (every log entry
@@ -254,6 +281,12 @@ public class TestRaftMetadataSnapshot {
             assertEquals(leaderEphemeral.getLeaseId(), followerEphemeral.getLeaseId());
             assertEquals(7L, followerEphemeral.getLeaseId());
             assertArrayEquals(bytes("ephemeral"), followerEphemeral.getData());
+            assertEquals(
+                    leaseTableOf(leasesAtFollowerKill),
+                    leaseTableOf(
+                            MetadataCluster.directQuery(followerMachine, RaftCommand.leaseList())
+                                    .getLeases()),
+                    "the follower's own leases CF carries the exact leader table (all four fields)");
 
             // Only install creates this: snapshots need a leader's updater; auto trigger is off.
             try {
@@ -297,6 +330,11 @@ public class TestRaftMetadataSnapshot {
                         timeout);
             }
 
+            // The installed artifact itself carries the exact transferred three-family content.
+            assertCatchupThreeFamilies(
+                    findSnapshotDirectory(raftDirOf(tempDir, followerIndex), snapshotIndex),
+                    leaseTableOf(leasesAtFollowerKill));
+
             send(cluster, RaftCommand.put("/catchup/after-catchup", bytes("ok"), 0, 400L));
             final long afterCatchupRevision = committedRevision(cluster);
             waitUntil(
@@ -334,6 +372,14 @@ public class TestRaftMetadataSnapshot {
                                     RaftCommand.pollChanges(snapshotIndex - 1, POLL_BUDGET_BYTES))
                             .getStatus(),
                     "the retention line survives the restart");
+
+            // The follower's working database, built by the real install -> reinitialize ->
+            // live-apply -> restart path. killServer closes each server (and its RocksDB),
+            // so the dump sees a cleanly closed database; no restart follows.
+            for (int i = 0; i < NUM_SERVERS; i++) {
+                cluster.killServer(i);
+            }
+            assertCatchupThreeFamilies(metaDirOf(tempDir, followerIndex), leaseTableOf(leasesAtFollowerKill));
         }
     }
 
@@ -516,7 +562,8 @@ public class TestRaftMetadataSnapshot {
         return start;
     }
 
-    private static void assertCheckpointContent(File snapshotDir, long snapshotIndex)
+    private static void assertCheckpointContent(
+            File snapshotDir, long snapshotIndex, List<RaftResult.Lease> leasesAtSnapshotPoint)
             throws IOException {
         final Options options = new Options();
         final List<AutoCloseable> toClose = new ArrayList<>();
@@ -550,11 +597,15 @@ public class TestRaftMetadataSnapshot {
                     RocksDB.openReadOnly(snapshotDir.getAbsolutePath(), descriptors, handles);
             toClose.add(checkpoint);
             try {
-                final ColumnFamilyHandle state = handleOf(handles, columnFamilies, "state");
-                final ColumnFamilyHandle changes = handleOf(handles, columnFamilies, "changes");
-                final ColumnFamilyHandle defaults = handleOf(handles, columnFamilies, "default");
+                final ColumnFamilyHandle state =
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "state");
+                final ColumnFamilyHandle changes =
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "changes");
+                final ColumnFamilyHandle defaults =
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "default");
                 final ColumnFamilyHandle results =
-                        handleOf(handles, columnFamilies, "command-results");
+                        MetadataTableDumpAsserts.handleOf(
+                                handles, columnFamilies, "command-results");
 
                 assertNotNull(
                         checkpoint.get(
@@ -602,6 +653,15 @@ public class TestRaftMetadataSnapshot {
                         snapshotIndex,
                         decodeLong(marker),
                         "the marker describes exactly the snapshot prefix");
+
+                MetadataTableDumpAsserts.assertLeaseIndexAndCounterContent(
+                        checkpoint,
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "leases"),
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "lease-paths"),
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "counters"),
+                        leaseTableOf(leasesAtSnapshotPoint),
+                        Collections.singleton("42:/snap/root/ephemeral"),
+                        expectedCounters("user:/snap/counter", 5L, "sequential:/snap/root/seq-", 1L));
             } finally {
                 for (ColumnFamilyHandle handle : handles) {
                     handle.close();
@@ -616,11 +676,71 @@ public class TestRaftMetadataSnapshot {
         }
     }
 
-    private static ColumnFamilyHandle handleOf(
-            List<ColumnFamilyHandle> handles, List<String> names, String name) {
-        final int index = names.indexOf(name);
-        assertTrue(index >= 0, "column family " + name + " is present");
-        return handles.get(index);
+    /** The leases CF rows expected from a captured LEASE_LIST, formatted ttl/expireAt/renew. */
+    private static Map<Long, String> leaseTableOf(List<RaftResult.Lease> captured) {
+        final Map<Long, String> expected = new TreeMap<>();
+        for (RaftResult.Lease lease : captured) {
+            expected.put(
+                    lease.getLeaseId(),
+                    lease.getTtlMs() + "/" + lease.getExpireAtMs() + "/" + lease.getLastRenewIndex());
+        }
+        return expected;
+    }
+
+    private static Map<String, Long> expectedCounters(
+            String userName, long userValue, String seqName, long seqValue) {
+        final Map<String, Long> expected = new TreeMap<>();
+        expected.put(userName, userValue);
+        expected.put(seqName, seqValue);
+        return expected;
+    }
+
+    /**
+     * Opens a closed snapshot or working directory read-only (the assertCheckpointContent
+     * skeleton) and asserts the /catchup scenario's exact three-family content.
+     */
+    private static void assertCatchupThreeFamilies(File dir, Map<Long, String> expectedLeases)
+            throws IOException {
+        final Options options = new Options();
+        final List<AutoCloseable> toClose = new ArrayList<>();
+        toClose.add(options);
+        try {
+            final List<byte[]> columnFamilyNames =
+                    RocksDB.listColumnFamilies(options, dir.getAbsolutePath());
+            final List<String> columnFamilies = new ArrayList<>();
+            for (byte[] name : columnFamilyNames) {
+                columnFamilies.add(new String(name, StandardCharsets.UTF_8));
+            }
+            final List<ColumnFamilyDescriptor> descriptors = new ArrayList<>();
+            for (byte[] name : columnFamilyNames) {
+                final ColumnFamilyOptions cfOptions = new ColumnFamilyOptions();
+                toClose.add(cfOptions);
+                descriptors.add(new ColumnFamilyDescriptor(name, cfOptions));
+            }
+            final List<ColumnFamilyHandle> handles = new ArrayList<>();
+            final RocksDB db = RocksDB.openReadOnly(dir.getAbsolutePath(), descriptors, handles);
+            toClose.add(db);
+            try {
+                MetadataTableDumpAsserts.assertLeaseIndexAndCounterContent(
+                        db,
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "leases"),
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "lease-paths"),
+                        MetadataTableDumpAsserts.handleOf(handles, columnFamilies, "counters"),
+                        expectedLeases,
+                        Collections.singleton("7:/catchup/ephemeral"),
+                        expectedCounters("user:/catchup/counter", 5L, "sequential:/catchup/seq-", 1L));
+            } finally {
+                for (ColumnFamilyHandle handle : handles) {
+                    handle.close();
+                }
+            }
+        } catch (RocksDBException e) {
+            throw new IOException("Failed to inspect the metadata tables of " + dir, e);
+        } finally {
+            for (int i = toClose.size() - 1; i >= 0; i--) {
+                quietClose(toClose.get(i));
+            }
+        }
     }
 
     private static Map<String, Long> listAsMap(MetadataStateMachine stateMachine, String prefix) {
@@ -695,11 +815,7 @@ public class TestRaftMetadataSnapshot {
 
     /** The change-record key encoding: an 8-byte big-endian revision. */
     private static long decodeLong(byte[] bytes) {
-        long value = 0;
-        for (int i = 0; i < 8; i++) {
-            value = (value << 8) | (bytes[i] & 0xFFL);
-        }
-        return value;
+        return MetadataTableDumpAsserts.decodeLong(bytes, 0);
     }
 
     private static void quietClose(AutoCloseable closeable) {

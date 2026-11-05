@@ -227,6 +227,61 @@ public class TestRaftCommandCodec {
     }
 
     @Test
+    void testUnpairedSurrogateNamesAreRejectedAtEncode() {
+        // UTF-8 would substitute an unpaired surrogate with '?' - itself a legal name character
+        // - so two distinct names would collapse onto one stored name. Every string surface
+        // flows through the one writeString, so each of these must reject at encode.
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RaftCommandCodec.encodeCommand(RaftCommand.increment("locks\uD800x", 1L)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RaftCommandCodec.encodeCommand(RaftCommand.put("/a\uD800b", new byte[0], 0, 1L)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        RaftCommandCodec.encodeCommand(
+                                RaftCommand.list("/c/", "/after\uD800", 5L)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RaftCommandCodec.encodeCommand(RaftCommand.increment("locks\uDC00x", 1L)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        RaftCommandCodec.encodeCommand(
+                                RaftCommand.increment("locks\uD800\uD800x", 1L)));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        RaftCommandCodec.encodeResult(
+                                RaftResult.ok(RaftCommand.Op.CREATE).resultPath("/s\uD800x")));
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        RaftCommandCodec.encodeChangeRecord(
+                                new ChangeEvent(
+                                        42L,
+                                        Arrays.asList(
+                                                new ChangeEvent.Change(
+                                                        ChangeEvent.ChangeOp.CREATE,
+                                                        "/s\uD800x",
+                                                        new byte[0])))));
+
+        // No over-rejection: a surrogate pair is one code point and rides the wire losslessly,
+        // and a literal '?' stays the legal name character it always was.
+        final RaftCommand astral =
+                RaftCommandCodec.decodeCommand(
+                        RaftCommandCodec.encodeCommand(RaftCommand.increment("cnt😀x", 1L)));
+        assertNotNull(astral);
+        assertEquals("cnt😀x", astral.getPath());
+        final RaftCommand literal =
+                RaftCommandCodec.decodeCommand(
+                        RaftCommandCodec.encodeCommand(RaftCommand.increment("locks?x", 1L)));
+        assertNotNull(literal);
+        assertEquals("locks?x", literal.getPath());
+    }
+
+    @Test
     void testCreateWithLeaseRoundTripsWithoutEphemeralFlag() {
         final RaftCommand leased =
                 RaftCommandCodec.decodeCommand(
@@ -249,7 +304,7 @@ public class TestRaftCommandCodec {
 
     @Test
     void testVersionTwoLeaseRenewRoundTripsTtl() {
-        assertEquals(2, RaftCommandCodec.CURRENT_FORMAT_VERSION);
+        assertEquals(3, RaftCommandCodec.CURRENT_FORMAT_VERSION);
 
         final RaftCommand renewed =
                 RaftCommandCodec.decodeCommand(
@@ -259,12 +314,12 @@ public class TestRaftCommandCodec {
         assertEquals(30L, renewed.getTtlMs());
         assertEquals(100L, renewed.getExpireAtMs());
 
-        final RaftCommand legacyFactory =
+        final RaftCommand zeroTtl =
                 RaftCommandCodec.decodeCommand(
-                        RaftCommandCodec.encodeCommand(RaftCommand.leaseRenew(11L, 100L)));
-        assertNotNull(legacyFactory);
-        assertEquals(0L, legacyFactory.getTtlMs());
-        assertEquals(100L, legacyFactory.getExpireAtMs());
+                        RaftCommandCodec.encodeCommand(RaftCommand.leaseRenew(11L, 0L, 100L)));
+        assertNotNull(zeroTtl);
+        assertEquals(0L, zeroTtl.getTtlMs());
+        assertEquals(100L, zeroTtl.getExpireAtMs());
     }
 
     @Test
@@ -276,13 +331,43 @@ public class TestRaftCommandCodec {
     }
 
     @Test
+    void testVersionThreeGuardedIncrementRoundTrips() {
+        final RaftCommand guarded =
+                RaftCommandCodec.decodeCommand(
+                        RaftCommandCodec.encodeCommand(
+                                RaftCommand.increment("/locks/a", 1L, 42L)));
+        assertNotNull(guarded);
+        assertEquals("/locks/a", guarded.getPath());
+        assertEquals(1L, guarded.getDelta());
+        assertEquals(42L, guarded.getLeaseId(), "the trailing lease guard survives the wire");
+
+        final RaftCommand plain =
+                RaftCommandCodec.decodeCommand(
+                        RaftCommandCodec.encodeCommand(RaftCommand.increment("/locks/a", 1L)));
+        assertNotNull(plain);
+        assertEquals(0L, plain.getLeaseId(), "the two-arg factory stays unguarded");
+    }
+
+    @Test
+    void testVersionTwoIncrementWirePayloadIsRejected() {
+        // v2 INCREMENT was [path][zigzag delta] with no trailing lease guard: the version byte
+        // rejects it, never a silent truncation into an unguarded increment.
+        assertNull(
+                RaftCommandCodec.decodeCommand(
+                        new byte[] {2, RaftCommand.Op.INCREMENT.code(), 1, 'a', 2}));
+    }
+
+    @Test
     void testNewResultStatusesAppendWithoutRenumbering() {
         assertEquals(12, RaftResult.Status.STALE_TERM.code());
         assertEquals(13, RaftResult.Status.RESULT_EXPIRED.code());
         assertEquals(14, RaftResult.Status.INVOCATION_MISMATCH.code());
+        assertEquals(15, RaftResult.Status.STALE_LEASE.code());
         for (RaftResult.Status status :
                 Arrays.asList(
-                        RaftResult.Status.RESULT_EXPIRED, RaftResult.Status.INVOCATION_MISMATCH)) {
+                        RaftResult.Status.RESULT_EXPIRED,
+                        RaftResult.Status.INVOCATION_MISMATCH,
+                        RaftResult.Status.STALE_LEASE)) {
             final RaftResult decoded =
                     RaftCommandCodec.decodeResult(
                             RaftCommandCodec.encodeResult(
@@ -308,7 +393,7 @@ public class TestRaftCommandCodec {
                                         RaftCommand.increment("m-cnt", -3))),
                         RaftCommand.increment("c-cnt", -5),
                         RaftCommand.leaseRegister(11L, 30, 99L),
-                        RaftCommand.leaseRenew(11L, 100L),
+                        RaftCommand.leaseRenew(11L, 0L, 100L),
                         RaftCommand.leaseExpire(11L, 42L),
                         RaftCommand.get("/c/get"),
                         RaftCommand.list("/c/", 77),

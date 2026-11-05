@@ -283,31 +283,34 @@ public class TestInvocationResultStore {
     }
 
     @Test
-    void testCutoffIsMonotonicAndRetentionTimeUsesEffectiveCutoffFloor() throws Exception {
+    void testCutoffIsMonotonicAndRefreshRetentionNeverLowers() throws Exception {
         final ClientInvocationId invocation = invocation(50L);
         final MetadataLogEnvelope firstEnvelope =
                 envelope(RaftCommand.increment("clock", 1L), 10_000L, 1_000L);
+        final byte[] firstResult =
+                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT));
         final InvocationResultStore.Disposition first =
                 store.lookup(invocation, TermIndex.valueOf(1L, 1L), firstEnvelope);
-        commit(first, RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)), 1L);
+        commit(first, firstResult, 1L);
 
+        // The duplicate is preprocessed under a clock 5_000 ms behind the original entry, so its
+        // raw retention floor (9_000) sits below the committed record's retention (10_000): the
+        // refresh must keep 10_000, or collection could delete the record while the original
+        // entry at serverTime 10_000 still replays expecting an unexpired result.
         final InvocationResultStore.Disposition duplicate =
                 store.lookup(
                         invocation,
                         TermIndex.valueOf(1L, 2L),
                         envelope(RaftCommand.increment("clock", 1L), 5_000L, 1_000L));
-        assertEquals(9_000L, duplicate.getEffectiveCutoff());
-        assertEquals(9_000L, duplicate.getRetentionTime());
+        assertEquals(9_000L, duplicate.getEffectiveCutoff(), "the cutoff stays monotone");
+        assertEquals(10_000L, duplicate.getRetentionTime(), "a refresh never lowers retention");
         commit(duplicate, null, 2L);
         assertEquals(9_000L, store.loadCutoff());
-        assertRecord(
-                invocation,
-                1L,
-                1L,
-                10_000L,
-                9_000L,
-                firstEnvelope,
-                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)));
+        assertArrayEquals(
+                invocationKey(invocation),
+                db.get(resultsHandle, timeKey(10_000L, invocation)),
+                "the time index stays at the un-lowered retention");
+        assertRecord(invocation, 1L, 1L, 10_000L, 10_000L, firstEnvelope, firstResult);
     }
 
     @Test
@@ -334,6 +337,70 @@ public class TestInvocationResultStore {
                                 TermIndex.valueOf(1L, 10L),
                                 envelope(RaftCommand.increment("missing", 1L), 1_000L, 100L)),
                 "serverTime equal to the persisted cutoff is not expired");
+    }
+
+    @Test
+    void testLaggingClockDuplicateKeepsOriginalReplayPastTheShavedFloor() throws Exception {
+        final ClientInvocationId invocation = invocation(53L);
+        final RaftCommand command = RaftCommand.put("/lagging-refresh", bytes("v"), 0, 1L);
+        final byte[] original =
+                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.PUT).version(1L));
+        commit(
+                store.lookup(
+                        invocation, TermIndex.valueOf(1L, 10L), envelope(command, 10_000L, 1_000L)),
+                original,
+                10L);
+
+        // A duplicate commits under a clock 500 ms behind: pre-fix it shaves the record's
+        // retention from 10_000 down to max(9_500, 9_000) = 9_500; post-fix 10_000 survives.
+        final InvocationResultStore.Disposition duplicate =
+                store.lookup(
+                        invocation,
+                        TermIndex.valueOf(1L, 11L),
+                        envelope(command, 9_500L, 1_000L));
+        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, duplicate.getKind());
+        commit(duplicate, null, 11L);
+
+        // A later write lands the replicated cutoff inside the shaved window (9_500, 10_000].
+        commit(
+                store.lookup(
+                        invocation(54L),
+                        TermIndex.valueOf(1L, 12L),
+                        envelope(
+                                RaftCommand.put("/lagging-advance", bytes("a"), 0, 1L),
+                                9_800L,
+                                100L)),
+                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.PUT).version(1L)),
+                12L);
+        assertEquals(9_700L, store.loadCutoff());
+
+        // Replaying the ORIGINAL entry (marker 12 >= 10) must still return the original result;
+        // pre-fix the record was collected below the 9_700 cutoff and this lookup throws
+        // "Missing unexpired invocation result" instead.
+        final InvocationResultStore.Disposition replay =
+                store.lookup(
+                        invocation, TermIndex.valueOf(1L, 10L), envelope(command, 10_000L, 1_000L));
+        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, replay.getKind());
+        assertArrayEquals(original, replay.getEncodedResult());
+
+        // Once the cutoff strictly passes the retained 10_000, collection is legitimate and the
+        // same replay degrades to the benign expired answer - never to corruption.
+        commit(
+                store.lookup(
+                        invocation(55L),
+                        TermIndex.valueOf(1L, 13L),
+                        envelope(
+                                RaftCommand.put("/lagging-sweep", bytes("s"), 0, 1L),
+                                11_500L,
+                                100L)),
+                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.PUT).version(1L)),
+                13L);
+        assertNull(db.get(resultsHandle, invocationKey(invocation)));
+        assertEquals(
+                InvocationResultStore.Disposition.Kind.RESULT_EXPIRED,
+                store.lookup(
+                        invocation, TermIndex.valueOf(1L, 10L), envelope(command, 10_000L, 1_000L))
+                        .getKind());
     }
 
     @Test

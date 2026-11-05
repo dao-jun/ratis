@@ -27,7 +27,6 @@ import org.rocksdb.WriteBatch;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -37,15 +36,13 @@ import java.util.Objects;
  */
 final class InvocationResultStore {
 
-    private static final byte[] APPLIED_REVISION_KEY =
-            "applied-revision".getBytes(StandardCharsets.UTF_8);
     private static final byte[] CUTOFF_KEY = {0};
     private static final byte RECORD_KEY_TAG = 1;
     private static final byte TIME_KEY_TAG = 2;
     private static final int CLIENT_ID_LENGTH = 16;
-    private static final int DIGEST_LENGTH = 32;
     private static final int RECORD_VERSION = 1;
-    private static final int RECORD_HEADER_LENGTH = 1 + 4 * Long.BYTES + DIGEST_LENGTH + Integer.BYTES;
+    private static final int RECORD_HEADER_LENGTH =
+            1 + 4 * Long.BYTES + MetadataLogEnvelope.DIGEST_LENGTH + Integer.BYTES;
 
     private final RocksDB db;
     private final ColumnFamilyHandle defaultHandle;
@@ -170,7 +167,7 @@ final class InvocationResultStore {
                 final long firstIndex = in.getLong();
                 final long firstSeen = in.getLong();
                 final long retentionTime = in.getLong();
-                final byte[] digest = new byte[DIGEST_LENGTH];
+                final byte[] digest = new byte[MetadataLogEnvelope.DIGEST_LENGTH];
                 in.get(digest);
                 final int resultLength = in.getInt();
                 if (resultLength <= 0 || resultLength != in.remaining()) {
@@ -245,6 +242,11 @@ final class InvocationResultStore {
 
         final Record record = Record.decode(encodedRecord);
         verifyCurrentTimeIndex(invocation, invocationKey, record.retentionTime);
+        // A refresh may only extend retention. A duplicate preprocessed under a lagging leader
+        // clock must never pull the record below the retention its committed predecessors chose:
+        // collection deletes strictly below the cutoff, so a lowered retention can drop the record
+        // while a replay of its own log entry still expects an unexpired result.
+        final long refreshedRetentionTime = Math.max(record.retentionTime, retentionTime);
         if (replay && record.firstIndex > termIndex.getIndex()) {
             return expired(
                     invocation,
@@ -272,7 +274,7 @@ final class InvocationResultStore {
                 invocationKey,
                 selected,
                 effectiveCutoff,
-                retentionTime);
+                refreshedRetentionTime);
     }
 
     /**
@@ -300,7 +302,8 @@ final class InvocationResultStore {
 
     /**
      * Stages a first result or an immutable-field-preserving refresh, and last its new
-     * time-index key, without committing either.
+     * time-index key, without committing either. The refreshed retention is floored at the
+     * existing record's retention in {@link #lookup}, so the time index only moves forward.
      */
     void stageResult(
             WriteBatch batch, Disposition disposition, byte[] firstExecutionResult)
@@ -417,7 +420,7 @@ final class InvocationResultStore {
     }
 
     private long loadAppliedRevision() throws IOException, RocksDBException {
-        final byte[] encoded = db.get(defaultHandle, APPLIED_REVISION_KEY);
+        final byte[] encoded = db.get(defaultHandle, MetadataStateMachine.APPLIED_REVISION_KEY);
         if (encoded == null) {
             return 0L;
         }

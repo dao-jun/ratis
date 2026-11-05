@@ -213,7 +213,7 @@ public class TestMetadataLogEnvelope {
                         RaftCommand.leaseRegister(1L, -1L, 0L),
                         RaftCommand.leaseRenew(1L, 0L, 0L),
                         RaftCommand.leaseRenew(1L, -1L, 0L),
-                        RaftCommand.leaseRenew(1L, 123L))) {
+                        RaftCommand.leaseRenew(1L, 0L, 123L))) {
             assertThrows(
                     IllegalArgumentException.class,
                     () ->
@@ -304,7 +304,7 @@ public class TestMetadataLogEnvelope {
                         writeRequest(
                                 clientId,
                                 2L,
-                                RaftCommandCodec.encodeCommand(RaftCommand.leaseRenew(8L, 9_000L))))) {
+                                RaftCommandCodec.encodeCommand(RaftCommand.leaseRenew(8L, 0L, 9_000L))))) {
             final TransactionContext context = stateMachine.startTransaction(request);
             org.junit.jupiter.api.Assertions.assertTrue(
                     context.getException() instanceof IllegalArgumentException,
@@ -380,7 +380,7 @@ public class TestMetadataLogEnvelope {
             assertEquals(
                     RaftResult.Status.MALFORMED,
                     machine.applyLogData(
-                                    encodeEnvelope(RaftCommand.leaseRenew(6L, 9_999L), 1_000L))
+                                    encodeEnvelope(RaftCommand.leaseRenew(6L, 0L, 9_999L), 1_000L))
                             .getStatus());
             assertEquals(
                     RaftResult.Status.MALFORMED,

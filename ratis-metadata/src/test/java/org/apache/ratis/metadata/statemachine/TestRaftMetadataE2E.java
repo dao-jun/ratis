@@ -529,8 +529,8 @@ public class TestRaftMetadataE2E {
         }
         assertEquals(collected, paged);
 
-        // the uncapped command (what the client's list() sends): one iterator view, one point in
-        // time
+        // the uncapped raw command (still legal on the admin surface; the client's list() now
+        // pages): one iterator view, one point in time
         final RaftResult uncapped = sendReadOnly(RaftCommand.list("/page/", "", Long.MAX_VALUE));
         assertFalse(uncapped.hasMore());
         assertEquals(collected, pathsOf(uncapped));

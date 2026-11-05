@@ -51,8 +51,21 @@ public final class LeaseExpiryScheduler
 
     private static final long CLOSE_JOIN_TIMEOUT_MS = 10_000L;
 
-    /** Grace past {@code expireAtMs} before proposing expiry: ttl / 3 (one renewal interval). */
+    /**
+     * Grace past {@code expireAtMs} before proposing expiry: ttl / 3 (one renewal interval) to
+     * bridge one in-flight renewal. The full due-ness slack adds the cross-leader clock-skew
+     * tolerance on top (see {@link #SKEW_TOLERANCE_TTL_DIVISOR}).
+     */
     private static final long EXPIRY_GRACE_TTL_DIVISOR = 3;
+
+    /**
+     * Default cross-leader clock-skew tolerance, in ttl fractions: the leader that sequenced a
+     * lease's last renewal stamped {@code expireAtMs} with its wall clock (the envelope's leader
+     * sample), while the judging leader reads {@code now} from its own - a successor clock
+     * running ahead of its predecessor's reads every stamp that much early. One renewal interval
+     * (ttl / 3) unless an absolute override was configured.
+     */
+    private static final long SKEW_TOLERANCE_TTL_DIVISOR = 3;
 
     private final RaftServer raftServer;
     private final MetadataStateMachine stateMachine;
@@ -60,6 +73,8 @@ public final class LeaseExpiryScheduler
     private final RaftPeerId selfId;
     private final Clock clock;
     private final long scanIntervalMs;
+    /** Absolute skew tolerance in ms, or null for the per-lease ttl / 3 default. */
+    private final Long clockSkewToleranceOverrideMs;
 
     /** Identifies this scheduler in the server's retry cache; call ids are always fresh. */
     private final ClientId clientId = ClientId.randomId();
@@ -75,8 +90,6 @@ public final class LeaseExpiryScheduler
     private volatile boolean closed;
     private ScanLoop activeLoop;
 
-    private final AtomicLong loopsStarted = new AtomicLong();
-    private final AtomicLong loopsStopped = new AtomicLong();
     private final AtomicLong scansCompleted = new AtomicLong();
     private final AtomicLong proposalsSubmitted = new AtomicLong();
 
@@ -86,7 +99,8 @@ public final class LeaseExpiryScheduler
             MetadataStateMachine stateMachine,
             RaftGroupId groupId,
             Clock clock,
-            Duration scanInterval) {
+            Duration scanInterval,
+            Duration clockSkewTolerance) {
         this.raftServer = checkNotNull(raftServer, "raftServer");
         this.stateMachine = checkNotNull(stateMachine, "stateMachine");
         this.groupId = checkNotNull(groupId, "groupId");
@@ -99,6 +113,12 @@ public final class LeaseExpiryScheduler
             throw new IllegalArgumentException(
                     "Lease scan interval must be positive, got " + scanInterval);
         }
+        if (clockSkewTolerance != null && clockSkewTolerance.toMillis() < 0) {
+            throw new IllegalArgumentException(
+                    "Lease clock-skew tolerance must not be negative, got " + clockSkewTolerance);
+        }
+        this.clockSkewToleranceOverrideMs =
+                clockSkewTolerance == null ? null : clockSkewTolerance.toMillis();
     }
 
     /** Registers for role notifications; starts serving if this member already leads. */
@@ -195,7 +215,10 @@ public final class LeaseExpiryScheduler
                 return;
             }
             for (RaftResult.Lease lease : page.getLeases()) {
-                if (now >= lease.getExpireAtMs() + expiryGraceMs(lease)) {
+                if (now
+                        >= lease.getExpireAtMs()
+                                + expiryGraceMs(lease)
+                                + clockSkewToleranceMs(lease)) {
                     proposeExpiry(lease);
                 }
             }
@@ -210,6 +233,17 @@ public final class LeaseExpiryScheduler
 
     private static long expiryGraceMs(RaftResult.Lease lease) {
         return lease.getTtlMs() / EXPIRY_GRACE_TTL_DIVISOR;
+    }
+
+    /**
+     * The due-ness slack covering cross-leader wall-clock skew: the stamping and judging leaders
+     * read different clocks, so a successor ahead of its predecessor by less than this must not
+     * judge a healthy lease due.
+     */
+    private long clockSkewToleranceMs(RaftResult.Lease lease) {
+        return clockSkewToleranceOverrideMs != null
+                ? clockSkewToleranceOverrideMs
+                : lease.getTtlMs() / SKEW_TOLERANCE_TTL_DIVISOR;
     }
 
     /** Reads one lease page via the query path; {@code null} means "skip this scan". */
@@ -302,18 +336,6 @@ public final class LeaseExpiryScheduler
         return scansCompleted.get();
     }
 
-    /** How many scan loops were started (one per leadership term won while attached). */
-    @VisibleForTesting
-    public long loopsStarted() {
-        return loopsStarted.get();
-    }
-
-    /** How many scan loops finished; {@code loopsStarted - loopsStopped} is the running count. */
-    @VisibleForTesting
-    public long loopsStopped() {
-        return loopsStopped.get();
-    }
-
     /** Whether a scan loop is currently running on this member. */
     @VisibleForTesting
     public boolean isScanLoopRunning() {
@@ -336,7 +358,6 @@ public final class LeaseExpiryScheduler
         }
 
         void start() {
-            loopsStarted.incrementAndGet();
             thread.start();
         }
 
@@ -368,28 +389,28 @@ public final class LeaseExpiryScheduler
         }
 
         private void run() {
-            try {
-                while (!stopRequested && !closed) {
+            while (!stopRequested && !closed) {
+                try {
                     scanOnce();
                     scansCompleted.incrementAndGet();
-                    synchronized (lock) {
-                        if (stopRequested || closed) {
-                            return;
-                        }
-                        try {
-                            lock.wait(scanIntervalMs);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            return;
-                        }
+                } catch (Throwable t) {
+                    // The scan contains its own expected failures; whatever still escapes
+                    // is a bug. One bug must not end expiry for the rest of the term:
+                    // surface it and keep looping - the interval wait below paces the
+                    // retries.
+                    LOG.error("{}: lease expiry scan failed unexpectedly", selfId, t);
+                }
+                synchronized (lock) {
+                    if (stopRequested || closed) {
+                        return;
+                    }
+                    try {
+                        lock.wait(scanIntervalMs);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
                     }
                 }
-            } catch (Throwable t) {
-                // Last resort: scanOnce swallows its own failures; a scan bug must surface, not
-                // kill expiry.
-                LOG.error("{}: lease expiry scan loop failed unexpectedly", selfId, t);
-            } finally {
-                loopsStopped.incrementAndGet();
             }
         }
     }

@@ -25,12 +25,16 @@ import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.statemachine.TransactionContext;
 import org.apache.ratis.util.JavaUtils;
 import org.apache.ratis.util.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
 
 class PendingRequest {
+  private static final Logger LOG = LoggerFactory.getLogger(PendingRequest.class);
+
   private final TermIndex termIndex;
   private final RaftClientRequest request;
   private final TransactionContext entry;
@@ -89,7 +93,18 @@ class PendingRequest {
 
   synchronized void setReply(RaftClientReply r) {
     Preconditions.assertTrue(r != null);
-    Preconditions.assertTrue(futureToComplete.complete(r), () -> "PendingRequest already completed: " + this);
+    if (futureToComplete.complete(r)) {
+      return;
+    }
+    // A setConfiguration request may legitimately be completed twice: the
+    // EventProcessor completes it when the (new) configuration commits
+    // (PendingRequests.replySetConfiguration) while a concurrently stopping
+    // leader state replies NotLeaderException
+    // (PendingRequests.sendNotLeaderResponses).  The future keeps the first
+    // reply; the second completion is a no-op, as in upstream ratis.
+    Preconditions.assertTrue(request instanceof SetConfigurationRequest,
+        () -> "PendingRequest already completed: " + this);
+    LOG.debug("Ignoring the second completion of a setConfiguration pending: {}", this);
   }
 
   TransactionContext setNotLeaderException(NotLeaderException nle, Collection<CommitInfoProto> commitInfos) {

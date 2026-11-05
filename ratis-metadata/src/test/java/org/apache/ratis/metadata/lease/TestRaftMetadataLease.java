@@ -17,6 +17,8 @@
 package org.apache.ratis.metadata.lease;
 
 import org.apache.ratis.metadata.MetadataCluster;
+import org.apache.ratis.metadata.client.LeaseSession;
+import org.apache.ratis.metadata.client.RaftMetadataClient;
 import org.apache.ratis.metadata.statemachine.ChangeEvent;
 import org.apache.ratis.metadata.statemachine.MetadataStateMachine;
 import org.apache.ratis.metadata.statemachine.RaftCommand;
@@ -40,6 +42,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -135,8 +139,9 @@ public class TestRaftMetadataLease {
                 previousRenewIndex = expectedRenewIndex;
             }
 
-            // the 45s advance clears the renewed expiry plus the ttl/3 grace
-            cluster.clock.advanceTime(45, TimeUnit.SECONDS);
+            // the 55s advance clears the renewed expiry plus the ttl/3 grace plus the ttl/3
+            // skew tolerance
+            cluster.clock.advanceTime(55, TimeUnit.SECONDS);
             MetadataCluster.waitThroughTransientFailure(
                     () ->
                             leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null
@@ -275,10 +280,11 @@ public class TestRaftMetadataLease {
                     "the renewed lease is still listed");
             assertEquals(RaftResult.Status.OK, statusOf(cluster, "/race/protected"));
 
-            // side 2: the renewed TTL is persisted, so its (larger) grace is renewed TTL / 3.
+            // side 2: the renewed TTL is persisted, so its grace (ttl / 3) and skew tolerance
+            // (ttl / 3) both scale with the renewed TTL.
             cluster.clock.advanceTime(
                     renewTtlMs + renewTtlMs / 3 - TimeUnit.SECONDS.toMillis(10)
-                            + TimeUnit.SECONDS.toMillis(5),
+                            + TimeUnit.SECONDS.toMillis(25),
                     TimeUnit.MILLISECONDS);
             MetadataCluster.waitThroughTransientFailure(
                     () ->
@@ -470,10 +476,11 @@ public class TestRaftMetadataLease {
             final List<Mutation> expectedTail = new ArrayList<>();
             expectedTail.add(Mutation.lease(ChangeEvent.ChangeOp.LEASE_RENEW, liveLeaseId));
 
-            // past expiry plus ttl/3 grace, far inside the live renewal: the NEW leader takes
-            // over
+            // past expiry plus the ttl/3 grace plus the ttl/3 skew tolerance, far inside the
+            // live renewal: the NEW leader takes over
             cluster.clock.advanceTime(
-                    ttlMs + ttlMs / 3 + TimeUnit.SECONDS.toMillis(5), TimeUnit.MILLISECONDS);
+                    ttlMs + 2 * (ttlMs / 3) + TimeUnit.SECONDS.toMillis(5),
+                    TimeUnit.MILLISECONDS);
             expectedTail.add(Mutation.path(ChangeEvent.ChangeOp.DELETE, "/fo/dead-eph"));
             expectedTail.add(Mutation.lease(ChangeEvent.ChangeOp.LEASE_EXPIRE, deadLeaseId));
             MetadataCluster.waitThroughTransientFailure(
@@ -535,6 +542,71 @@ public class TestRaftMetadataLease {
         }
     }
 
+    /**
+     * The cross-leader clock-skew defect end to end: a lease stamped by one leader is judged by
+     * its successor's clock, so a successor running ahead of its predecessor's reads every
+     * stamp that much early. The scheduler only ever compares its clock's {@code now} against
+     * the stamped {@code expireAtMs}, so the forward clock advance below is frame-identical to
+     * the successor's clock running ahead of the dead predecessor's.
+     */
+    @Test
+    void testNewLeaderToleratesPredecessorClockSkewPastTheGrace() throws Exception {
+        try (MetadataCluster cluster = newCluster()) {
+            cluster.start();
+            final RaftPeerId leader = cluster.awaitLeader();
+            final long leaseId = 801L;
+            final long ttlMs = TimeUnit.SECONDS.toMillis(30);
+            final long start = cluster.clock.milliseconds();
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.put("/skew", bytes(""), 0L, start)).getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.leaseRegister(leaseId, ttlMs, start + ttlMs))
+                            .getStatus());
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.put("/skew/eph", bytes("e"), leaseId, start))
+                            .getStatus());
+
+            cluster.killServer(cluster.indexOf(leader));
+            cluster.awaitLeader();
+
+            // ttl + ttl/3 + 1s: past the old bound (ttl + grace) but inside the new one (grace
+            // plus the default skew tolerance) - the new leader must not expire the lease.
+            cluster.clock.advanceTime(
+                    ttlMs + ttlMs / 3 + TimeUnit.SECONDS.toMillis(1), TimeUnit.MILLISECONDS);
+            holdThrough(
+                    STEADY_SCAN_WINDOW,
+                    () ->
+                            leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) != null
+                                    && statusOf(cluster, "/skew/eph") == RaftResult.Status.OK,
+                    "A lease skewed past the grace was expired by the new leader's clock frame");
+
+            // The healthy client's scheduled renewal lands under the new leader, re-stamping
+            // the expiry in the successor's frame.
+            final long renewedExpireAt = cluster.clock.milliseconds() + ttlMs;
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.leaseRenew(leaseId, ttlMs, renewedExpireAt))
+                            .getStatus());
+            renewIndexOf(cluster, leaseId, renewedExpireAt);
+
+            // The tolerance delays but never blocks expiry: past the renewed expiry plus grace
+            // plus tolerance, the lease and its ephemeral record die.
+            cluster.clock.advanceTime(
+                    ttlMs + 2 * (ttlMs / 3) + TimeUnit.SECONDS.toMillis(5),
+                    TimeUnit.MILLISECONDS);
+            MetadataCluster.waitThroughTransientFailure(
+                    () ->
+                            leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null
+                                    && statusOf(cluster, "/skew/eph")
+                                            == RaftResult.Status.NOT_FOUND,
+                    OPERATION_TIMEOUT,
+                    "The lease skewed past grace plus tolerance was not expired");
+        }
+    }
+
     @Test
     void testSchedulerProposesOnLeaderOnlyAndFollowsLeadershipTransfer() throws Exception {
         try (MetadataCluster cluster = newCluster()) {
@@ -553,7 +625,7 @@ public class TestRaftMetadataLease {
                                             TimeUnit.SECONDS.toMillis(2),
                                             now + TimeUnit.SECONDS.toMillis(2)))
                             .getStatus());
-            cluster.clock.advanceTime(3, TimeUnit.SECONDS);
+            cluster.clock.advanceTime(4, TimeUnit.SECONDS);
             MetadataCluster.waitThroughTransientFailure(
                     () -> leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null,
                     OPERATION_TIMEOUT,
@@ -595,7 +667,7 @@ public class TestRaftMetadataLease {
                                             TimeUnit.SECONDS.toMillis(2),
                                             nextNow + TimeUnit.SECONDS.toMillis(2)))
                             .getStatus());
-            cluster.clock.advanceTime(3, TimeUnit.SECONDS);
+            cluster.clock.advanceTime(4, TimeUnit.SECONDS);
             MetadataCluster.waitThroughTransientFailure(
                     () ->
                             leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), nextLeaseId)
@@ -625,12 +697,13 @@ public class TestRaftMetadataLease {
                     send(cluster, RaftCommand.leaseRegister(leaseId, ttlMs, start + ttlMs))
                             .getStatus());
 
-            // 9s past the stamp, still inside the 10s grace: scans happen, nothing is proposed.
-            // The source counted the leader scheduler's completed scans and proposals; the
-            // members own their schedulers without exposing them, so "scans happened and
-            // proposed nothing" becomes the lease holding through several scan intervals of
-            // wall time.
-            cluster.clock.advanceTime(ttlMs + TimeUnit.SECONDS.toMillis(9), TimeUnit.MILLISECONDS);
+            // 19s past the stamp, still inside the 10s grace plus the 10s default skew
+            // tolerance: scans happen, nothing is proposed. The source counted the leader
+            // scheduler's completed scans and proposals; the members own their schedulers
+            // without exposing them, so "scans happened and proposed nothing" becomes the lease
+            // holding through several scan intervals of wall time.
+            cluster.clock.advanceTime(
+                    ttlMs + TimeUnit.SECONDS.toMillis(19), TimeUnit.MILLISECONDS);
             holdThrough(
                     STEADY_SCAN_WINDOW,
                     () -> leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) != null,
@@ -639,12 +712,54 @@ public class TestRaftMetadataLease {
                     leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId),
                     "the lease survives inside the grace");
 
-            // 3s more = 12s past the stamp, past the grace: the scheduler proposes and it dies
+            // 3s more = 22s past the stamp, past grace plus tolerance: it dies
             cluster.clock.advanceTime(3, TimeUnit.SECONDS);
             MetadataCluster.waitThroughTransientFailure(
                     () -> leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null,
                     OPERATION_TIMEOUT,
                     "The lease past its grace was not expired");
+        }
+    }
+
+    /**
+     * The absolute override beats the per-lease ttl/3 default: with an explicit 30s tolerance a
+     * ttl-2s lease survives far past the default bound and dies only past the explicit one, so
+     * the hold fails if the knob is ignored.
+     */
+    @Test
+    void testExplicitSkewToleranceOverridesThePerLeaseDefault() throws Exception {
+        try (MetadataCluster cluster =
+                MetadataCluster.newBuilder(tempDir)
+                        .setNumServers(NUM_SERVERS)
+                        .setGroupUuid(UUID.fromString(GROUP_UUID))
+                        .setLeaseScanInterval(SCAN_INTERVAL)
+                        .setLeaseClockSkewTolerance(Duration.ofSeconds(30))
+                        .build()) {
+            cluster.start();
+            final long leaseId = 811L;
+            final long ttlMs = TimeUnit.SECONDS.toMillis(2);
+            final long start = cluster.clock.milliseconds();
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.leaseRegister(leaseId, ttlMs, start + ttlMs))
+                            .getStatus());
+
+            // ttl + 2*(ttl/3) + 5s: past the default bound (ttl + grace + ttl/3 tolerance) but
+            // far inside the explicit one (ttl + grace + 30s).
+            cluster.clock.advanceTime(
+                    ttlMs + 2 * (ttlMs / 3) + TimeUnit.SECONDS.toMillis(5),
+                    TimeUnit.MILLISECONDS);
+            holdThrough(
+                    STEADY_SCAN_WINDOW,
+                    () -> leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) != null,
+                    "The explicit skew tolerance did not override the per-lease default");
+
+            // 35s more clears the explicit bound: the expiry fires.
+            cluster.clock.advanceTime(35, TimeUnit.SECONDS);
+            MetadataCluster.waitThroughTransientFailure(
+                    () -> leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null,
+                    OPERATION_TIMEOUT,
+                    "The lease past its explicit tolerance bound was not expired");
         }
     }
 
@@ -781,6 +896,221 @@ public class TestRaftMetadataLease {
                                     && statusOf(cluster, "/mx/keep") == RaftResult.Status.OK,
                     OPERATION_TIMEOUT,
                     "The leases did not expire by the replicated sample and cascade per lease");
+        }
+    }
+
+    /**
+     * The transparency contract of the lease session: a leader failover resolving inside the
+     * ttl must not lapse the lease for an affordable short ttl. {@code killServer} is a
+     * GRACEFUL close, so pre-fix the renewal's own retry walk on the shared pipeline could
+     * burn full 3s attempts against the draining leader (a mid-election follower's
+     * LeaderNotReady neither rotates nor sleeps zero) - churn-suite runs observed fatal
+     * ~12.5s stalls for ttl=6s, whose expiry budget is ttl + ttl/3 = 8s. The concurrent write
+     * stream keeps the client's general pipeline busy as in the churn suite; assertions wait
+     * 16s per cycle (2x the pre-fix budget) so a pre-fix death surfaces before the verdict.
+     * TestRaftMetadataChurn remains the standing multi-recipe guard of the same invariant.
+     */
+    @Test
+    void testShortTtlSessionSurvivesLeaderFailovers() throws Exception {
+        try (MetadataCluster cluster = newCluster()) {
+            cluster.start();
+            cluster.awaitLeader();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            final AtomicBoolean stopAux = new AtomicBoolean();
+            final Thread clockDriver =
+                    new Thread(
+                            () -> {
+                                while (!stopAux.get()) {
+                                    cluster.clock.advanceTime(25, TimeUnit.MILLISECONDS);
+                                    try {
+                                        Thread.sleep(25);
+                                    } catch (InterruptedException e) {
+                                        return;
+                                    }
+                                }
+                            },
+                            "failover-clock");
+            clockDriver.setDaemon(true);
+            clockDriver.start();
+            // Fire-and-forget load through the SAME client: the pre-fix conditions under which
+            // renewals stalled in the churn suite; each op may fail during the close window.
+            final AtomicInteger seq = new AtomicInteger();
+            final Thread writer =
+                    new Thread(
+                            () -> {
+                                while (!stopAux.get()) {
+                                    final int i = seq.incrementAndGet();
+                                    client.createAsync("/failover/w" + i, bytes("w"))
+                                            .whenComplete(
+                                                    (created, failure) ->
+                                                            client.deleteAsync(
+                                                                    "/failover/w" + i));
+                                    try {
+                                        Thread.sleep(10);
+                                    } catch (InterruptedException e) {
+                                        return;
+                                    }
+                                }
+                            },
+                            "failover-writer");
+            writer.setDaemon(true);
+            writer.start();
+            try {
+                final long ttlMs = TimeUnit.SECONDS.toMillis(6);
+                final LeaseSession session = client.openLease(Duration.ofMillis(ttlMs));
+                client.create("/failover", bytes(""));
+                assertEquals(
+                        "/failover/eph",
+                        client.create("/failover/eph", bytes("eph"), session));
+                for (int cycle = 0; cycle < 3; cycle++) {
+                    final long killedAt = System.currentTimeMillis();
+                    final int leaderIndex = cluster.indexOf(cluster.awaitLeader());
+                    cluster.killServer(leaderIndex);
+                    cluster.awaitLeader(cluster.livePeerIds()); // resolves well inside the ttl
+                    final long settleTo = killedAt + 16_000L; // 2x the pre-fix ttl+grace budget
+                    while (System.currentTimeMillis() < settleTo) {
+                        Thread.sleep(200);
+                    }
+                    assertTrue(
+                            session.isAlive(),
+                            "cycle " + cycle
+                                    + ": a failover resolving inside the ttl killed the session");
+                    assertTrue(
+                            client.exists("/failover/eph"),
+                            "cycle " + cycle + ": the live session's bound record vanished");
+                    cluster.restartServer(leaderIndex);
+                    // The next kill must face a full electorate: killing while the restart is
+                    // still catching up parks the election past any ttl - not the contract's case.
+                    cluster.awaitRejoined(leaderIndex);
+                }
+                assertTrue(session.isAlive(), "the session did not survive the failover series");
+                session.close();
+            } finally {
+                stopAux.set(true);
+                clockDriver.join(5_000);
+                writer.join(5_000);
+                client.close();
+            }
+        }
+    }
+
+    /**
+     * The cohort bound: renewals of sessions on one client share its renewal pipeline, sized by
+     * the most urgent live ttl - here 2s, so every attempt is <= 667ms and neither session's
+     * renewal can wait out the other's urgency across a graceful leader close. Pre-fix both
+     * rode the generic 3s/24h pipeline, where the 2s session (budget ttl + ttl/3 = 2.67s) dies
+     * inside any failover whose first attempt burns one 3s deadline against the draining
+     * leader - the finding's scenario at its sharpest.
+     */
+    @Test
+    void testMixedTtlSessionsShareTheSizedRenewalPipeline() throws Exception {
+        try (MetadataCluster cluster = newCluster()) {
+            cluster.start();
+            cluster.awaitLeader();
+            final RaftMetadataClient client = cluster.newMetadataClient();
+            final AtomicBoolean stopClock = new AtomicBoolean();
+            final Thread clockDriver =
+                    new Thread(
+                            () -> {
+                                while (!stopClock.get()) {
+                                    cluster.clock.advanceTime(25, TimeUnit.MILLISECONDS);
+                                    try {
+                                        Thread.sleep(25);
+                                    } catch (InterruptedException e) {
+                                        return;
+                                    }
+                                }
+                            },
+                            "mixed-clock");
+            clockDriver.setDaemon(true);
+            clockDriver.start();
+            try {
+                final LeaseSession urgent = client.openLease(Duration.ofSeconds(2));
+                final LeaseSession relaxed = client.openLease(Duration.ofSeconds(6));
+                client.create("/mixed", bytes(""));
+                assertEquals("/mixed/u", client.create("/mixed/u", bytes("u"), urgent));
+                assertEquals("/mixed/r", client.create("/mixed/r", bytes("r"), relaxed));
+                final long killedAt = System.currentTimeMillis();
+                cluster.killServer(cluster.indexOf(cluster.awaitLeader()));
+                cluster.awaitLeader(cluster.livePeerIds());
+                while (System.currentTimeMillis() < killedAt + 16_000L) {
+                    Thread.sleep(200);
+                }
+                assertTrue(urgent.isAlive(), "the urgent session died in a failover inside its ttl");
+                assertTrue(relaxed.isAlive(), "the relaxed session died behind the urgent sizing");
+                assertTrue(client.exists("/mixed/u"));
+                assertTrue(client.exists("/mixed/r"));
+                urgent.close();
+                relaxed.close();
+            } finally {
+                stopClock.set(true);
+                clockDriver.join(5_000);
+                client.close();
+            }
+        }
+    }
+
+    /**
+     * The monotone apply: a renewal whose (leader-normalized) expiry does not extend the stored
+     * one is a no-op success - no overwrite, no lastRenewIndex bump, no change event. The
+     * leader stamps every renewal's expiry from its own clock, so the non-extending duplicate
+     * is formed by renewing twice at one frozen clock reading; pre-fix the duplicate overwrote
+     * the stored state while bumping the fence - exactly what a late duplicate of a dispatch
+     * the client gave up on could commit across a leader change to a slower clock,
+     * retroactively shortening a live lease its own renewals kept extending.
+     */
+    @Test
+    void testLateDuplicateRenewalCannotShortenALease() throws Exception {
+        try (MetadataCluster cluster = newCluster()) {
+            cluster.start();
+            final long leaseId = 901L;
+            final long ttlMs = TimeUnit.SECONDS.toMillis(30);
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.leaseRegister(leaseId, ttlMs,
+                            cluster.clock.milliseconds() + ttlMs)).getStatus());
+            cluster.clock.advanceTime(10, TimeUnit.SECONDS);
+            final long extended = cluster.clock.milliseconds() + ttlMs;
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.leaseRenew(leaseId, ttlMs, extended)).getStatus());
+            final long fence = renewIndexOf(cluster, leaseId, extended);
+            // The duplicate: the same (frozen) clock reading gives it the same normalized
+            // expiry - a stale proposer stamp the leader normalizes to a non-extending value.
+            final long stale = extended - TimeUnit.SECONDS.toMillis(20);
+            assertEquals(
+                    RaftResult.Status.OK,
+                    send(cluster, RaftCommand.leaseRenew(leaseId, ttlMs, stale)).getStatus());
+            final RaftResult.Lease lease =
+                    leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId);
+            assertNotNull(lease, "the lease is still listed after the duplicate");
+            assertEquals(
+                    extended,
+                    lease.getExpireAtMs(),
+                    "a non-extending renewal must not shorten the stored expiry");
+            assertEquals(
+                    fence,
+                    lease.getLastRenewIndex(),
+                    "a non-extending renewal must not bump the renew-index fence");
+            int renewEvents = 0;
+            for (ChangeEvent record : sendReadOnly(
+                            cluster, RaftCommand.pollChanges(0, POLL_BUDGET_BYTES)).getRecords()) {
+                for (ChangeEvent.Change change : record.getChanges()) {
+                    if (change.getOp() == ChangeEvent.ChangeOp.LEASE_RENEW
+                            && change.getLeaseId() == leaseId) {
+                        renewEvents++;
+                    }
+                }
+            }
+            assertEquals(1, renewEvents, "a non-extending renewal must leave no change event");
+            // And the fence not bumping is not a lease that lives forever: the expiry applies
+            // at the extended time plus the ttl/3 grace and the ttl/3 skew tolerance.
+            cluster.clock.advanceTime(
+                    ttlMs + 2 * (ttlMs / 3) + TimeUnit.SECONDS.toMillis(2), TimeUnit.MILLISECONDS);
+            MetadataCluster.waitThroughTransientFailure(
+                    () -> leaseOf(sendReadOnly(cluster, RaftCommand.leaseList()), leaseId) == null,
+                    OPERATION_TIMEOUT,
+                    "The lease did not expire at its (never shortened) expiry");
         }
     }
 
