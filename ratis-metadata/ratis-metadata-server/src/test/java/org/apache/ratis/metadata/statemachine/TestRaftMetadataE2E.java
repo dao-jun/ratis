@@ -864,6 +864,40 @@ public class TestRaftMetadataE2E {
         }
     }
 
+    /**
+     * Config log entries never reach applyTransaction - their term/index arrives as
+     * notifyTermIndexUpdated - yet the log keeps moving, so the retention line must advance on
+     * that path too: a config-entry index at a GC cadence multiple retires the early records
+     * the same way an applied one does.
+     */
+    @Test
+    void testChangeRecordGcAdvancesOnConfigEntryIndexUpdates() throws Exception {
+        try (Standalone standalone = new Standalone("gc-config")) {
+            final MetadataStateMachine sm = standalone.stateMachine;
+            sm.setChangeRecordRetention(4, 2);
+            for (int i = 1; i <= 3; i++) {
+                standalone.apply(RaftCommand.put("/cf-k" + i, bytes("v"), 0, 1L));
+            }
+            assertEquals(
+                    RaftResult.Status.OK,
+                    directQuery(sm, RaftCommand.pollChanges(1, 1 << 20)).getStatus(),
+                    "the early records poll fine before the config-index GC");
+
+            sm.notifyTermIndexUpdated(2L, 10L); // a config entry's term/index, a cadence multiple
+
+            assertEquals(
+                    RaftResult.Status.NEED_SNAPSHOT,
+                    directQuery(sm, RaftCommand.pollChanges(1, 1 << 20)).getStatus(),
+                    "the config-index GC moved the line past the early records");
+            final RaftResult live = directQuery(sm, RaftCommand.pollChanges(7, 1 << 20));
+            assertEquals(RaftResult.Status.OK, live.getStatus());
+            assertEquals(7L, live.getOldestRetainedRevision());
+            assertTrue(
+                    revisionsOf(live.getRecords()).isEmpty(),
+                    "the config index carried no change records; the window starts empty");
+        }
+    }
+
     @Test
     void testRecursiveDeleteEmitsOneSubtreeEventAndKeepsCounts() throws Exception {
         try (Standalone standalone = new Standalone("subtree-del")) {

@@ -321,6 +321,7 @@ public class TestRaftMetadataChurn {
                         "post-churn writes and reads still work");
 
                 watcher.close();
+                tracker.assertOverlappedHoldersWereDeadAtRelease();
                 System.out.println("[churn] " + watchLog.summary());
                 System.out.println("[churn] " + tracker.summary());
                 System.out.println("[churn] lock grant overlaps: " + tracker.overlaps());
@@ -639,6 +640,28 @@ public class TestRaftMetadataChurn {
                 }
             }
             return found;
+        }
+
+        /**
+         * The fencing closure over the overlaps: a holder whose live window ran past a
+         * successor's grant must have been lease-dead by its own release - the protocol's
+         * benign delayed-token zombie, fenced by the successor's higher token. A holder still
+         * alive at that release would be a genuine mutual-exclusion break, not a zombie.
+         */
+        synchronized void assertOverlappedHoldersWereDeadAtRelease() {
+            for (Grant a : grants) {
+                for (Grant b : grants) {
+                    if (a == b || !a.path.equals(b.path) || a.releaseNanos == 0
+                            || !(a.grantNanos < b.grantNanos && a.releaseNanos > b.grantNanos)) {
+                        continue;
+                    }
+                    assertTrue(
+                            !a.aliveAtRelease,
+                            "holder " + a.contender + " (token=" + a.token
+                                    + ") overlapped " + b.contender + "'s grant on " + a.path
+                                    + " while still alive at its release (all: " + grants + ")");
+                }
+            }
         }
 
         synchronized String summary() {

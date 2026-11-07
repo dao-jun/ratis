@@ -68,6 +68,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -529,6 +530,10 @@ public class TestRaftMetadataServer {
                                             GrpcConfigKeys.Server.setPort(properties, occupied))
                             .build();
             try {
+                ExitUtils.clear(); // the record is JVM-global and sticky - start this pin clean
+                assertNull(
+                        server.getTerminateException(),
+                        "no terminate condition is recorded before any start attempt");
                 final long begin = System.nanoTime();
                 final IOException failure = assertThrows(IOException.class, server::start);
                 assertTrue(
@@ -540,6 +545,14 @@ public class TestRaftMetadataServer {
                         failure.getCause() instanceof ExitUtils.ExitException,
                         "the grpc bind failure routed through ratis' terminate path");
                 assertNotNull(ExitUtils.getFirstExitException());
+                assertNotNull(
+                        server.getTerminateException(),
+                        "the silent member's recorded reason is observable through the server's"
+                                + " own seam");
+                assertSame(
+                        ExitUtils.getFirstExitException(),
+                        server.getTerminateException(),
+                        "the seam reports exactly the recorded terminate condition");
                 assertNull(server.getClient(), "a failed start leaves no client");
             } finally {
                 ExitUtils.clear();

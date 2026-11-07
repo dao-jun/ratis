@@ -305,12 +305,16 @@ public class MetadataStateMachineStorage implements StateMachineStorage {
         }
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(dir.toPath())) {
             for (Path entry : stream) {
-                if (entry.toFile().isDirectory() && SNAPSHOT_DIR_REGEX.matcher(entry.getFileName().toString()).matches()
-                        // The manifest is the last file of a publication, so only a dir
-                        // carrying it counts as a snapshot; a torn remainder does not.
-                        && new File(entry.toFile(), StateMachineIdentity.SNAPSHOT_FILE).isFile()) {
-                    snapshots.add(entry.toFile());
+                if (!entry.toFile().isDirectory()
+                        || !SNAPSHOT_DIR_REGEX.matcher(entry.getFileName().toString()).matches()) {
+                    continue;
                 }
+                // The manifest is the last file of a publication, so only a dir confirmed
+                // without it (a torn remainder) is skipped - a failed stat is not absence.
+                if (manifestConfirmedAbsent(entry.toFile())) {
+                    continue;
+                }
+                snapshots.add(entry.toFile());
             }
         }
         return snapshots;

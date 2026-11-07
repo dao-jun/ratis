@@ -68,9 +68,10 @@ public final class IOUtils {
 
     /**
      * Attempts to move source to target atomically and falls back to a non-atomic move if it
-     * fails. Flushes the parent directory afterwards to guarantee crash consistency.
+     * fails. Flushes the parent directory afterwards for crash consistency - best effort, a
+     * flush failure is only logged (see {@link #flushParentIfExists}).
      *
-     * @throws IOException if both atomic and non-atomic moves fail, or the parent dir flush fails.
+     * @throws IOException if both the atomic and the non-atomic move fail.
      */
     public static void atomicMoveWithFallback(Path source, Path target) throws IOException {
         try {

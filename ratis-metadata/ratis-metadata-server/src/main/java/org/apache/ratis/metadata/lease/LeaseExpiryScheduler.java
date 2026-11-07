@@ -121,8 +121,12 @@ public final class LeaseExpiryScheduler implements AutoCloseable, MetadataStateM
             if (closed) {
                 throw new IllegalStateException("LeaseExpiryScheduler is already closed");
             }
+            // Register under the lock: a close() racing the start either lands before the
+            // check (start throws, nothing registered) or after it (the removal below sees
+            // this registration) - never in between, which would leave a closed scheduler's
+            // listener attached to the state machine forever.
+            stateMachine.addRoleListener(this);
         }
-        stateMachine.addRoleListener(this);
         if (isReadyLeader()) {
             onLeaderReady();
         }

@@ -247,7 +247,8 @@ public final class RaftCommandCodec {
      * Encodes one command result onto the wire.
      *
      * @throws IllegalArgumentException when a string field (a result or list-entry path) carries
-     *     an unpaired surrogate, which UTF-8 cannot represent losslessly
+     *     an unpaired surrogate, which UTF-8 cannot represent losslessly, or a MULTI_FAILED
+     *     result lacks its failIndex (>= 0) or failStatus - a payload the decoder would reject
      */
     public static byte[] encodeResult(RaftResult result) {
         final Encoder out = new Encoder();
@@ -342,6 +343,12 @@ public final class RaftCommandCodec {
     private static void writeErrorPayload(Encoder out, RaftResult result) {
         switch (result.getStatus()) {
             case MULTI_FAILED:
+                if (result.getFailIndex() < 0 || result.getFailStatus() == null) {
+                    throw new IllegalArgumentException(
+                            "Cannot encode a MULTI_FAILED result: failIndex and failStatus are"
+                                    + " required, got " + result.getFailIndex()
+                                    + " and " + result.getFailStatus());
+                }
                 out.writeVarlong(result.getFailIndex());
                 out.writeByte(result.getFailStatus().code());
                 break;

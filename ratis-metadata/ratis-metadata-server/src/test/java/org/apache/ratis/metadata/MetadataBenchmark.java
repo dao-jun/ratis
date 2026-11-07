@@ -42,8 +42,9 @@ import java.util.concurrent.atomic.AtomicReference;
  * the production {@link RaftMetadataClient} addressing every member (so killing the leader is
  * carried by the client's retries, exactly as production would).
  *
- * <p>Scenarios: sequential write at three payload sizes, sequential read (served by the leader's
- * state machine, i.e. ratis' DEFAULT read option - leader-local, not through the log),
+ * <p>Scenarios: sequential write at three payload sizes, sequential read (linearizable, the
+ * production servers' configured read option - ratis' read-index protocol, not a leader-local
+ * state-machine read),
  * full-prefix list over 1000 children, pipelined write at fixed in-flight windows, and - raft-3
  * only - leader failover under a write stream. Every scenario runs a warmup segment that is
  * discarded. The pipelined scenario's per-op latency is observed at poll time, so an op that

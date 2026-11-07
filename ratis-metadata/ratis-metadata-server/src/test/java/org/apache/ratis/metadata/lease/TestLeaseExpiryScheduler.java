@@ -51,6 +51,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.apache.ratis.metadata.util.TestWait.waitUntil;
 
@@ -234,6 +235,61 @@ public class TestLeaseExpiryScheduler {
                     () -> member.scheduler.proposalsSubmitted() >= 1,
                     TIMEOUT,
                     "No expiry was proposed after the unexpected scan failure");
+        }
+    }
+
+    /**
+     * The deposed stop ends the loop but leaves the observed reference pointing at the dead
+     * loop; the next term's leader-ready must REPLACE that reference - not trust a non-null
+     * observation as a running loop - or the member would lead with no expiry at all. The
+     * never-started member's leadership probe answers not-leader, so the deposed stop here is
+     * the probe-true half of the stop guard's semantics.
+     */
+    @Test
+    void testLeaderReadyAfterADeposedStopReplacesTheDeadLoop() throws Exception {
+        try (StandaloneMember member = new StandaloneMember(tempDir)) {
+            member.scheduler.onLeaderReady();
+            waitUntil(
+                    () -> member.scheduler.scansCompleted() >= 1,
+                    TIMEOUT,
+                    "The scan loop never completed a scan");
+
+            member.scheduler.onNotLeader();
+            assertFalse(
+                    member.scheduler.isScanLoopRunning(),
+                    "the deposed stop ended the loop");
+
+            member.scheduler.onLeaderReady();
+            waitUntil(
+                    () -> member.scheduler.scansCompleted() >= 2,
+                    TIMEOUT,
+                    "the new term's loop never ran - the dead loop was trusted, not replaced");
+            assertTrue(member.scheduler.isScanLoopRunning(), "the replacement loop runs");
+        }
+    }
+
+    /**
+     * A leader-ready arriving while the term's loop still lives (a re-election whose deposed
+     * event the member has not observed) replaces the live loop too: the new term is served by
+     * exactly one loop and the stale one drains on its stop flag.
+     */
+    @Test
+    void testLeaderReadyDuringALiveLoopReplacesItWithExactlyOne() throws Exception {
+        try (StandaloneMember member = new StandaloneMember(tempDir)) {
+            member.scheduler.onLeaderReady();
+            waitUntil(
+                    () -> member.scheduler.scansCompleted() >= 1,
+                    TIMEOUT,
+                    "The scan loop never completed a scan");
+
+            member.scheduler.onLeaderReady(); // the re-election, before any deposed event lands
+
+            assertTrue(member.scheduler.isScanLoopRunning(), "the new term is served");
+            final long atReplacement = member.scheduler.scansCompleted();
+            waitUntil(
+                    () -> member.scheduler.scansCompleted() >= atReplacement + 2,
+                    TIMEOUT,
+                    "the replacement loop never kept scanning");
         }
     }
 }
