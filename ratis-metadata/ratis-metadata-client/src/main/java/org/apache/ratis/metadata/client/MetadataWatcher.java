@@ -112,6 +112,21 @@ public final class MetadataWatcher implements AutoCloseable {
     /** Last-wins restart checkpoint recorded while {@link #needSnapshotReportOutstanding}. */
     private Long pendingRestartRevision;
 
+    /**
+     * Consecutive deliveries where nothing flowed - the listener died on the batch's first
+     * record every time. Pace alone bounds the cost; at {@link #DELIVERY_STALL_LIMIT} the
+     * chain escalates into its recorded failure instead of re-delivering the identical batch
+     * forever.
+     */
+    private int stalledDeliveries;
+
+    /**
+     * How many consecutive stalled deliveries escalate into the recorded failure: the listener
+     * cannot consume the batch's first record at all, so every later delivery is the same
+     * attempt - one spare covers a transient, the third is a verdict.
+     */
+    private static final int DELIVERY_STALL_LIMIT = 3;
+
     private MetadataWatcher(RaftMetadataClient client, Listener listener, Executor executor, long pollIntervalMs,
             long maxPollBytes, long sinceRevision) {
         this.client = client;
@@ -185,11 +200,20 @@ public final class MetadataWatcher implements AutoCloseable {
         }
     }
 
-    /** Starts the poll chain; at most one chain runs per watcher. */
+    /**
+     * Starts the poll chain; at most one chain runs per watcher. While a NEED_SNAPSHOT report
+     * is still outstanding (queued or running) the start is recorded instead - the chain leaves
+     * from the stopped checkpoint once the report completed, so no delivery ever overlaps the
+     * report callback.
+     */
     public void start() {
         synchronized (gate) {
             checkState(!closed, "MetadataWatcher is closed");
             checkState(!running, "MetadataWatcher is already running");
+            if (needSnapshotReportOutstanding) {
+                pendingRestartRevision = checkpoint;
+                return;
+            }
             startChainLocked(checkpoint);
         }
     }
@@ -269,6 +293,7 @@ public final class MetadataWatcher implements AutoCloseable {
         lastDeliveredRevision = sinceRevision;
         running = true;
         failure = null;
+        stalledDeliveries = 0;
         scheduleNextLocked(0);
     }
 
@@ -374,7 +399,10 @@ public final class MetadataWatcher implements AutoCloseable {
      * single-flight even on a multithreaded executor. The completion carries the highest
      * revision the listener completed: a record whose {@code onRecord} threw an Error never
      * counts, so the chain resumes from it instead of claiming the undelivered tail - a
-     * per-record Exception keeps the log-and-continue policy and still counts.
+     * per-record Exception keeps the log-and-continue policy and still counts. The first
+     * Error is also handed to the completion as the stall escalation's cause; the rethrow
+     * leaves where the Error surfaces (the executor's placement, the pool's containment)
+     * exactly where it was.
      */
     private void deliver(final RaftMetadataClient.PollResult polled) {
         final List<ChangeEvent> records = polled.getRecords();
@@ -384,6 +412,7 @@ public final class MetadataWatcher implements AutoCloseable {
             resumeFrom = checkpoint;
         }
         final long[] completedThrough = {resumeFrom};
+        final Throwable[] death = {null};
         runUnit(() -> {
             for (ChangeEvent event : records) {
                 try {
@@ -393,22 +422,41 @@ public final class MetadataWatcher implements AutoCloseable {
                             "Change listener failed on revision {}; continuing",
                             event.getRevision(),
                             e);
+                } catch (Throwable t) {
+                    // The stall escalation's cause; the rethrow hands the Error to wherever
+                    // the executor contract puts it.
+                    death[0] = t;
+                    throw t;
                 }
                 // Reached on a normal return and on a logged-and-continued Exception;
                 // an Error skips it, freezing the count at the last completed record.
                 completedThrough[0] = event.getRevision();
             }
-        }, () -> completeDelivery(completedThrough[0]), "delivery of revision " + lastRecordRevision);
+        }, () -> completeDelivery(completedThrough[0], death[0]),
+                "delivery of revision " + lastRecordRevision);
     }
 
-    /** The delivery unit completed: the watermark moves to what was actually delivered. */
-    private void completeDelivery(final long completedThrough) {
+    /**
+     * The delivery unit completed: the watermark moves to what was actually delivered. A
+     * stalled delivery (nothing flowed - the listener died on the first record) escalates at
+     * {@link #DELIVERY_STALL_LIMIT} consecutive stalls into the recorded failure; an advancing
+     * delivery resets the count.
+     */
+    private void completeDelivery(final long completedThrough, final Throwable death) {
         synchronized (gate) {
             // Single-flight pins lastDeliveredRevision at the batch's resume point here, so an
             // unchanged value means nothing flowed - the listener died on the first record.
             final boolean advanced = completedThrough != lastDeliveredRevision;
             lastDeliveredRevision = completedThrough;
             checkpoint = completedThrough;
+            if (!advanced && ++stalledDeliveries >= DELIVERY_STALL_LIMIT) {
+                stopAfterFailure(death, "the change listener stalled " + stalledDeliveries
+                        + " deliveries in a row");
+                return;
+            }
+            if (advanced) {
+                stalledDeliveries = 0;
+            }
             // Records flowed: the next poll leaves immediately, keeping up with a busy stream.
             // Nothing flowed: re-polling the identical batch immediately would hammer the raft
             // group and the failing listener round-trip fast - pace at the configured interval.
@@ -418,9 +466,9 @@ public final class MetadataWatcher implements AutoCloseable {
 
     /**
      * The retention line: the chain stops and the report goes through the same admission gate
-     * as a record batch. Restart requests arriving while the report is outstanding are recorded
-     * (last wins); the completed report starts the one new chain from the last accepted
-     * checkpoint, or leaves the chain stopped when none was requested.
+     * as a record batch. Restart requests - and starts - arriving while the report is
+     * outstanding are recorded (last wins); the completed report starts the one new chain from
+     * the last accepted checkpoint, or leaves the chain stopped when none was requested.
      */
     private void stopAfterNeedSnapshot(final long oldestRetainedRevision) {
         final long stoppedAt;
@@ -445,7 +493,11 @@ public final class MetadataWatcher implements AutoCloseable {
                 stoppedAt, oldestRetainedRevision);
     }
 
-    /** The report completed: start the last accepted restart, or stay stopped. */
+    /**
+     * The report completed: start the last accepted restart - a restartFrom, or a start
+     * recorded at the stopped checkpoint - or stay stopped. No chain can be running here: a
+     * report outstanding means the chain is stopped, and every entry point defers while it is.
+     */
     private void completeNeedSnapshotReport() {
         synchronized (gate) {
             needSnapshotReportOutstanding = false;
@@ -455,8 +507,7 @@ public final class MetadataWatcher implements AutoCloseable {
             }
             final Long restart = pendingRestartRevision;
             pendingRestartRevision = null;
-            // A chain started manually while the report ran outranks the recorded request.
-            if (restart != null && !running) {
+            if (restart != null) {
                 LOG.info("Metadata watcher resuming from revision {} after NEED_SNAPSHOT", restart);
                 startChainLocked(restart);
             }

@@ -1257,6 +1257,67 @@ public class TestRaftMetadataClient {
         }
     }
 
+    /**
+     * A start() requested while the NEED_SNAPSHOT report is still outstanding defers like a
+     * restart: no chain may leave before the report's callback returned, or its record
+     * deliveries would overlap the report callback on the multithreaded delivery pool. The
+     * completed report starts the one new chain from the stopped checkpoint.
+     */
+    @Test
+    void testAStartWhileTheNeedSnapshotReportIsOutstandingDefersUntilItCompleted() throws Exception {
+        final GatedPollRpc rpc = new GatedPollRpc();
+        final RaftMetadataClient client = newStubClient(rpc, null);
+        try {
+            final QueueingExecutor executor = new QueueingExecutor();
+            final Recorder recorder = new Recorder();
+            final MetadataWatcher watcher =
+                    MetadataWatcher.newBuilder(client, recorder)
+                            .setExecutor(executor)
+                            .setSinceRevision(0)
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcher.start();
+            waitUntil(
+                    rpc::hasInFlightPoll,
+                    OPERATION_TIMEOUT,
+                    "The watcher never issued its first poll");
+            rpc.answerNeedSnapshot(5L);
+            waitUntil(
+                    () -> executor.submitted.size() == 1,
+                    OPERATION_TIMEOUT,
+                    "The watcher never queued its NEED_SNAPSHOT report");
+            assertFalse(
+                    watcher.isRunning(), "the chain is stopped while the report is outstanding");
+
+            watcher.start(); // deferred, not started: the report callback still owns the pool
+            assertFalse(
+                    watcher.isRunning(),
+                    "the start stays pending until the report completed");
+            assertNeverTripped(
+                    rpc.anotherPollArrived,
+                    NEGATIVE_WINDOW,
+                    "the pending start must not poll before the report completed");
+
+            executor.submitted.poll().run(); // the report finally runs
+            waitUntil(
+                    () -> rpc.pollCount() == 2 && rpc.hasInFlightPoll(),
+                    OPERATION_TIMEOUT,
+                    "The completed report never started the deferred chain");
+            assertEquals(
+                    0L,
+                    rpc.sinceRevisionOf(2),
+                    "the deferred chain leaves from the stopped checkpoint");
+
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> watcher.start(),
+                    "a start against a polling chain keeps its rejection");
+            watcher.close();
+        } finally {
+            client.close();
+        }
+    }
+
     /** A report that completes with no restart request leaves the chain stopped. */
     @Test
     void testNeedSnapshotReportWithoutRestartLeavesTheChainStopped() throws Exception {
@@ -1430,6 +1491,72 @@ public class TestRaftMetadataClient {
                     revisionsOf(delivered),
                     "the redelivery hands over both records exactly once");
             assertEquals(2L, watcher.lastDeliveredRevision());
+            watcher.close();
+        } finally {
+            client.close();
+        }
+    }
+
+    /**
+     * A listener dying on the first record of EVERY batch is a poison pace alone cannot
+     * outlive: the chain would re-deliver the identical batch forever at poll pace, running
+     * but never advancing, with no failure surface. Three consecutive stalled deliveries
+     * escalate into the recorded failure - the chain stops and the listener's Error becomes
+     * observable.
+     */
+    @Test
+    void testAListenerDyingOnEveryRecordEscalatesToTheRecordedFailure() throws Exception {
+        final GatedPollRpc rpc = new GatedPollRpc();
+        final RaftMetadataClient client = newStubClient(rpc, null);
+        try {
+            final QueueingExecutor executor = new QueueingExecutor();
+            final UnknownError poison = new UnknownError("listener dies on every record");
+            final MetadataWatcher watcher =
+                    MetadataWatcher.newBuilder(
+                                    client,
+                                    new MetadataWatcher.Listener() {
+                                        @Override
+                                        public void onRecord(ChangeEvent event) {
+                                            throw poison;
+                                        }
+
+                                        @Override
+                                        public void onNeedSnapshot(
+                                                long oldestRetainedRevision) {}
+                                    })
+                            .setExecutor(executor)
+                            .setSinceRevision(0)
+                            .setPollInterval(Duration.ofMillis(50))
+                            .build();
+            watcher.start();
+            waitUntil(
+                    rpc::hasInFlightPoll,
+                    OPERATION_TIMEOUT,
+                    "The watcher never issued its first poll");
+            for (int stall = 0; stall < 3; stall++) {
+                waitUntil(
+                        rpc::hasInFlightPoll,
+                        OPERATION_TIMEOUT,
+                        "stalled delivery " + (stall + 1) + " never re-polled the batch");
+                rpc.answerRecords(3L, 1L, 3L); // the identical batch, every time
+                waitUntil(
+                        () -> executor.submitted.size() == 1,
+                        OPERATION_TIMEOUT,
+                        "stalled delivery " + (stall + 1) + " never queued");
+                try {
+                    executor.submitted.poll().run();
+                } catch (UnknownError expected) {
+                    // where the drained unit puts it - the escalation records it too
+                }
+            }
+            assertFalse(watcher.isRunning(), "the stalled chain must escalate, not pace forever");
+            assertSame(poison, watcher.getFailure(), "the escalation carries the listener's Error");
+            final int pollsAtTheStop = rpc.pollCount();
+            Thread.sleep(NEGATIVE_WINDOW.toMillis());
+            assertEquals(
+                    pollsAtTheStop,
+                    rpc.pollCount(),
+                    "an escalated chain polls no more");
             watcher.close();
         } finally {
             client.close();
@@ -2012,6 +2139,62 @@ public class TestRaftMetadataClient {
                 "the replaced client closed on "
                         + rpc.closeThreads.get(0)
                         + ", not the closer thread");
+    }
+
+    /**
+     * What the grace-period close does to a mutation still in flight on the replaced client:
+     * ratis answers the cut with a bare AlreadyClosedException (the sync io() loop rethrows it
+     * straight, the async window's close-time teardown fails the request with it) - no budget
+     * failure underneath, unlike the poison cascade. The request may already sit applied in the
+     * raft log, so the cut must answer the unknown-outcome family; the safe-to-retry family is
+     * reserved for failures of a client the user's own close cut.
+     */
+    @Test
+    void testTheGracePeriodCutOfAReplacedClientAnswersUnknownOutcome() throws Exception {
+        final ScriptedReplyRpc rpc = new ScriptedReplyRpc();
+        final AtomicInteger builds = new AtomicInteger();
+        final RaftMetadataClient client =
+                newRecoverableStubClient(
+                        rpc, singleAttemptPolicy(), 150L, SystemClock.getInstance(), builds);
+        final RaftClient first = raftClientOf(client);
+
+        // A mutation in flight on the soon-to-be-replaced client. The warm-up reply unlocks
+        // the ordered window (ratis delays every send behind an un-replied first), so the
+        // withheld create is actually issued and parks on its rpc future, past the swap and
+        // past the close - the window's fail sweep starts at the poison pair's seqNum and
+        // never touches it.
+        client.putAsync("/warm", bytes("x")).join();
+        rpc.holdCreatePath = "/in-flight";
+        final CompletableFuture<String> held = client.createAsync("/in-flight", bytes("x"));
+
+        rpc.failAll = true;
+        awaitFailureOf(
+                client.putAsync("/poison/0", bytes("x")), "The poisoning put never settled");
+        awaitFailureOf(
+                client.putAsync("/poison/1", bytes("x")),
+                "The poison-detecting put never settled"); // the rebuild trigger
+        waitUntil(
+                () -> raftClientOf(client) != first && builds.get() == 2,
+                Duration.ofSeconds(5),
+                "The poisoned pipeline was never rebuilt exactly once");
+        waitUntil(
+                () -> !rpc.closeThreads.isEmpty(),
+                Duration.ofSeconds(5),
+                "The replaced client was never closed after the grace period");
+
+        // The transport reports the withheld reply's failure on the now-closed client - the
+        // same cut a channel death delivers in production. failAll still on, so the withheld
+        // reply settles as a transport failure and walks ratis' closed-client path.
+        rpc.completeHeld();
+
+        final Throwable failure = awaitFailureOf(held, "The in-flight create never settled");
+        assertEquals(
+                PossiblyCommittedException.class,
+                failure.getClass(),
+                "the grace-period cut must answer unknown outcome, not " + failure);
+        assertTrue(
+                causedBy(failure, AlreadyClosedException.class),
+                "the cut is close-shaped: " + failure);
     }
 
     // ------------------------------------------------------------------

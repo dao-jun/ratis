@@ -1011,13 +1011,15 @@ public final class RaftMetadataClient implements AutoCloseable {
         // client was built with; the user thread accepted a blocking close here, as ever.
         closeQuietly(raftClient.get());
         // The renewals' own client goes too; its close blocks on the transport, but the user
-        // thread already accepted blocking on raftClient.close() just above.
+        // thread already accepted blocking on raftClient.close() just above. A renewals client
+        // riding the main pipeline (the null-factory wiring) is the reference's own client,
+        // already closed above - never closed twice.
         final RaftClient renewals;
         synchronized (sessionState) {
             renewals = renewalClient;
             renewalClient = null;
         }
-        if (renewals != null && renewals != raftClient) {
+        if (renewals != null && renewals != raftClient.get()) {
             closeQuietly(renewals);
         }
         renewalCloser.shutdown();
@@ -1101,12 +1103,14 @@ public final class RaftMetadataClient implements AutoCloseable {
         // The local capture keeps an in-flight sync attempt on the client it started with, so a
         // concurrent pipeline recovery cannot cut its retry budget short: the io() surface never
         // touches the poisoned window, and the replaced client stays open through the grace.
+        // The grace-period close landing on it afterwards settles as unknown outcome in
+        // translate(), never as the safe-to-retry family.
         final RaftClient client = raftClient.get();
         final RaftClientReply reply;
         try {
             reply = readOnly ? client.io().sendReadOnly(message) : client.io().send(message);
         } catch (IOException e) {
-            throw translate(e, command, !readOnly);
+            throw translate(e, command, !readOnly, client);
         }
         return toResult(reply, command);
     }
@@ -1139,7 +1143,8 @@ public final class RaftMetadataClient implements AutoCloseable {
      * still fails to its caller. Ordering holds within one pipeline: a call issued before a
      * replacement is not ordered against one issued after it (see {@link #revokeLeaseAsync}).
      * The sync surface never touches the window; an attempt in flight on a replaced client
-     * keeps its per-attempt lifetime through the quiet period.
+     * keeps its per-attempt lifetime through the quiet period - the grace-period close past
+     * it settles the attempt as unknown outcome, never as safe-to-retry.
      */
     private CompletableFuture<RaftResult> sendAsync(RaftClient target, RaftCommand command, boolean readOnly,
                                                     String what) {
@@ -1207,9 +1212,11 @@ public final class RaftMetadataClient implements AutoCloseable {
      * Issues one send on the sender thread: {@code target.async()} may park here in ratis'
      * outstanding-request backpressure for as long as that pipeline stays wedged, which is
      * acceptable exactly because no other component runs on this thread. A send queued before
-     * close() settles the way the raft client answers it - a {@link MetadataTransportException}
-     * once the transport reports the close (ratis fails the window with {@link
-     * AlreadyClosedException}), or a real reply if the transport still answers; the closed flag
+     * close() settles the way the raft client answers it - the transport family once the
+     * transport reports the close (ratis fails the window with {@link
+     * AlreadyClosedException}; on the current client, or unknown outcome for a mutation of an
+     * already-replaced one - see {@link #translate}), or a real reply if the transport still
+     * answers; the closed flag
      * is deliberately NOT checked here, so the semantics match an in-flight send racing close().
      * Any failure settles {@code done}; the future must settle even on Errors - and the sender
      * thread must survive.
@@ -1220,7 +1227,7 @@ public final class RaftMetadataClient implements AutoCloseable {
             reply = task.readOnly ? task.target.async().sendReadOnly(task.message)
                     : task.target.async().send(task.message);
         } catch (Throwable rejected) {
-            task.done.completeExceptionally(translate(rejected, task.command, !task.readOnly));
+            task.done.completeExceptionally(translate(rejected, task.command, !task.readOnly, task.target));
             return;
         }
         reply.whenComplete((received, failure) -> {
@@ -1231,7 +1238,8 @@ public final class RaftMetadataClient implements AutoCloseable {
                     // failure warranted one - already happened, so the next
                     // send lands on the healed pipeline.
                     recoverPipelineIfPoisoned(failure, task.target);
-                    task.done.completeExceptionally(translate(failure, task.command, !task.readOnly));
+                    task.done.completeExceptionally(
+                            translate(failure, task.command, !task.readOnly, task.target));
                     return;
                 }
                 try {
@@ -1397,13 +1405,15 @@ public final class RaftMetadataClient implements AutoCloseable {
 
     /**
      * Surfaces a transport-level failure of both {@link #send} and {@link #sendAsync}: a mutation
-     * abandoned with its outcome unknown - its own budget exhausted, or the exhaustion cascade
-     * through the ordered pipeline - answers {@link PossiblyCommittedException}; everything else
+     * abandoned with its outcome unknown - its own budget exhausted, the exhaustion cascade
+     * through the ordered pipeline, or the grace-period close cutting its attempt on an
+     * already-replaced client - answers {@link PossiblyCommittedException}; everything else
      * stays the transport failure it was.
      */
-    private static RuntimeException translate(Throwable failure, RaftCommand command, boolean mutation) {
+    private RuntimeException translate(Throwable failure, RaftCommand command, boolean mutation,
+            RaftClient sentTo) {
         final Throwable cause = ExceptionUtils.stripCompletionException(failure);
-        if (mutation && outcomeUnknown(cause)) {
+        if (mutation && (outcomeUnknown(cause) || abandonedByReplacement(cause, sentTo))) {
             return new PossiblyCommittedException(command.getOp(), cause);
         }
         if (cause instanceof IOException) {
@@ -1423,12 +1433,26 @@ public final class RaftMetadataClient implements AutoCloseable {
      * head with the raw {@link RaftRetryFailureException} and its outstanding siblings with
      * that failure wrapped - sent or merely queued alike, hence the safe-side match). A
      * close-time teardown carries {@code AlreadyClosedException} without the budget failure
-     * underneath and stays plain.
+     * underneath and stays plain when it cut the current client; the replaced-client case is
+     * {@link #abandonedByReplacement} instead.
      */
     private static boolean outcomeUnknown(Throwable cause) {
         return cause instanceof RaftRetryFailureException
                 || ExceptionUtils.stripException(cause, AlreadyClosedException.class)
                 instanceof RaftRetryFailureException;
+    }
+
+    /**
+     * Whether a close-shaped failure cut a send whose raft client a pipeline recovery already
+     * replaced: the quiet-period close is the only actor that ever closes a replaced client,
+     * and its cut may land after the request reached the leader - the outcome is unknown, so
+     * it must not wear the safe-to-retry family. The user's own close cuts the current client
+     * (the reference matches, no replacement stands between the attempt and the close) and
+     * keeps the plain transport family.
+     */
+    private boolean abandonedByReplacement(Throwable cause, RaftClient sentTo) {
+        return sentTo != null && sentTo != raftClient.get()
+                && ExceptionUtils.causedBy(cause, AlreadyClosedException.class);
     }
 
     /** Maps a non-OK status to the exception family; OK passes through. */
