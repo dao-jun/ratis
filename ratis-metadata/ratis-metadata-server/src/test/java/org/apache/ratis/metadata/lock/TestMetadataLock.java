@@ -130,6 +130,42 @@ public class TestMetadataLock {
         taker.release();
     }
 
+    /**
+     * An external recursive delete removes the held record outside the lock protocol: the
+     * change stream carries one {@code DELETE_SUBTREE} event at the deleted root and no
+     * per-victim {@code DELETE}. The parked contender must wake on that event itself, not wait
+     * out a watchdog tick: its 30s ttl stretches the tick to 10s while the wake rides the
+     * 200ms poll, so a 3s bound separates the two. The fencing counter survives the subtree
+     * delete, so the woken contender still takes a higher token.
+     */
+    @Test
+    void testWaiterWakesOnAnExternalSubtreeDeleteCoveringThePath() throws Exception {
+        final MetadataLock.Hold holder = newLock(holderClient, "/locks/d").acquire();
+        final MetadataLock slowTickContender =
+                MetadataLock.newBuilder()
+                        .setClient(contenderClient)
+                        .setPath("/locks/d")
+                        .setTtl(Duration.ofSeconds(30))
+                        .build();
+        final long revisionAtIssue = adminRevisionOf(cluster);
+        final CompletableFuture<MetadataLock.Hold> pending = slowTickContender.acquireAsync();
+        // Parked provably: the contender's lease registration and its rejected create both
+        // appended entries beyond the revision it took as its watch position.
+        waitUntil(
+                () -> adminRevisionOf(cluster) >= revisionAtIssue + 2,
+                SETTLE,
+                "The contender never parked on the held record");
+        assertFalse(pending.isDone(), "the contender waits while the record exists");
+
+        // The recursive delete lands exactly on the lock path: the record dies with the
+        // subtree event at the root, the parent chain and the fencing counter survive.
+        adminDelete("/locks/d", true);
+
+        final MetadataLock.Hold taker = pending.get(3, TimeUnit.SECONDS);
+        assertTrue(taker.getToken() > holder.getToken(), "the woken contender takes a higher token");
+        taker.release();
+    }
+
     /** A bounded acquire times out cleanly while the lock is held, and the path stays acquirable. */
     @Test
     void testAcquireTimesOutWhileTheLockIsHeld() throws Exception {
@@ -539,6 +575,24 @@ public class TestMetadataLock {
             }
         }
         return false;
+    }
+
+    /**
+     * Delete through the admin client - an external actor bypassing the lock protocol; with
+     * {@code recursive} the whole subtree goes and the change stream reports one
+     * {@code DELETE_SUBTREE} change at the root.
+     */
+    private void adminDelete(String path, boolean recursive) throws Exception {
+        final RaftCommand delete = RaftCommand.delete(path, recursive);
+        final RaftClientReply reply =
+                cluster.adminClient()
+                        .io()
+                        .send(
+                                Message.valueOf(
+                                        ByteBuffer.wrap(RaftCommandCodec.encodeCommand(delete))));
+        final RaftResult result =
+                RaftCommandCodec.decodeResult(reply.getMessage().getContent().toByteArray());
+        assertEquals(RaftResult.Status.OK, result.getStatus());
     }
 
     /**

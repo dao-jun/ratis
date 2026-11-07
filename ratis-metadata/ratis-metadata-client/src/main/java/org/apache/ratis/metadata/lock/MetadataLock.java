@@ -47,8 +47,10 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  * <p>Acquire, in order: the parent chain is materialized once; the current revision is taken as
  * the watch position (so no release can slip between the failed attempt and the watch); then the
  * contender loops - open a lease, create the lock record bound to it, and on {@code NODE_EXISTS}
- * wait for the record's {@code DELETE} change (a watchdog tick re-attempts regardless, so a
- * missed event can never wedge a waiter). A contender whose own lease expired underneath
+ * wait for the record's {@code DELETE} change, or a {@code DELETE_SUBTREE} change whose deleted
+ * root covers the path - an external recursive delete removes the record without any
+ * per-victim event (a watchdog tick re-attempts regardless, so a missed event can never wedge
+ * a waiter). A contender whose own lease expired underneath
  * ({@code UNKNOWN_LEASE} from the create) reopens one and keeps waiting. Releasing - and every
  * acquire-failure unwind - stops the contender's renewals and revokes its private lease: the
  * server's lease-checked expiry cascade deletes the lock record for a prompt handover, and only
@@ -66,15 +68,19 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  *
  * <p>The lock is neither reentrant nor fair: all waiters wake on every release and one create
  * wins. One acquire per {@link MetadataLock} instance; the record at the path and the counter of
- * the same name belong to the lock exclusively. {@link #acquireAsync()} never throws and never
- * blocks - the acquire is an event-driven state machine on the client's asynchronous calls, and
+ * the same name belong to the lock exclusively. {@link #acquireAsync()} never blocks, and never
+ * throws for the first acquire on an open lock - the acquire is an event-driven state machine on
+ * the client's asynchronous calls, and
  * every failure lands in the future as {@link RaftMetadataException} (misconfiguration), a
  * {@code MetadataTransportException} (the request never went through; a mutation whose retry
  * budget ran out answers its subclass {@code PossiblyCommittedException} - reconcile by
  * reading state before re-acquiring; the acquire's unwind below is already ownership-safe
- * either way), or a {@link TimeoutException}. A path that cannot ride the UTF-8 wire (an
+ * either way), or a {@link TimeoutException}; a closed lock refuses through the future the same
+ * way. A path that cannot ride the UTF-8 wire (an
  * unpaired surrogate) is a programmer error and settles the future with {@code
- * IllegalArgumentException}, like the non-positive-timeout checkArgument.
+ * IllegalArgumentException}, like the non-positive-timeout checkArgument - while a second
+ * acquire on the same instance throws IllegalStateException synchronously, another programmer
+ * error on the caller's side of the future.
  */
 public final class MetadataLock implements AutoCloseable {
 
@@ -260,6 +266,16 @@ public final class MetadataLock implements AutoCloseable {
     }
 
     /**
+     * Whether the lock path lies in the subtree a recursive delete removed - the deleted root
+     * itself or any descendant. A recursive delete reports one {@code DELETE_SUBTREE} change at
+     * its root and enumerates no victims, so a waiter inside the subtree matches on prefix.
+     */
+    private static boolean inSubtree(String path, String deletedRoot) {
+        return path.equals(deletedRoot)
+                || path.startsWith(deletedRoot.endsWith("/") ? deletedRoot : deletedRoot + "/");
+    }
+
+    /**
      * Materializes the parent chain once, then fixes the watch position; {@code NODE_EXISTS}
      * just means the parent is already there.
      */
@@ -316,8 +332,10 @@ public final class MetadataLock implements AutoCloseable {
                             @Override
                             public void onRecord(ChangeEvent event) {
                                 for (ChangeEvent.Change change : event.getChanges()) {
-                                    if (change.getOp() == ChangeEvent.ChangeOp.DELETE
-                                            && path.equals(change.getPath())) {
+                                    if ((change.getOp() == ChangeEvent.ChangeOp.DELETE
+                                            && path.equals(change.getPath()))
+                                            || (change.getOp() == ChangeEvent.ChangeOp.DELETE_SUBTREE
+                                            && inSubtree(path, change.getPath()))) {
                                         onWake();
                                         return;
                                     }
