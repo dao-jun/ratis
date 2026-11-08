@@ -363,6 +363,8 @@ public final class MetadataCluster implements AutoCloseable {
                 }
             } catch (IOException serverBusy) {
                 // A server still starting or re-electing answers late, not never.
+            } catch (RuntimeException serverBusy) {
+                // A killed member's transport answers UNAVAILABLE mid-teardown - late, not never.
             }
         }
         return Optional.empty();

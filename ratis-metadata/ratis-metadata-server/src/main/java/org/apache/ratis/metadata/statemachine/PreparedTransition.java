@@ -16,6 +16,8 @@
  */
 package org.apache.ratis.metadata.statemachine;
 
+import java.util.Objects;
+
 /**
  * One staged, not-yet-committed transition. Row mutations accumulate in two
  * Java-side {@link MutationBuffer}s - business and maintenance - so a
@@ -38,7 +40,9 @@ final class PreparedTransition implements AutoCloseable {
     private final MutationBuffer business = new MutationBuffer();
     private final MutationBuffer maintenance = new MutationBuffer();
 
-    private StoreStats statsDelta = StoreStats.ZERO;
+    private StoreStats businessStats = StoreStats.ZERO;
+    private StoreStats maintenanceStats = StoreStats.ZERO;
+    private org.apache.ratis.metadata.proto.MetadataProtos.WriteReply reply;
     private long changeFloor = -1;
     private Phase phase = Phase.STAGED;
 
@@ -71,10 +75,44 @@ final class PreparedTransition implements AutoCloseable {
         return checkStaged(maintenance);
     }
 
-    /** Stages a stats delta applied to the persisted marker at commit time. */
+    /**
+     * Stages a business-side stats delta - dropped again by
+     * {@link #discardBusiness()} together with the business rows.
+     */
     void stageStatsDelta(StoreStats delta) {
         checkStaged(this);
-        statsDelta = statsDelta.plus(delta);
+        businessStats = businessStats.plus(delta);
+    }
+
+    /** Stages a maintenance-side stats delta; survives a business discard. */
+    void stageMaintenanceStatsDelta(StoreStats delta) {
+        checkStaged(this);
+        maintenanceStats = maintenanceStats.plus(delta);
+    }
+
+    /**
+     * Drops every business row and business stats charge - the deterministic
+     * business-failure path - while the maintenance work and the change floor
+     * stay staged for commit.
+     */
+    void discardBusiness() {
+        checkStaged(this);
+        business.clear();
+        businessStats = StoreStats.ZERO;
+    }
+
+    /**
+     * Stages the candidate reply. Publication waits for the commit, exactly
+     * like the rows and markers: the engine returns it only after
+     * {@link RocksMetadataStore#commit} succeeded.
+     */
+    void stageReply(org.apache.ratis.metadata.proto.MetadataProtos.WriteReply candidate) {
+        checkStaged(this);
+        if (reply != null) {
+            throw new MetadataStoreException(MetadataStoreException.Reason.LIFECYCLE,
+                    "the candidate reply is already staged");
+        }
+        this.reply = Objects.requireNonNull(candidate, "candidate");
     }
 
     /** Stages the new change floor; the commit keeps the maximum seen. */
@@ -94,7 +132,12 @@ final class PreparedTransition implements AutoCloseable {
     }
 
     StoreStats statsDelta() {
-        return statsDelta;
+        return businessStats.plus(maintenanceStats);
+    }
+
+    /** @return the staged candidate reply, or {@code null} until staged. */
+    org.apache.ratis.metadata.proto.MetadataProtos.WriteReply reply() {
+        return reply;
     }
 
     long changeFloor() {

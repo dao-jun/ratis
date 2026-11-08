@@ -55,7 +55,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Direct storage tests of invocation result selection and caller-owned atomic staging. */
-public class TestInvocationResultStore {
+public class TestLegacyResultStore {
 
     private static final UUID CLIENT_UUID =
             UUID.fromString("12345678-1234-4678-9234-567812345678");
@@ -76,7 +76,7 @@ public class TestInvocationResultStore {
     private RocksDB db;
     private ColumnFamilyHandle defaultHandle;
     private ColumnFamilyHandle resultsHandle;
-    private InvocationResultStore store;
+    private LegacyResultStore store;
 
     /**
      * The in-memory applied-revision marker production passes into the store, tracked here in
@@ -103,7 +103,7 @@ public class TestInvocationResultStore {
         db = RocksDB.open(dbOptions, tempDir.getAbsolutePath(), descriptors, handles);
         defaultHandle = handles.get(0);
         resultsHandle = handles.get(1);
-        store = new InvocationResultStore(db, defaultHandle, resultsHandle);
+        store = new LegacyResultStore(db, defaultHandle, resultsHandle);
     }
 
     @AfterEach
@@ -139,9 +139,9 @@ public class TestInvocationResultStore {
         final byte[] firstResult =
                 RaftCommandCodec.encodeResult(
                         RaftResult.ok(RaftCommand.Op.INCREMENT).counterValue(7L).revision(10L));
-        final InvocationResultStore.Disposition first =
+        final LegacyResultStore.Disposition first =
                 lookup(invocation, TermIndex.valueOf(1L, 10L), firstEnvelope);
-        assertEquals(InvocationResultStore.Disposition.Kind.EXECUTE, first.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.EXECUTE, first.getKind());
         assertEquals(900L, first.getEffectiveCutoff());
         assertEquals(1_000L, first.getRetentionTime());
 
@@ -159,9 +159,9 @@ public class TestInvocationResultStore {
 
         final MetadataLogEnvelope duplicateEnvelope =
                 envelope(RaftCommand.increment("first", 7L), 2_000L, 100L);
-        final InvocationResultStore.Disposition duplicate =
+        final LegacyResultStore.Disposition duplicate =
                 lookup(invocation, TermIndex.valueOf(1L, 11L), duplicateEnvelope);
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, duplicate.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, duplicate.getKind());
         assertArrayEquals(firstResult, duplicate.getEncodedResult());
         assertEquals(1_900L, duplicate.getEffectiveCutoff());
         assertEquals(2_000L, duplicate.getRetentionTime());
@@ -172,9 +172,9 @@ public class TestInvocationResultStore {
                 invocationKey(invocation), db.get(resultsHandle, timeKey(2_000L, invocation)));
         assertRecord(invocation, 1L, 10L, 1_000L, 2_000L, firstEnvelope, firstResult);
 
-        final InvocationResultStore.Disposition replay =
+        final LegacyResultStore.Disposition replay =
                 lookup(invocation, TermIndex.valueOf(1L, 10L), firstEnvelope);
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, replay.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, replay.getKind());
         assertArrayEquals(firstResult, replay.getEncodedResult());
     }
 
@@ -185,16 +185,16 @@ public class TestInvocationResultStore {
                 envelope(RaftCommand.put("/mismatch", bytes("first"), 0L, 1L), 1_000L, 100L);
         final byte[] originalResult =
                 RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.PUT).version(1L));
-        final InvocationResultStore.Disposition first =
+        final LegacyResultStore.Disposition first =
                 lookup(invocation, TermIndex.valueOf(1L, 5L), originalEnvelope);
         commit(first, originalResult, 5L);
 
         final MetadataLogEnvelope mismatchEnvelope =
                 envelope(RaftCommand.increment("different", 1L), 2_000L, 100L);
-        final InvocationResultStore.Disposition mismatch =
+        final LegacyResultStore.Disposition mismatch =
                 lookup(invocation, TermIndex.valueOf(1L, 6L), mismatchEnvelope);
         final RaftResult mismatchResult = decode(mismatch);
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, mismatch.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, mismatch.getKind());
         assertEquals(RaftResult.Status.INVOCATION_MISMATCH, mismatchResult.getStatus());
         assertEquals(RaftCommand.Op.INCREMENT, mismatchResult.getOp());
         commit(mismatch, null, 6L);
@@ -222,7 +222,7 @@ public class TestInvocationResultStore {
                 "a missing result at or above the persisted cutoff is corruption");
 
         final ClientInvocationId cutoffWriter = invocation(31L);
-        final InvocationResultStore.Disposition cutoff =
+        final LegacyResultStore.Disposition cutoff =
                 lookup(
                         cutoffWriter,
                         TermIndex.valueOf(1L, 11L),
@@ -231,25 +231,25 @@ public class TestInvocationResultStore {
                 cutoff,
                 RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)),
                 11L);
-        final InvocationResultStore.Disposition expired =
+        final LegacyResultStore.Disposition expired =
                 lookup(missing, TermIndex.valueOf(1L, 10L), oldEnvelope);
-        assertEquals(InvocationResultStore.Disposition.Kind.RESULT_EXPIRED, expired.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RESULT_EXPIRED, expired.getKind());
         assertEquals(RaftResult.Status.RESULT_EXPIRED, decode(expired).getStatus());
 
         final ClientInvocationId newerGeneration = invocation(32L);
         final MetadataLogEnvelope generationEnvelope =
                 envelope(RaftCommand.increment("generation", 1L), 3_000L, 100L);
-        final InvocationResultStore.Disposition first =
+        final LegacyResultStore.Disposition first =
                 lookup(newerGeneration, TermIndex.valueOf(2L, 30L), generationEnvelope);
         commit(
                 first,
                 RaftCommandCodec.encodeResult(
                         RaftResult.ok(RaftCommand.Op.INCREMENT).counterValue(99L)),
                 30L);
-        final InvocationResultStore.Disposition generationReplay =
+        final LegacyResultStore.Disposition generationReplay =
                 lookup(newerGeneration, TermIndex.valueOf(1L, 10L), generationEnvelope);
         assertEquals(
-                InvocationResultStore.Disposition.Kind.RESULT_EXPIRED,
+                LegacyResultStore.Disposition.Kind.RESULT_EXPIRED,
                 generationReplay.getKind());
         assertEquals(RaftResult.Status.RESULT_EXPIRED, decode(generationReplay).getStatus());
     }
@@ -259,7 +259,7 @@ public class TestInvocationResultStore {
         final ClientInvocationId invocation = invocation(40L);
         final MetadataLogEnvelope envelope =
                 envelope(RaftCommand.increment("index", 1L), 1_000L, 100L);
-        final InvocationResultStore.Disposition first =
+        final LegacyResultStore.Disposition first =
                 lookup(invocation, TermIndex.valueOf(1L, 1L), envelope);
         commit(first, RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)), 1L);
         try (WriteBatch batch = new WriteBatch()) {
@@ -300,7 +300,7 @@ public class TestInvocationResultStore {
                 envelope(RaftCommand.increment("clock", 1L), 10_000L, 1_000L);
         final byte[] firstResult =
                 RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT));
-        final InvocationResultStore.Disposition first =
+        final LegacyResultStore.Disposition first =
                 lookup(invocation, TermIndex.valueOf(1L, 1L), firstEnvelope);
         commit(first, firstResult, 1L);
 
@@ -308,7 +308,7 @@ public class TestInvocationResultStore {
         // raw retention floor (9_000) sits below the committed record's retention (10_000): the
         // refresh must keep 10_000, or collection could delete the record while the original
         // entry at serverTime 10_000 still replays expecting an unexpired result.
-        final InvocationResultStore.Disposition duplicate =
+        final LegacyResultStore.Disposition duplicate =
                 lookup(
                         invocation,
                         TermIndex.valueOf(1L, 2L),
@@ -328,7 +328,7 @@ public class TestInvocationResultStore {
     void testMissingReplayAtPersistedCutoffIsNotExpired() throws Exception {
         setMarker(10L);
         final ClientInvocationId cutoffWriter = invocation(51L);
-        final InvocationResultStore.Disposition cutoff =
+        final LegacyResultStore.Disposition cutoff =
                 lookup(
                         cutoffWriter,
                         TermIndex.valueOf(1L, 11L),
@@ -364,12 +364,12 @@ public class TestInvocationResultStore {
 
         // A duplicate commits under a clock 500 ms behind: pre-fix it shaves the record's
         // retention from 10_000 down to max(9_500, 9_000) = 9_500; post-fix 10_000 survives.
-        final InvocationResultStore.Disposition duplicate =
+        final LegacyResultStore.Disposition duplicate =
                 lookup(
                         invocation,
                         TermIndex.valueOf(1L, 11L),
                         envelope(command, 9_500L, 1_000L));
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, duplicate.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, duplicate.getKind());
         commit(duplicate, null, 11L);
 
         // A later write lands the replicated cutoff inside the shaved window (9_500, 10_000].
@@ -388,10 +388,10 @@ public class TestInvocationResultStore {
         // Replaying the ORIGINAL entry (marker 12 >= 10) must still return the original result;
         // pre-fix the record was collected below the 9_700 cutoff and this lookup throws
         // "Missing unexpired invocation result" instead.
-        final InvocationResultStore.Disposition replay =
+        final LegacyResultStore.Disposition replay =
                 lookup(
                         invocation, TermIndex.valueOf(1L, 10L), envelope(command, 10_000L, 1_000L));
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, replay.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, replay.getKind());
         assertArrayEquals(original, replay.getEncodedResult());
 
         // Once the cutoff strictly passes the retained 10_000, collection is legitimate and the
@@ -408,7 +408,7 @@ public class TestInvocationResultStore {
                 13L);
         assertNull(db.get(resultsHandle, invocationKey(invocation)));
         assertEquals(
-                InvocationResultStore.Disposition.Kind.RESULT_EXPIRED,
+                LegacyResultStore.Disposition.Kind.RESULT_EXPIRED,
                 lookup(
                         invocation, TermIndex.valueOf(1L, 10L), envelope(command, 10_000L, 1_000L))
                         .getKind());
@@ -421,7 +421,7 @@ public class TestInvocationResultStore {
             final ClientInvocationId invocation = invocation(100L + i);
             final MetadataLogEnvelope envelope =
                     envelope(RaftCommand.increment("ordered-" + i, 1L), times[i], 10L);
-            final InvocationResultStore.Disposition first =
+            final LegacyResultStore.Disposition first =
                     lookup(invocation, TermIndex.valueOf(1L, i + 1L), envelope);
             commit(
                     first,
@@ -463,9 +463,9 @@ public class TestInvocationResultStore {
         // first result would have expired, so ordinary GC must not delete the refreshed record
         // in its own transition - only the sibling below the cutoff is collected.
         final MetadataLogEnvelope refreshEnvelope = envelope(command, 3_000L, 1_500L);
-        final InvocationResultStore.Disposition refresh =
+        final LegacyResultStore.Disposition refresh =
                 lookup(invocation, TermIndex.valueOf(1L, 7L), refreshEnvelope);
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, refresh.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, refresh.getKind());
         assertEquals(1_500L, refresh.getEffectiveCutoff());
         assertEquals(3_000L, refresh.getRetentionTime());
         assertArrayEquals(original, refresh.getEncodedResult());
@@ -506,12 +506,12 @@ public class TestInvocationResultStore {
                 RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.PUT).version(1L)),
                 9L);
 
-        final InvocationResultStore.Disposition mismatch =
+        final LegacyResultStore.Disposition mismatch =
                 lookup(
                         invocation,
                         TermIndex.valueOf(1L, 10L),
                         envelope(RaftCommand.increment("mismatch-other", 1L), 3_000L, 1_500L));
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, mismatch.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, mismatch.getKind());
         final RaftResult mismatchResult = decode(mismatch);
         assertEquals(RaftResult.Status.INVOCATION_MISMATCH, mismatchResult.getStatus());
         assertEquals(RaftCommand.Op.INCREMENT, mismatchResult.getOp());
@@ -659,12 +659,12 @@ public class TestInvocationResultStore {
 
         // A refresh while the clock is still behind the persisted cutoff: the old time key sits
         // exactly at the cutoff, so the refresh survives its own transition.
-        final InvocationResultStore.Disposition behindRefresh =
+        final LegacyResultStore.Disposition behindRefresh =
                 lookup(
                         behind,
                         TermIndex.valueOf(1L, 3L),
                         envelope(RaftCommand.put("/cb-behind", bytes("b"), 0, 1L), 8_700L, 100L));
-        assertEquals(InvocationResultStore.Disposition.Kind.RETURN_RESULT, behindRefresh.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.RETURN_RESULT, behindRefresh.getKind());
         assertArrayEquals(behindResult, behindRefresh.getEncodedResult());
         commit(behindRefresh, null, 3L);
         assertRecord(behind, 1L, 2L, 8_900L, 9_000L, behindEnvelope, behindResult);
@@ -766,16 +766,16 @@ public class TestInvocationResultStore {
         final MetadataLogEnvelope secondEnvelope = envelope(command, 2_500L, 100L);
         final byte[] secondResult =
                 RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.PUT).version(2L));
-        final InvocationResultStore.Disposition second =
+        final LegacyResultStore.Disposition second =
                 lookup(invocation, TermIndex.valueOf(1L, 62L), secondEnvelope);
-        assertEquals(InvocationResultStore.Disposition.Kind.EXECUTE, second.getKind());
+        assertEquals(LegacyResultStore.Disposition.Kind.EXECUTE, second.getKind());
         commit(second, secondResult, 62L);
         assertRecord(invocation, 1L, 62L, 2_500L, 2_500L, secondEnvelope, secondResult);
 
-        final InvocationResultStore.Disposition oldGenerationReplay =
+        final LegacyResultStore.Disposition oldGenerationReplay =
                 lookup(invocation, TermIndex.valueOf(1L, 60L), firstEnvelope);
         assertEquals(
-                InvocationResultStore.Disposition.Kind.RESULT_EXPIRED, oldGenerationReplay.getKind());
+                LegacyResultStore.Disposition.Kind.RESULT_EXPIRED, oldGenerationReplay.getKind());
         assertEquals(RaftResult.Status.RESULT_EXPIRED, decode(oldGenerationReplay).getStatus());
         commit(oldGenerationReplay, null, 63L);
         assertRecord(
@@ -863,7 +863,7 @@ public class TestInvocationResultStore {
     }
 
     private void commit(
-            InvocationResultStore.Disposition disposition, byte[] firstResult, long revision)
+            LegacyResultStore.Disposition disposition, byte[] firstResult, long revision)
             throws Exception {
         try (WriteBatch batch = new WriteBatch()) {
             store.stageRetention(batch, disposition);
@@ -882,7 +882,7 @@ public class TestInvocationResultStore {
         appliedRevision = revision;
     }
 
-    private InvocationResultStore.Disposition lookup(
+    private LegacyResultStore.Disposition lookup(
             ClientInvocationId invocation, TermIndex termIndex, MetadataLogEnvelope envelope)
             throws IOException, RocksDBException {
         return store.lookup(invocation, termIndex, envelope, appliedRevision);
@@ -936,7 +936,7 @@ public class TestInvocationResultStore {
         assertArrayEquals(originalResult, result);
     }
 
-    private static RaftResult decode(InvocationResultStore.Disposition disposition) {
+    private static RaftResult decode(LegacyResultStore.Disposition disposition) {
         final RaftResult result = RaftCommandCodec.decodeResult(disposition.getEncodedResult());
         assertTrue(result != null, "disposition result must decode");
         return result;
@@ -951,7 +951,7 @@ public class TestInvocationResultStore {
      */
     @Test
     void testCollectionIsBoundedPerApplyAndStillDrainsTheBacklog() throws Exception {
-        final int backlog = InvocationResultStore.MAX_COLLECTIONS_PER_APPLY + 2;
+        final int backlog = LegacyResultStore.MAX_COLLECTIONS_PER_APPLY + 2;
         final List<ClientInvocationId> expired = new ArrayList<>();
         for (int i = 0; i < backlog; i++) {
             final ClientInvocationId id = invocation(1_000L + i);

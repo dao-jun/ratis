@@ -106,7 +106,7 @@ public class MetadataStateMachine extends BaseStateMachine {
         STATE_CF, COUNTERS_CF, LEASES_CF, LEASE_PATHS_CF, CHANGES_CF, RESULTS_CF
     };
 
-    /** Default-family key for the applied revision; shared with {@link InvocationResultStore}. */
+    /** Default-family key for the applied revision; shared with {@link LegacyResultStore}. */
     static final byte[] APPLIED_REVISION_KEY = "applied-revision".getBytes(StandardCharsets.UTF_8);
 
     /** Default-family key holding the smallest revision whose change records are retained. */
@@ -157,7 +157,7 @@ public class MetadataStateMachine extends BaseStateMachine {
     /** Every column-family handle in open order; set by openDb. */
     private List<ColumnFamilyHandle> cfHandles;
     private WriteOptions writeOptions;
-    private InvocationResultStore resultStore;
+    private LegacyResultStore resultStore;
 
     /** Narrow test seam immediately before the sole valid-command {@code db.write} call. */
     @VisibleForTesting
@@ -575,7 +575,7 @@ public class MetadataStateMachine extends BaseStateMachine {
         // The raft log is the WAL; the RocksDB WAL buys nothing (batches survive process death at
         // memtable granularity, not power loss).
         writeOptions = new WriteOptions().setDisableWAL(true);
-        resultStore = new InvocationResultStore(db, defaultHandle, resultsHandle);
+        resultStore = new LegacyResultStore(db, defaultHandle, resultsHandle);
 
         try {
             final byte[] marker = db.get(defaultHandle, APPLIED_REVISION_KEY);
@@ -713,12 +713,12 @@ public class MetadataStateMachine extends BaseStateMachine {
             // Duplicate selection precedes every new term fence and all business validation.
             // The marker argument is the durable one: it is loaded on open and advanced in
             // lockstep with every write that persists it, on this same applier thread.
-            final InvocationResultStore.Disposition disposition =
+            final LegacyResultStore.Disposition disposition =
                     resultStore.lookup(invocation, termIndex, envelope, appliedRevisionMarker);
-            if (disposition.getKind() == InvocationResultStore.Disposition.Kind.RESULT_EXPIRED) {
+            if (disposition.getKind() == LegacyResultStore.Disposition.Kind.RESULT_EXPIRED) {
                 return disposition.getEncodedResult();
             }
-            if (disposition.getKind() == InvocationResultStore.Disposition.Kind.RETURN_RESULT) {
+            if (disposition.getKind() == LegacyResultStore.Disposition.Kind.RETURN_RESULT) {
                 final byte[] reply = disposition.getEncodedResult();
                 if (revision > appliedRevisionMarker) {
                     commitControl(disposition, reply, revision);
@@ -769,7 +769,7 @@ public class MetadataStateMachine extends BaseStateMachine {
     }
 
     /** Commits a result/cutoff/marker transition without any business writes or change event. */
-    private void commitControl(InvocationResultStore.Disposition disposition, byte[] reply, long revision)
+    private void commitControl(LegacyResultStore.Disposition disposition, byte[] reply, long revision)
             throws IOException, RocksDBException {
         try (WriteBatch control = new WriteBatch()) {
             commitCommandBatch(control, disposition, reply, revision);
@@ -777,7 +777,7 @@ public class MetadataStateMachine extends BaseStateMachine {
     }
 
     /** The sole commit point for a valid envelope at a new revision. */
-    private void commitCommandBatch(WriteBatch batch, InvocationResultStore.Disposition disposition, byte[] reply,
+    private void commitCommandBatch(WriteBatch batch, LegacyResultStore.Disposition disposition, byte[] reply,
                                     long revision) throws IOException, RocksDBException {
         resultStore.stageRetention(batch, disposition);
         resultStore.stageResult(batch, disposition, reply);
@@ -862,11 +862,11 @@ public class MetadataStateMachine extends BaseStateMachine {
         }
         final StateRecord record = StateRecord.decode(encoded);
         return RaftResult.ok(RaftCommand.Op.GET)
-                .version(record.version)
-                .leaseId(record.leaseId)
-                .createTime(record.createTime)
-                .modifyTime(record.modifyTime)
-                .data(record.data);
+                .version(record.version())
+                .leaseId(record.leaseId())
+                .createTime(record.createTime())
+                .modifyTime(record.modifyTime())
+                .data(record.data());
     }
 
     private RaftResult queryExists(RaftCommand command) throws RocksDBException {
@@ -1009,7 +1009,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                 }
                 final LeaseState state = LeaseState.decode(iterator.value());
                 result.addLease(new RaftResult.Lease(
-                        bytesToLong(iterator.key(), 0), state.ttlMs, state.expireAtMs, state.lastRenewIndex));
+                        bytesToLong(iterator.key(), 0), state.ttlMs(), state.expireAtMs(), state.lastRenewIndex()));
                 iterator.next();
             }
             iterator.status();
@@ -1306,19 +1306,19 @@ public class MetadataStateMachine extends BaseStateMachine {
             }
             if (compareAndSwap) {
                 final boolean matches = command.getExpectedVersion() == 0 ? existing == null
-                        : existing != null && existing.version == command.getExpectedVersion();
+                        : existing != null && existing.version() == command.getExpectedVersion();
                 if (!matches) {
                     return RaftResult.error(RaftCommand.Op.CAS, RaftResult.Status.VERSION_MISMATCH);
                 }
             }
             final StateRecord updated = existing == null
                     ? StateRecord.fresh(command.getLeaseId(), command.getTimestamp(), command.getData())
-                    : new StateRecord(existing.version + 1, command.getLeaseId(), existing.createTime,
+                    : new StateRecord(existing.version() + 1, command.getLeaseId(), existing.createTime(),
                     command.getTimestamp(), command.getData());
             putRecord(command.getPath(), existing, updated);
             addChange(existing == null ? ChangeEvent.ChangeOp.CREATE
                     : ChangeEvent.ChangeOp.UPDATE, command.getPath(), command.getData());
-            return RaftResult.ok(command.getOp()).version(updated.version);
+            return RaftResult.ok(command.getOp()).version(updated.version());
         }
 
         private RaftResult applyCreate(RaftCommand command) throws RocksDBException {
@@ -1434,8 +1434,8 @@ public class MetadataStateMachine extends BaseStateMachine {
             final StateRecord root = getRecord(path);
             batch.delete(stateHandle, pathKey(path));
             recordOverlay.put(path, RECORD_TOMBSTONE);
-            if (root != null && root.leaseId != 0) {
-                batch.delete(leasePathsHandle, leasePathsKey(root.leaseId, pathKey(path)));
+            if (root != null && root.leaseId() != 0) {
+                batch.delete(leasePathsHandle, leasePathsKey(root.leaseId(), pathKey(path)));
             }
             deleted++;
 
@@ -1446,8 +1446,8 @@ public class MetadataStateMachine extends BaseStateMachine {
                     // A staged record dies with the subtree too: release its reverse entry and
                     // tombstone it. Count it only when the committed scan could not have (no
                     // committed copy, or an earlier tombstone hid it); a refresh was counted.
-                    if (staged.getValue().leaseId != 0) {
-                        batch.delete(leasePathsHandle, leasePathsKey(staged.getValue().leaseId, staged.getKey()));
+                    if (staged.getValue().leaseId() != 0) {
+                        batch.delete(leasePathsHandle, leasePathsKey(staged.getValue().leaseId(), staged.getKey()));
                     }
                     if (isUnderSubtreeTombstone(staged.getKey())
                             || db.get(stateHandle, pathKey(staged.getKey())) == null) {
@@ -1534,7 +1534,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                 return leaseError; // UNKNOWN_LEASE: the contender's lease died
             }
             final StateRecord owner = getRecord(command.getPath());
-            return owner != null && owner.leaseId == command.getLeaseId() ? null : RaftResult.Status.STALE_LEASE;
+            return owner != null && owner.leaseId() == command.getLeaseId() ? null : RaftResult.Status.STALE_LEASE;
         }
 
         private RaftResult applyLeaseRegister(RaftCommand command) throws RocksDBException {
@@ -1559,7 +1559,7 @@ public class MetadataStateMachine extends BaseStateMachine {
             // while bumping lastRenewIndex. A renewal that does not extend the expiry changes
             // nothing - the expiry fence and any pending expiry proposal stay valid against the
             // unchanged state.
-            if (command.getExpireAtMs() <= lease.expireAtMs) {
+            if (command.getExpireAtMs() <= lease.expireAtMs()) {
                 return RaftResult.ok(RaftCommand.Op.LEASE_RENEW).revision(revision);
             }
             // Renewal carries the new TTL as well as the normalized absolute expiry.
@@ -1578,7 +1578,7 @@ public class MetadataStateMachine extends BaseStateMachine {
             }
             // Renew/expire race guard: a lease renewed after the expirer's view must not be killed.
             if (command.getExpectedLastRenewIndex() >= 0
-                    && lease.lastRenewIndex > command.getExpectedLastRenewIndex()) {
+                    && lease.lastRenewIndex() > command.getExpectedLastRenewIndex()) {
                 return RaftResult.ok(RaftCommand.Op.LEASE_EXPIRE).expired(false).deletedCount(0);
             }
             batch.delete(leasesHandle, longToBytes(command.getLeaseId()));
@@ -1618,7 +1618,7 @@ public class MetadataStateMachine extends BaseStateMachine {
             for (String path : victims) {
                 final StateRecord record = getRecord(path);
                 // A stale reverse entry must not delete the current record, though the entry goes.
-                if (record != null && record.leaseId == command.getLeaseId()) {
+                if (record != null && record.leaseId() == command.getLeaseId()) {
                     deleteRecord(path, record);
                     deleted++;
                 }
@@ -1675,14 +1675,14 @@ public class MetadataStateMachine extends BaseStateMachine {
         private void putRecord(String path, StateRecord previous, StateRecord updated) throws RocksDBException {
             batch.put(stateHandle, pathKey(path), updated.encode());
             recordOverlay.put(path, updated);
-            if (updated.leaseId != 0) {
-                final byte[] binding = leasePathsKey(updated.leaseId, pathKey(path));
+            if (updated.leaseId() != 0) {
+                final byte[] binding = leasePathsKey(updated.leaseId(), pathKey(path));
                 batch.put(leasePathsHandle, binding, new byte[0]);
                 leasePathsOverlay.put(ByteBuffer.wrap(binding), Boolean.TRUE);
             }
-            if (previous != null && previous.leaseId != 0 && previous.leaseId != updated.leaseId) {
+            if (previous != null && previous.leaseId() != 0 && previous.leaseId() != updated.leaseId()) {
                 // Re-binding releases the old reverse entry, else it grows the index forever.
-                final byte[] stale = leasePathsKey(previous.leaseId, pathKey(path));
+                final byte[] stale = leasePathsKey(previous.leaseId(), pathKey(path));
                 batch.delete(leasePathsHandle, stale);
                 leasePathsOverlay.put(ByteBuffer.wrap(stale), Boolean.FALSE);
             }
@@ -1691,8 +1691,8 @@ public class MetadataStateMachine extends BaseStateMachine {
         private void deleteRecord(String path, StateRecord record) throws RocksDBException {
             batch.delete(stateHandle, pathKey(path));
             recordOverlay.put(path, RECORD_TOMBSTONE);
-            if (record.leaseId != 0) {
-                final byte[] binding = leasePathsKey(record.leaseId, pathKey(path));
+            if (record.leaseId() != 0) {
+                final byte[] binding = leasePathsKey(record.leaseId(), pathKey(path));
                 batch.delete(leasePathsHandle, binding);
                 leasePathsOverlay.put(ByteBuffer.wrap(binding), Boolean.FALSE);
             }
@@ -1735,7 +1735,7 @@ public class MetadataStateMachine extends BaseStateMachine {
             if (parentRecord == null) {
                 return RaftResult.Status.NO_PARENT;
             }
-            return parentRecord.leaseId != 0 ? RaftResult.Status.NOT_ALLOWED : null;
+            return parentRecord.leaseId() != 0 ? RaftResult.Status.NOT_ALLOWED : null;
         }
 
         /** A non-zero {@code leaseId} must name a lease that exists right now, via the overlay. */
@@ -1755,7 +1755,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                 missing.add(current);
                 current = parentOf(current);
             }
-            if (terminal != null && terminal.leaseId != 0) {
+            if (terminal != null && terminal.leaseId() != 0) {
                 return RaftResult.Status.NOT_ALLOWED;
             }
             for (int i = missing.size() - 1; i >= 0; i--) {
@@ -1772,80 +1772,6 @@ public class MetadataStateMachine extends BaseStateMachine {
     }
 
     // --- Storage codecs and helpers ---
-
-    /** The record stored in the {@code state} CF; fixed-width header, data appended. */
-    private static final class StateRecord {
-        private static final int HEADER_LENGTH = 4 + 8 + 8 + 8;
-
-        private final int version;
-        private final long leaseId;
-        private final long createTime;
-        private final long modifyTime;
-        private final byte[] data;
-
-        StateRecord(int version, long leaseId, long createTime, long modifyTime, byte[] data) {
-            this.version = version;
-            this.leaseId = leaseId;
-            this.createTime = createTime;
-            this.modifyTime = modifyTime;
-            this.data = data;
-        }
-
-        byte[] encode() {
-            final byte[] encoded = new byte[HEADER_LENGTH + data.length];
-            putInt(encoded, 0, version);
-            putLong(encoded, 4, leaseId);
-            putLong(encoded, 12, createTime);
-            putLong(encoded, 20, modifyTime);
-            System.arraycopy(data, 0, encoded, HEADER_LENGTH, data.length);
-            return encoded;
-        }
-
-        /** A record at birth: version 1, lease-bound, one timestamp for create and modify. */
-        static StateRecord fresh(long leaseId, long timestamp, byte[] data) {
-            return new StateRecord(1, leaseId, timestamp, timestamp, data);
-        }
-
-        static StateRecord decode(byte[] encoded) {
-            final int version = bytesToInt(encoded, 0);
-            final long leaseId = bytesToLong(encoded, 4);
-            final long createTime = bytesToLong(encoded, 12);
-            final long modifyTime = bytesToLong(encoded, 20);
-            final byte[] data = new byte[encoded.length - HEADER_LENGTH];
-            System.arraycopy(encoded, HEADER_LENGTH, data, 0, data.length);
-            return new StateRecord(version, leaseId, createTime, modifyTime, data);
-        }
-
-        /** The version of an encoded record without decoding it; version sits at offset 0. */
-        static int versionOf(byte[] encoded) {
-            return bytesToInt(encoded, 0);
-        }
-    }
-
-    /** The lease state stored in the {@code leases} CF; three big-endian longs. */
-    private static final class LeaseState {
-        private final long ttlMs;
-        private final long expireAtMs;
-        private final long lastRenewIndex;
-
-        LeaseState(long ttlMs, long expireAtMs, long lastRenewIndex) {
-            this.ttlMs = ttlMs;
-            this.expireAtMs = expireAtMs;
-            this.lastRenewIndex = lastRenewIndex;
-        }
-
-        byte[] encode() {
-            final byte[] encoded = new byte[24];
-            putLong(encoded, 0, ttlMs);
-            putLong(encoded, 8, expireAtMs);
-            putLong(encoded, 16, lastRenewIndex);
-            return encoded;
-        }
-
-        static LeaseState decode(byte[] encoded) {
-            return new LeaseState(bytesToLong(encoded, 0), bytesToLong(encoded, 8), bytesToLong(encoded, 16));
-        }
-    }
 
     /** Path syntax check mirroring ZooKeeper's client-side PathUtils; error status or null. */
     private static RaftResult.Status checkPath(String path) {
@@ -1950,19 +1876,19 @@ public class MetadataStateMachine extends BaseStateMachine {
         return bytes;
     }
 
-    private static void putLong(byte[] target, int offset, long value) {
+    static void putLong(byte[] target, int offset, long value) {
         for (int i = 0; i < 8; i++) {
             target[offset + i] = (byte) (value >>> (8 * (7 - i)));
         }
     }
 
-    private static void putInt(byte[] target, int offset, int value) {
+    static void putInt(byte[] target, int offset, int value) {
         for (int i = 0; i < 4; i++) {
             target[offset + i] = (byte) (value >>> (8 * (3 - i)));
         }
     }
 
-    private static long bytesToLong(byte[] source, int offset) {
+    static long bytesToLong(byte[] source, int offset) {
         long value = 0;
         for (int i = 0; i < 8; i++) {
             value = (value << 8) | (source[offset + i] & 0xFFL);
@@ -1970,7 +1896,7 @@ public class MetadataStateMachine extends BaseStateMachine {
         return value;
     }
 
-    private static int bytesToInt(byte[] source, int offset) {
+    static int bytesToInt(byte[] source, int offset) {
         int value = 0;
         for (int i = 0; i < 4; i++) {
             value = (value << 8) | (source[offset + i] & 0xFF);

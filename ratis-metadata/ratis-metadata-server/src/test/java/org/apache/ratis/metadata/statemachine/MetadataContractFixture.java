@@ -32,6 +32,7 @@ import org.apache.ratis.metadata.proto.MetadataProtos.Role;
 import org.apache.ratis.metadata.proto.MetadataProtos.WriteReply;
 import org.apache.ratis.metadata.protocol.GroupConfig;
 import org.apache.ratis.metadata.protocol.Stamp;
+import org.apache.ratis.protocol.RaftGroupId;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
@@ -50,12 +51,18 @@ final class MetadataContractFixture implements AutoCloseable {
     private final Path directory;
     private final Role role;
     private final GroupConfig config;
+    private final RaftGroupId groupId;
+    private final MetadataEngine engine;
+    private long term = 1;
     private RocksMetadataStore store;
 
     private MetadataContractFixture(Path directory, Role role, GroupConfig config) {
         this.directory = directory;
         this.role = role;
         this.config = config;
+        this.groupId = RaftGroupId.valueOf(java.util.UUID.nameUUIDFromBytes(
+                ("rmd-fixture-" + role).getBytes(StandardCharsets.UTF_8)));
+        this.engine = new MetadataEngine(groupId);
         this.store = RocksMetadataStore.open(directory);
     }
 
@@ -69,6 +76,20 @@ final class MetadataContractFixture implements AutoCloseable {
 
     Path directory() {
         return directory;
+    }
+
+    /** The fixture's deterministic group identity, used to freeze requests. */
+    RaftGroupId groupId() {
+        return groupId;
+    }
+
+    /** The term stamped onto every engine entry; tests may move it forward. */
+    void setTerm(long newTerm) {
+        this.term = newTerm;
+    }
+
+    long term() {
+        return term;
     }
 
     /** Commits the initialization marker set at the given entry position. */
@@ -106,8 +127,8 @@ final class MetadataContractFixture implements AutoCloseable {
         transition.business().put(MetadataCf.RESULT_EXPIRY,
                 StoredRecordCodec.resultExpiryKey(result.expiresAt(), resultKey),
                 StoredRecordCodec.resultExpiryValue(result.firstIndex()));
-        transition.stageStatsDelta(
-                new StoreStats(4 + result.reply().length, 0, 0, 0, 0, 0));
+        transition.stageStatsDelta(new StoreStats(
+                InvocationResultStore.charge(resultKey, result), 0, 0, 0, 0, 0));
     }
 
     /** Makes the next {@code commit} fail after staging, before the db write. */
@@ -212,6 +233,9 @@ final class MetadataContractFixture implements AutoCloseable {
 
     /** Reopens the store on the same directory; a corrupt marker fails here. */
     RocksMetadataStore reopenStore() {
+        if (store != null) {
+            store.close();
+        }
         store = RocksMetadataStore.open(directory);
         return store;
     }
@@ -219,19 +243,19 @@ final class MetadataContractFixture implements AutoCloseable {
     // ---- engine entry points: fixed shape, delivered with T03/T04 ----
 
     WriteReply apply(long index, long proposedTime, ClientWrite request) {
-        throw new UnsupportedOperationException("apply arrives with T03");
+        return engine.apply(term, index, proposedTime, request, config, store);
     }
 
     WriteReply admin(long index, long proposedTime, AdminWrite request) {
-        throw new UnsupportedOperationException("admin arrives with T03");
+        return engine.admin(term, index, proposedTime, request, config, store);
     }
 
     QueryReply query(Query request) {
-        throw new UnsupportedOperationException("query arrives with T03");
+        return engine.query(request, config, store);
     }
 
     void maintenance(long index, long proposedTime, LeaseCandidate candidate) {
-        throw new UnsupportedOperationException("maintenance arrives with T03");
+        engine.maintenance(term, index, proposedTime, candidate, config, store);
     }
 
     void configEntry(long term, long index) {

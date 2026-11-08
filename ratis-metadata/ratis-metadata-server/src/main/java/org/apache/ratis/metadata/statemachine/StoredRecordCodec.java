@@ -90,9 +90,7 @@ final class StoredRecordCodec {
 
     static byte[] logicalTimeValue(long logicalNow) {
         requireNonNegative("logicalNow", logicalNow);
-        final ByteBuffer out = header(9);
-        out.putLong(logicalNow);
-        return finish(out);
+        return counterValue(logicalNow);
     }
 
     static long decodeLogicalTime(byte[] value) {
@@ -567,7 +565,8 @@ final class StoredRecordCodec {
         return out;
     }
 
-    private static byte[] sha256(byte[] payload) {
+    /** The one SHA-256 of the package: record checksums and domain digests. */
+    static byte[] sha256(byte[] payload) {
         try {
             return MessageDigest.getInstance("SHA-256").digest(payload);
         } catch (NoSuchAlgorithmException e) {

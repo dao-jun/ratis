@@ -19,6 +19,7 @@ package org.apache.ratis.metadata.statemachine;
 import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Optional;
 import java.util.TreeMap;
 
@@ -50,6 +51,38 @@ final class MutationBuffer {
 
     boolean isEmpty() {
         return mutationCount == 0;
+    }
+
+    /** Drops every staged row; the buffer is empty and reusable afterwards. */
+    void clear() {
+        rows.clear();
+        mutationCount = 0;
+    }
+
+    /**
+     * @return the staged state of one key: a present value, an empty
+     *         tombstone, or {@code null} when this buffer stages nothing for
+     *         the key - the caller then reads the next layer down.
+     */
+    Optional<byte[]> staged(MetadataCf cf, byte[] key) {
+        final TreeMap<byte[], Optional<byte[]>> cfRows = rows.get(cf);
+        return cfRows == null ? null : cfRows.get(key);
+    }
+
+    /**
+     * @return a read-only view of the staged rows within
+     *         {@code [from, toExclusive)} in unsigned key order - the empty
+     *         map when nothing is staged for the family, and the whole tail
+     *         when {@code toExclusive} is {@code null}
+     */
+    NavigableMap<byte[], Optional<byte[]>> stagedRows(MetadataCf cf, byte[] from, byte[] toExclusive) {
+        final TreeMap<byte[], Optional<byte[]>> cfRows = rows.get(cf);
+        if (cfRows == null) {
+            return new TreeMap<>(UNSIGNED_ORDER);
+        }
+        return toExclusive == null
+                ? cfRows.tailMap(from, true)
+                : cfRows.subMap(from, true, toExclusive, false);
     }
 
     long mutationCount() {

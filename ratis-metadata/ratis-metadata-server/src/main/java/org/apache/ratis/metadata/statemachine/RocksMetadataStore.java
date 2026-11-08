@@ -97,6 +97,7 @@ final class RocksMetadataStore implements AutoCloseable {
     private long appliedTermValue;
     private long appliedIndexValue;
     private long logicalTimeValue;
+    private Stamp rootStampValue;
     private long changeFloorValue;
     private StoreStats statsValue = StoreStats.ZERO;
 
@@ -193,7 +194,7 @@ final class RocksMetadataStore implements AutoCloseable {
         appliedTermValue = applied[0];
         appliedIndexValue = applied[1];
         logicalTimeValue = StoredRecordCodec.decodeLogicalTime(requireMarker(LOGICAL_TIME_KEY));
-        StoredRecordCodec.decodeRootStamp(requireMarker(ROOT_STAMP_KEY));
+        rootStampValue = StoredRecordCodec.decodeRootStamp(requireMarker(ROOT_STAMP_KEY));
         changeFloorValue = StoredRecordCodec.decodeChangeFloor(requireMarker(CHANGE_FLOOR_KEY));
         statsValue = StoredRecordCodec.decodeStats(requireMarker(STATS_KEY));
         initialized = true;
@@ -269,6 +270,11 @@ final class RocksMetadataStore implements AutoCloseable {
 
     long logicalTime() {
         return logicalTimeValue;
+    }
+
+    /** @return the initialization entry's stamp - the root's permanent lifecycle. */
+    Stamp rootStamp() {
+        return rootStampValue;
     }
 
     long changeFloor() {
@@ -350,6 +356,7 @@ final class RocksMetadataStore implements AutoCloseable {
                 this.appliedTermValue = term;
                 this.appliedIndexValue = rootStamp.logIndex();
                 this.logicalTimeValue = 0;
+                this.rootStampValue = rootStamp;
                 this.changeFloorValue = rootStamp.logIndex();
                 this.statsValue = StoreStats.ZERO;
                 this.initialized = true;

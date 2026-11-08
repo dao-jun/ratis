@@ -1,11 +1,10 @@
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+ * or more contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -17,441 +16,249 @@
  */
 package org.apache.ratis.metadata.statemachine;
 
-import org.apache.ratis.metadata.protocol.RaftCommandCodec;
-import org.apache.ratis.metadata.protocol.RaftResult;
-import org.apache.ratis.protocol.ClientInvocationId;
-import org.apache.ratis.server.protocol.TermIndex;
-import org.rocksdb.ColumnFamilyHandle;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.RocksIterator;
-import org.rocksdb.WriteBatch;
-
-import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Objects;
+import java.util.Optional;
+
+import org.apache.ratis.metadata.proto.MetadataProtos.BusinessResult;
+import org.apache.ratis.metadata.proto.MetadataProtos.Lane;
+import org.apache.ratis.metadata.proto.MetadataProtos.TakeoverId;
+import org.apache.ratis.metadata.protocol.OperationId;
+import org.rocksdb.RocksIterator;
 
 /**
- * Durable invocation results and their deterministic replay selection. This class reads RocksDB
- * and stages into caller-owned batches; the state machine remains the sole writer and batch owner.
+ * The layout-3 result table: durable original replies keyed by writer
+ * identity, one expiry-index row per result, and the bounded collection of
+ * logically expired rows. Stateless - every method is a pure function over
+ * the passed view and transition, so one shared instance serves every group.
+ *
+ * <p>The lookup order is fixed: a missing row is a miss; a row past its
+ * logical expiry is {@link ResultLookup.Kind#RESULT_EXPIRED} even though it
+ * may still sit on disk (an expired digest cannot promise conflict
+ * detection); only a live row compares digests - equal replays the original
+ * bytes, unequal is {@link ResultLookup.Kind#INVOCATION_MISMATCH}.</p>
  */
 final class InvocationResultStore {
+  static final InvocationResultStore INSTANCE = new InvocationResultStore();
 
-    private static final byte[] CUTOFF_KEY = {0};
-    private static final byte RECORD_KEY_TAG = 1;
-    private static final byte TIME_KEY_TAG = 2;
-    private static final int CLIENT_ID_LENGTH = 16;
-    private static final int RECORD_VERSION = 1;
-    private static final int RECORD_HEADER_LENGTH =
-            1 + 4 * Long.BYTES + MetadataLogEnvelope.DIGEST_LENGTH + Integer.BYTES;
+  private InvocationResultStore() {
+  }
 
-    /**
-     * One apply's share of expired-result collection. A write burst followed by an idle
-     * retention window can put the whole backlog below the cutoff at once; without a cap the
-     * first write back carries all of it - unbounded batch work and native memory on the
-     * applier. The survivors stay candidates; the next applies resume at them.
-     */
-    static final int MAX_COLLECTIONS_PER_APPLY = 1024;
+  // ---- lookup ----
 
-    private final RocksDB db;
-    private final ColumnFamilyHandle defaultHandle;
-    private final ColumnFamilyHandle resultsHandle;
-
-    /**
-     * Lower bound on every live time index's retention time, maintained from staged and
-     * committed state alone: each staged result lowers it, each collection scan raises it to
-     * the first key it leaves at or above the cutoff. {@link Long#MIN_VALUE} means unknown -
-     * the first scan after open establishes it. Only the applier thread touches this store,
-     * so the floor needs no synchronization.
-     */
-    private long earliestLiveRetentionTime = Long.MIN_VALUE;
-
-    InvocationResultStore(
-            RocksDB db, ColumnFamilyHandle defaultHandle, ColumnFamilyHandle resultsHandle) {
-        this.db = Objects.requireNonNull(db, "db");
-        this.defaultHandle = Objects.requireNonNull(defaultHandle, "defaultHandle");
-        this.resultsHandle = Objects.requireNonNull(resultsHandle, "resultsHandle");
+  /**
+   * Looks up the stored result of one business operation.
+   */
+  ResultLookup lookup(OperationId id, byte[] digest, long logicalNow, ReadView view) {
+    Objects.requireNonNull(id, "id");
+    final byte[] resultKey = StoredRecordCodec.businessResultKey(
+        id.writerId(), id.generation(), id.sequence());
+    final ResultLookup lookup = lookupAt(resultKey, digest, logicalNow, view);
+    if (lookup.kind() == ResultLookup.Kind.REPLAY) {
+      verifyOperationReply(lookup, id);
     }
+    return lookup;
+  }
 
-    /** The durable outcome selected before any business execution or term fence. */
-    static final class Disposition {
-        enum Kind {
-            EXECUTE,
-            RETURN_RESULT,
-            RESULT_EXPIRED
-        }
-
-        private final Kind kind;
-        private final ClientInvocationId invocation;
-        private final TermIndex termIndex;
-        private final MetadataLogEnvelope envelope;
-        private final Record previous;
-        private final byte[] invocationKey;
-        private final byte[] encodedResult;
-        private final long effectiveCutoff;
-        private final long retentionTime;
-
-        @SuppressWarnings("checkstyle:ParameterNumber")
-        private Disposition(Kind kind, ClientInvocationId invocation, TermIndex termIndex, MetadataLogEnvelope envelope,
-                Record previous, byte[] invocationKey, byte[] encodedResult, long effectiveCutoff, long retentionTime) {
-            this.kind = kind;
-            this.invocation = invocation;
-            this.termIndex = termIndex;
-            this.envelope = envelope;
-            this.previous = previous;
-            this.invocationKey = invocationKey;
-            this.encodedResult = encodedResult == null ? null : encodedResult.clone();
-            this.effectiveCutoff = effectiveCutoff;
-            this.retentionTime = retentionTime;
-        }
-
-        Kind getKind() {
-            return kind;
-        }
-
-        byte[] getEncodedResult() {
-            return encodedResult == null ? null : encodedResult.clone();
-        }
-
-        long getEffectiveCutoff() {
-            return effectiveCutoff;
-        }
-
-        long getRetentionTime() {
-            return retentionTime;
-        }
+  /**
+   * Looks up the stored result of one takeover: identity is
+   * {@code (writerId, expectedGeneration, nonce)}.
+   */
+  ResultLookup lookupTakeover(TakeoverId id, byte[] digest, long logicalNow, ReadView view) {
+    Objects.requireNonNull(id, "id");
+    final byte[] resultKey = StoredRecordCodec.takeoverResultKey(
+        id.getWriterId().toByteArray(), id.getExpectedGeneration(), id.getNonce().toByteArray());
+    final ResultLookup lookup = lookupAt(resultKey, digest, logicalNow, view);
+    if (lookup.kind() == ResultLookup.Kind.REPLAY) {
+      verifyTakeoverReply(lookup, id);
     }
+    return lookup;
+  }
 
-    /** Immutable first-execution fields plus the mutable logical retention timestamp. */
-    private static final class Record {
-        private final byte[] encodedResult;
-        private final long firstTerm;
-        private final long firstIndex;
-        private final long firstSeen;
-        private final long retentionTime;
-        private final byte[] rawDigest;
-
-        private Record(byte[] encodedResult, long firstTerm, long firstIndex, long firstSeen, long retentionTime,
-                       byte[] rawDigest) {
-            this.encodedResult = encodedResult.clone();
-            this.firstTerm = firstTerm;
-            this.firstIndex = firstIndex;
-            this.firstSeen = firstSeen;
-            this.retentionTime = retentionTime;
-            this.rawDigest = rawDigest.clone();
-        }
-
-        private Record refresh(long newRetentionTime) {
-            return new Record(encodedResult, firstTerm, firstIndex, firstSeen, newRetentionTime, rawDigest);
-        }
-
-        private byte[] encode() {
-            return ByteBuffer.allocate(RECORD_HEADER_LENGTH + encodedResult.length)
-                    .put((byte) RECORD_VERSION)
-                    .putLong(firstTerm)
-                    .putLong(firstIndex)
-                    .putLong(firstSeen)
-                    .putLong(retentionTime)
-                    .put(rawDigest)
-                    .putInt(encodedResult.length)
-                    .put(encodedResult)
-                    .array();
-        }
-
-        private static Record decode(byte[] encoded) throws IOException {
-            if (encoded == null || encoded.length < RECORD_HEADER_LENGTH) {
-                throw new IOException("Truncated invocation result record");
-            }
-            try {
-                final ByteBuffer in = ByteBuffer.wrap(encoded);
-                final int version = in.get() & 0xFF;
-                if (version != RECORD_VERSION) {
-                    throw new IOException("Unknown invocation result record version " + version);
-                }
-                final long firstTerm = in.getLong();
-                final long firstIndex = in.getLong();
-                final long firstSeen = in.getLong();
-                final long retentionTime = in.getLong();
-                final byte[] digest = new byte[MetadataLogEnvelope.DIGEST_LENGTH];
-                in.get(digest);
-                final int resultLength = in.getInt();
-                if (resultLength <= 0 || resultLength != in.remaining()) {
-                    throw new IOException("Invalid encoded result length " + resultLength
-                            + " with " + in.remaining() + " bytes remaining");
-                }
-                if (firstTerm < 0 || firstIndex < 0) {
-                    throw new IOException("Invalid first term/index " + firstTerm + "/" + firstIndex);
-                }
-                final byte[] result = new byte[resultLength];
-                in.get(result);
-                if (RaftCommandCodec.decodeResult(result) == null) {
-                    throw new IOException("Invocation record contains an invalid encoded result");
-                }
-                return new Record(result, firstTerm, firstIndex, firstSeen, retentionTime, digest);
-            } catch (RuntimeException malformed) {
-                throw new IOException("Malformed invocation result record", malformed);
-            }
-        }
+  private ResultLookup lookupAt(byte[] resultKey, byte[] digest, long logicalNow, ReadView view) {
+    final byte[] encoded = view.get(MetadataCf.COMMAND_RESULTS, resultKey);
+    if (encoded == null) {
+      return ResultLookup.miss();
     }
-
-    /**
-     * Selects the transition using only durable pre-transition marker, cutoff, and result
-     * state. The {@code appliedRevision} caller argument is that durable marker: the state
-     * machine keeps it equal to the persisted applied-revision key - loaded on open, advanced
-     * right after each durable write, always on this store's single applier thread.
-     */
-    Disposition lookup(ClientInvocationId invocation, TermIndex termIndex, MetadataLogEnvelope envelope,
-            long appliedRevision) throws IOException, RocksDBException {
-        Objects.requireNonNull(invocation, "invocation");
-        Objects.requireNonNull(termIndex, "termIndex");
-        Objects.requireNonNull(envelope, "envelope");
-
-        final byte[] invocationKey = invocationKey(invocation);
-        final long persistedCutoff = loadCutoff();
-        final long effectiveCutoff = Math.max(persistedCutoff, envelope.getProposedCutoffMillis());
-        final long retentionTime = Math.max(envelope.getServerTimeMillis(), effectiveCutoff);
-        final boolean replay = termIndex.getIndex() <= appliedRevision;
-        final byte[] encodedRecord = db.get(resultsHandle, invocationKey);
-
-        if (encodedRecord == null) {
-            if (replay) {
-                if (envelope.getServerTimeMillis() < persistedCutoff) {
-                    return expired(
-                            invocation, termIndex, envelope, null, invocationKey, effectiveCutoff, retentionTime);
-                }
-                throw new IOException("Missing unexpired invocation result for " + invocation
-                                + " at replay revision " + termIndex.getIndex()
-                                + " with serverTime " + envelope.getServerTimeMillis()
-                                + " and persisted cutoff " + persistedCutoff);
-            }
-            return new Disposition(Disposition.Kind.EXECUTE, invocation, termIndex, envelope, null, invocationKey,
-                    null, effectiveCutoff, retentionTime);
-        }
-
-        final Record record = Record.decode(encodedRecord);
-        verifyCurrentTimeIndex(invocation, invocationKey, record.retentionTime);
-        // A refresh may only extend retention. A duplicate preprocessed under a lagging leader
-        // clock must never pull the record below the retention its committed predecessors chose:
-        // collection deletes strictly below the cutoff, so a lowered retention can drop the record
-        // while a replay of its own log entry still expects an unexpired result.
-        final long refreshedRetentionTime = Math.max(record.retentionTime, retentionTime);
-        if (replay && record.firstIndex > termIndex.getIndex()) {
-            return expired(invocation, termIndex, envelope, record, invocationKey, effectiveCutoff, retentionTime);
-        }
-
-        final byte[] selected = Arrays.equals(record.rawDigest, envelope.getRawCommandDigest()) ? record.encodedResult
-                : RaftCommandCodec.encodeResult(RaftResult.error(
-                envelope.getCommand().getOp(), RaftResult.Status.INVOCATION_MISMATCH));
-        return new Disposition(Disposition.Kind.RETURN_RESULT, invocation, termIndex, envelope, record, invocationKey,
-                selected, effectiveCutoff, refreshedRetentionTime);
+    final StoredResult result = StoredRecordCodec.decodeStoredResult(encoded);
+    if (result.expiresAt() <= logicalNow) {
+      return ResultLookup.expired();
     }
-
-    /**
-     * Stages, against pre-transition state only: the deterministic collection of expired results,
-     * the cutoff advance, and the current invocation's old time-index deletion, in that order.
-     * Collection is driven exclusively by the disposition's replicated effective cutoff - never a
-     * local clock - and only a candidate strictly below the cutoff is collected. The caller stages
-     * the refreshed/new record and its new time index afterwards via {@link #stageResult}.
-     */
-    void stageRetention(WriteBatch batch, Disposition disposition)
-            throws IOException, RocksDBException {
-        Objects.requireNonNull(batch, "batch");
-        Objects.requireNonNull(disposition, "disposition");
-        if (disposition.kind == Disposition.Kind.RESULT_EXPIRED) {
-            return;
-        }
-        stageExpiredCandidateDeletions(batch, disposition);
-        batch.put(resultsHandle, CUTOFF_KEY, longBytes(disposition.effectiveCutoff));
-        if (disposition.previous != null) {
-            batch.delete(resultsHandle, timeKey(disposition.previous.retentionTime, disposition.invocation));
-        }
+    if (!Arrays.equals(result.digest(), digest)) {
+      return ResultLookup.mismatch();
     }
+    return ResultLookup.replay(result);
+  }
 
-    /**
-     * Stages a first result or an immutable-field-preserving refresh, and last its new
-     * time-index key, without committing either. The refreshed retention is floored at the
-     * existing record's retention in {@link #lookup}, so the time index only moves forward.
-     *
-     * <p>The {@code firstExecutionResult} bytes must be {@link RaftCommandCodec#encodeResult}
-     * output from this same apply; the record stores them verbatim and only the reply path
-     * ever decodes them, so validity is the caller's precondition rather than re-parsed here.
-     */
-    void stageResult(WriteBatch batch, Disposition disposition, byte[] firstExecutionResult) throws RocksDBException {
-        Objects.requireNonNull(batch, "batch");
-        Objects.requireNonNull(disposition, "disposition");
-        if (disposition.kind == Disposition.Kind.RESULT_EXPIRED) {
-            return;
+  /**
+   * The replay path verifies the stored reply still carries the identity of
+   * the key it is filed under and the revision it claims to come from; a
+   * checksum-valid but identity-inconsistent row is storage corruption.
+   */
+  private void verifyOperationReply(ResultLookup lookup, OperationId id) {
+    final BusinessResult reply = parseReply(lookup, "operation");
+    if (!reply.hasOperationId()
+        || !Arrays.equals(reply.getOperationId().getWriter().getWriterId().toByteArray(),
+            id.writerId())
+        || reply.getOperationId().getWriter().getGeneration() != id.generation()
+        || reply.getOperationId().getSequence() != id.sequence()) {
+      throw identityCorrupt(lookup, "operation");
+    }
+    requireClaimedRevision(lookup, reply, "operation");
+  }
+
+  private void verifyTakeoverReply(ResultLookup lookup, TakeoverId id) {
+    final BusinessResult reply = parseReply(lookup, "takeover");
+    if (!reply.hasTakeoverId()
+        || !Arrays.equals(reply.getTakeoverId().getWriterId().toByteArray(),
+            id.getWriterId().toByteArray())
+        || reply.getTakeoverId().getExpectedGeneration() != id.getExpectedGeneration()
+        || !Arrays.equals(reply.getTakeoverId().getNonce().toByteArray(),
+            id.getNonce().toByteArray())) {
+      throw identityCorrupt(lookup, "takeover");
+    }
+    requireClaimedRevision(lookup, reply, "takeover");
+  }
+
+  private BusinessResult parseReply(ResultLookup lookup, String what) {
+    try {
+      return BusinessResult.parseFrom(lookup.originalReply());
+    } catch (org.apache.ratis.thirdparty.com.google.protobuf.InvalidProtocolBufferException e) {
+      throw MetadataStoreException.corrupt(
+          "the stored " + what + " reply is not a parsable BusinessResult", e);
+    }
+  }
+
+  private MetadataStoreException identityCorrupt(ResultLookup lookup, String what) {
+    return MetadataStoreException.corrupt(
+        "the stored " + what + " reply does not carry the identity of its key");
+  }
+
+  private void requireClaimedRevision(ResultLookup lookup, BusinessResult reply, String what) {
+    if (reply.getFirstRevision() != lookup.firstIndex()) {
+      throw MetadataStoreException.corrupt("the stored " + what
+          + " reply claims revision " + reply.getFirstRevision()
+          + " but its record was first executed at index " + lookup.firstIndex());
+    }
+  }
+
+  // ---- staging ----
+
+  /**
+   * Stages one stored business result: the result row, its exactly-one
+   * expiry-index row and the lane byte charge, all into the transition's
+   * business buffer so a business discard drops them with it.
+   */
+  void stageResult(PreparedTransition transition, OperationId id, Lane lane, StoredResult result) {
+    final byte[] resultKey = StoredRecordCodec.businessResultKey(
+        id.writerId(), id.generation(), id.sequence());
+    stageAt(transition, resultKey, lane, result);
+  }
+
+  /** The takeover twin of {@link #stageResult}. */
+  void stageTakeoverResult(PreparedTransition transition, TakeoverId id, Lane lane,
+      StoredResult result) {
+    final byte[] resultKey = StoredRecordCodec.takeoverResultKey(
+        id.getWriterId().toByteArray(), id.getExpectedGeneration(), id.getNonce().toByteArray());
+    stageAt(transition, resultKey, lane, result);
+  }
+
+  private void stageAt(PreparedTransition transition, byte[] resultKey, Lane lane,
+      StoredResult result) {
+    transition.business().put(MetadataCf.COMMAND_RESULTS, resultKey,
+        StoredRecordCodec.storedResultValue(result));
+    transition.business().put(MetadataCf.RESULT_EXPIRY,
+        StoredRecordCodec.resultExpiryKey(result.expiresAt(), resultKey),
+        StoredRecordCodec.resultExpiryValue(result.firstIndex()));
+    transition.stageStatsDelta(laneCharge(lane, charge(resultKey, result)));
+  }
+
+  /** The exact byte charge of one result plus its index row, per lane. */
+  static long charge(byte[] resultKey, StoredResult result) {
+    return StoredRecordCodec.storedResultValue(result).length + resultKey.length
+        + (8 + resultKey.length) + 9;
+  }
+
+  private static StoreStats laneCharge(Lane lane, long bytes) {
+    if (lane == Lane.CONTROL) {
+      return new StoreStats(0, bytes, 0, 0, 0, 0);
+    }
+    return new StoreStats(bytes, 0, 0, 0, 0, 0);
+  }
+
+  // ---- bounded collection ----
+
+  /**
+   * Stages the bounded collection of logically expired results: from the
+   * smallest expiry key while the budget lasts, each row is verified against
+   * its result and the writer's lane before both rows are deleted and the
+   * lane bytes returned. Whatever does not fit stays for a later entry; no
+   * persistent "fully collected" watermark exists - the next pass resumes at
+   * the smallest remaining key.
+   */
+  void stageGc(PreparedTransition transition, GcBudget budget, long logicalNow, ReadView view) {
+    final RocksIterator iterator = view.iterator(MetadataCf.RESULT_EXPIRY);
+    try {
+      iterator.seekToFirst();
+      while (iterator.isValid()) {
+        final byte[] expiryKey = iterator.key();
+        final long expiresAt = expiryAt(expiryKey);
+        if (expiresAt > logicalNow) {
+          break; // index order: every later row expires later
         }
-        final Record result;
-        if (disposition.previous != null) {
-            result = disposition.previous.refresh(disposition.retentionTime);
-        } else {
-            if (firstExecutionResult == null) {
-                throw new IllegalArgumentException("First execution requires an encoded RaftResult");
-            }
-            result = new Record(firstExecutionResult, disposition.termIndex.getTerm(), disposition.termIndex.getIndex(),
-                    disposition.envelope.getServerTimeMillis(), disposition.retentionTime,
-                    disposition.envelope.getRawCommandDigest());
+        final byte[] resultKey = resultKeyOf(expiryKey);
+        final long visitBytes = expiryKey.length
+            + Optional.ofNullable(iterator.value()).map(v -> v.length).orElse(0)
+            + resultKey.length;
+        if (!budget.tryCharge(1, visitBytes)) {
+          break;
         }
-        batch.put(resultsHandle, disposition.invocationKey, result.encode());
-        batch.put(resultsHandle, timeKey(disposition.retentionTime, disposition.invocation), disposition.invocationKey);
-        earliestLiveRetentionTime = Math.min(earliestLiveRetentionTime, disposition.retentionTime);
-    }
-
-    /**
-     * Deletes every result whose time index sits strictly below the disposition's effective
-     * cutoff. The currently refreshed invocation is never an ordinary candidate: its old time
-     * key leaves via the refresh staging itself, so both a matching and a mismatching refresh
-     * survive their own transition. Any inconsistency on a non-refreshed key the scan reaches -
-     * a malformed or value-mismatching index key, a missing or undecodable record, or a record
-     * whose embedded retention time disagrees with its index - fails as corruption and is never
-     * silently skipped. A scan the retention floor proves empty is skipped wholesale, so an
-     * inconsistency that appears above the floor surfaces only once collection catches up to it.
-     */
-    private void stageExpiredCandidateDeletions(WriteBatch batch, Disposition disposition)
-            throws IOException, RocksDBException {
-        final long effectiveCutoff = disposition.effectiveCutoff;
-        if (earliestLiveRetentionTime >= effectiveCutoff) {
-            // No live time index can sit below the cutoff: the scan would collect nothing,
-            // so skip its native iterator entirely - this runs once per committed entry.
-            return;
+        final StoredResult result = StoredRecordCodec.decodeStoredResult(
+            view.get(MetadataCf.COMMAND_RESULTS, resultKey));
+        if (result.expiresAt() != expiresAt) {
+          throw MetadataStoreException.corrupt("the expiry index says " + expiresAt
+              + " but the result row expires at " + result.expiresAt());
         }
-        final boolean refreshing = disposition.previous != null;
-        try (RocksIterator iterator = db.newIterator(resultsHandle)) {
-            int collected = 0;
-            boolean drained = true;
-            // Time keys are the highest tag, so this seek lands on the first one; they sort by
-            // retention time first, so iteration can stop at the first key at or above the cutoff.
-            iterator.seek(new byte[]{TIME_KEY_TAG});
-            while (iterator.isValid()) {
-                final byte[] timeKey = iterator.key();
-                if (timeKey.length == 0 || timeKey[0] != TIME_KEY_TAG) {
-                    break;
-                }
-                if (timeKey.length != 1 + Long.BYTES + CLIENT_ID_LENGTH + Long.BYTES) {
-                    throw new IOException("Malformed time index key of length " + timeKey.length + " below cutoff "
-                            + effectiveCutoff);
-                }
-                final long candidateTime = sortableLong(timeKey, 1);
-                if (candidateTime >= effectiveCutoff) {
-                    // Keys sort by retention time first; nothing further is strictly below.
-                    break;
-                }
-                final byte[] recordKey = invocationKeyFromTimeKey(timeKey);
-                if (refreshing && Arrays.equals(recordKey, disposition.invocationKey)) {
-                    iterator.next();
-                    continue;
-                }
-                if (!Arrays.equals(recordKey, iterator.value())) {
-                    throw new IOException("Time index at retentionTime " + candidateTime
-                            + " does not rebuild its invocation key");
-                }
-                final byte[] encodedRecord = db.get(resultsHandle, recordKey);
-                if (encodedRecord == null) {
-                    throw new IOException("Missing result record for the time index at retentionTime " + candidateTime);
-                }
-                final Record record = Record.decode(encodedRecord);
-                if (record.retentionTime != candidateTime) {
-                    throw new IOException("Result record retentionTime " + record.retentionTime
-                            + " disagrees with its time index " + candidateTime);
-                }
-                batch.delete(resultsHandle, timeKey);
-                batch.delete(resultsHandle, recordKey);
-                if (++collected >= MAX_COLLECTIONS_PER_APPLY) {
-                    drained = false;
-                    break;
-                }
-                iterator.next();
-            }
-            // isValid()==false also covers a scan stopped by a storage error; only status()
-            // tells that apart from a clean end, so a collection never commits off a partial
-            // scan (the floor logic below relies on having truly seen the last candidate).
-            iterator.status();
-            // Where the loop stopped - the first time key at or above the cutoff, or past the
-            // time keys - no key below the cutoff survives this batch, so the floor rises to
-            // it. A truncated or failed scan leaves the floor untouched: the uncollected
-            // candidates below the cutoff still live, and the next apply's seek lands on them
-            // (the collected keys are gone) - the floor stays a lower bound either way.
-            if (drained) {
-                if (iterator.isValid() && iterator.key().length > 0 && iterator.key()[0] == TIME_KEY_TAG) {
-                    earliestLiveRetentionTime = sortableLong(iterator.key(), 1);
-                } else {
-                    earliestLiveRetentionTime = Long.MAX_VALUE;
-                }
-            }
-        }
+        final Lane lane = laneOf(resultKey, view);
+        final byte[] encoded = StoredRecordCodec.storedResultValue(result);
+        transition.maintenance().delete(MetadataCf.COMMAND_RESULTS, resultKey);
+        transition.maintenance().delete(MetadataCf.RESULT_EXPIRY, expiryKey);
+        transition.stageMaintenanceStatsDelta(
+            laneCharge(lane, -(encoded.length + resultKey.length + expiryKey.length + 9)));
+        iterator.next();
+      }
+      try {
+        iterator.status();
+      } catch (org.rocksdb.RocksDBException e) {
+        throw MetadataStoreException.io("result-expiry scan ended in error", e);
+      }
+    } finally {
+      iterator.close();
     }
+  }
 
-    /** Loads the replicated monotone result cutoff; absent means no expiration has been proposed. */
-    long loadCutoff() throws RocksDBException {
-        final byte[] encoded = db.get(resultsHandle, CUTOFF_KEY);
-        if (encoded == null) {
-            return Long.MIN_VALUE;
-        }
-        if (encoded.length != Long.BYTES) {
-            throw new RocksDBException("Corrupt invocation result cutoff: expected 8 bytes, got " + encoded.length);
-        }
-        return ByteBuffer.wrap(encoded).getLong();
-    }
+  private long expiryAt(byte[] expiryKey) {
+    return ((long) (expiryKey[0] & 0xff) << 56) | ((long) (expiryKey[1] & 0xff) << 48)
+        | ((long) (expiryKey[2] & 0xff) << 40) | ((long) (expiryKey[3] & 0xff) << 32)
+        | ((long) (expiryKey[4] & 0xff) << 24) | ((long) (expiryKey[5] & 0xff) << 16)
+        | ((long) (expiryKey[6] & 0xff) << 8) | (expiryKey[7] & 0xff);
+  }
 
-    private void verifyCurrentTimeIndex(ClientInvocationId invocation, byte[] invocationKey, long retentionTime)
-            throws IOException, RocksDBException {
-        final byte[] indexed = db.get(resultsHandle, timeKey(retentionTime, invocation));
-        if (!Arrays.equals(invocationKey, indexed)) {
-            throw new IOException("Missing or mismatching time index for " + invocation
-                    + " at retentionTime " + retentionTime);
-        }
-    }
+  private byte[] resultKeyOf(byte[] expiryKey) {
+    return Arrays.copyOfRange(expiryKey, 8, expiryKey.length);
+  }
 
-    private static Disposition expired(ClientInvocationId invocation, TermIndex termIndex, MetadataLogEnvelope envelope,
-            Record previous, byte[] invocationKey, long effectiveCutoff, long retentionTime) {
-        return new Disposition(Disposition.Kind.RESULT_EXPIRED, invocation, termIndex, envelope, previous,
-                invocationKey, RaftCommandCodec.encodeResult(RaftResult.error(
-                        envelope.getCommand().getOp(), RaftResult.Status.RESULT_EXPIRED)),
-                effectiveCutoff, retentionTime);
+  /**
+   * @return the lane of the writer the result key names; the writer row
+   *         never goes away, so a missing row is corruption
+   */
+  private Lane laneOf(byte[] resultKey, ReadView view) {
+    final byte[] writerId = Arrays.copyOfRange(resultKey, 1, 17);
+    final byte[] encoded = view.get(MetadataCf.WRITERS, StoredRecordCodec.writerKey(writerId));
+    if (encoded == null) {
+      throw MetadataStoreException.corrupt(
+          "the writer of an expired result row has no writer row");
     }
-
-    private static byte[] invocationKey(ClientInvocationId invocation) throws IOException {
-        final byte[] clientId = invocation.getClientId().toByteString().toByteArray();
-        if (clientId.length != CLIENT_ID_LENGTH) {
-            throw new IOException("Invalid clientId width " + clientId.length + " for " + invocation);
-        }
-        return ByteBuffer.allocate(1 + CLIENT_ID_LENGTH + Long.BYTES)
-                .put(RECORD_KEY_TAG)
-                .put(clientId)
-                .putLong(invocation.getLongId() ^ Long.MIN_VALUE)
-                .array();
-    }
-
-    private static byte[] timeKey(long retentionTime, ClientInvocationId invocation) {
-        final byte[] clientId = invocation.getClientId().toByteString().toByteArray();
-        if (clientId.length != CLIENT_ID_LENGTH) {
-            // lookup validates this before a Disposition can be constructed.
-            throw new IllegalArgumentException("Invalid clientId width " + clientId.length + " for " + invocation);
-        }
-        return ByteBuffer.allocate(1 + Long.BYTES + CLIENT_ID_LENGTH + Long.BYTES)
-                .put(TIME_KEY_TAG)
-                .putLong(retentionTime ^ Long.MIN_VALUE)
-                .put(clientId)
-                .putLong(invocation.getLongId() ^ Long.MIN_VALUE)
-                .array();
-    }
-
-    /** Rebuilds the record key a time index key addresses: the same clientId and call id. */
-    private static byte[] invocationKeyFromTimeKey(byte[] timeKey) {
-        final byte[] recordKey = new byte[1 + CLIENT_ID_LENGTH + Long.BYTES];
-        recordKey[0] = RECORD_KEY_TAG;
-        System.arraycopy(timeKey, 1 + Long.BYTES, recordKey, 1, CLIENT_ID_LENGTH + Long.BYTES);
-        return recordKey;
-    }
-
-    /** Decodes a sign-flipped big-endian long written by {@link #timeKey} back to its value. */
-    private static long sortableLong(byte[] source, int offset) {
-        return ByteBuffer.wrap(source, offset, Long.BYTES).getLong() ^ Long.MIN_VALUE;
-    }
-
-    private static byte[] longBytes(long value) {
-        return ByteBuffer.allocate(Long.BYTES).putLong(value).array();
-    }
+    return StoredRecordCodec.decodeWriter(encoded).lane();
+  }
 }
