@@ -1,0 +1,212 @@
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements. See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License. You may obtain a copy of the License at
+// http://www.apache.org/licenses/LICENSE-2.0
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+syntax = "proto3";
+package ratis.metadata.v1;
+option java_package = "org.apache.ratis.metadata.proto";
+option java_outer_classname = "MetadataProtos";
+
+// Normative reference schema; this file is documentation until T01 copies it.
+enum Role { ROLE_UNSPECIFIED = 0; COORDINATION = 1; KEYSPACE = 2; }
+enum Lane { LANE_UNSPECIFIED = 0; BUSINESS = 1; CONTROL = 2; }
+enum NodeKind { NODE_UNSPECIFIED = 0; NORMAL = 1; EPHEMERAL_LOCK = 2; }
+enum Admission { ADMIT_UNSPECIFIED = 0; ACCEPTED = 1; REPLAY = 2; REJECTED = 3; }
+enum Status {
+  S_UNSPECIFIED = 0; S_OK = 1; S_NOT_FOUND = 2; S_NODE_EXISTS = 3;
+  S_NO_PARENT = 4; S_HAS_CHILDREN = 5; S_VERSION_MISMATCH = 6;
+  S_NOT_OWNER = 7; S_NOT_ALLOWED = 8; S_UNKNOWN_LEASE = 9;
+  S_LEASE_EXPIRED = 10; S_BAD_TTL = 11; S_LIMIT_EXCEEDED = 12;
+  S_REPLY_TOO_LARGE = 13; S_NUMERIC_OVERFLOW = 14; S_MULTI_FAILED = 15;
+  S_MALFORMED = 16; S_BAD_PATH = 17; S_WRONG_ROLE = 18;
+  S_CONFIG_MISMATCH = 19; S_BUDGET_MISMATCH = 20;
+  S_GROUP_NOT_INITIALIZED = 21; S_SEQUENCE_GAP = 22;
+  S_RESULT_CAPACITY = 23; S_CHANGE_CAPACITY = 24;
+  S_UNKNOWN_WRITER = 25; S_STALE_GENERATION = 26; S_FUTURE_GENERATION = 27;
+  S_INVOCATION_MISMATCH = 28; S_RESULT_EXPIRED = 29;
+  S_WRITER_LIMIT = 30; S_WRITER_EXISTS = 31; S_GENERATION_EXHAUSTED = 32;
+  S_LEASE_LIMIT = 33; S_NOT_HELD = 34; S_NEED_SNAPSHOT = 35;
+  S_PAGE_TOO_SMALL = 36; S_SNAPSHOT_TOO_LARGE = 37; S_BAD_CURSOR = 38;
+  S_REPLAY_UNAVAILABLE = 39; S_SEQUENCE_EXHAUSTED = 40;
+}
+message Stamp { int64 log_index = 1; uint32 ordinal = 2; }
+message WriterRef { bytes writer_id = 1; int64 generation = 2; }
+message OperationId { WriterRef writer = 1; int64 sequence = 2; }
+message TakeoverId { bytes writer_id = 1; int64 expected_generation = 2; bytes nonce = 3; }
+message LockToken { bytes group_id = 1; int64 log_index = 2; }
+message ExpectedVersion {
+  oneof predicate { bool absent = 1; Stamp exact = 2; }
+}
+message GroupConfig {
+  uint32 schema_version = 1;
+  Role role = 2;
+  int64 retention_ms = 3;
+  uint32 path_bytes = 4;
+  uint32 key_bytes = 5;
+  uint32 path_depth = 6;
+  uint32 value_bytes = 7;
+  uint32 request_bytes = 8;
+  uint32 multi_ops = 9;
+  uint32 recursive_nodes = 10;
+  uint32 mutation_nodes = 11;
+  uint32 scanned_keys = 12;
+  uint32 batch_bytes = 13;
+  uint32 lease_bindings = 14;
+  int64 lease_min_ttl_ms = 15;
+  int64 lease_max_ttl_ms = 16;
+  int64 active_leases = 17;
+  int64 writer_rows = 18;
+  uint32 stored_reply_bytes = 19;
+  int64 business_result_bytes = 20;
+  int64 control_result_bytes = 21;
+  uint32 result_gc_records = 22;
+  uint32 result_gc_bytes = 23;
+  int64 change_retention_revisions = 24;
+  int64 change_capacity_bytes = 25;
+  uint32 change_record_bytes = 26;
+  uint32 change_gc_records = 27;
+  uint32 change_gc_bytes = 28;
+  uint32 page_entries = 29;
+  uint32 page_bytes = 30;
+  uint32 page_visits = 31;
+  uint32 change_floor_revisions_per_entry = 32;
+}
+message InitializeGroup { bytes group_id = 1; GroupConfig config = 2; bytes fingerprint = 3; }
+message HelloRequest { uint32 wire_version = 1; Role role = 2; int64 retry_budget_ms = 3; }
+message HelloReply {
+  Status status = 1; bytes group_id = 2; GroupConfig config = 3;
+  bytes fingerprint = 4; int64 applied_index = 5; int64 logical_time = 6;
+}
+message RegisterWriter { bytes writer_id = 1; Lane lane = 2; }
+message TakeoverWriter { TakeoverId id = 1; }
+message Put { bytes key = 1; bytes value = 2; int64 lease_id = 3; }
+message Create {
+  bytes path = 1; bytes value = 2; int64 lease_id = 3;
+  NodeKind kind = 4; bool sequential = 5; bool create_parents = 6;
+}
+message Cas { bytes key = 1; bytes value = 2; ExpectedVersion expected = 3; int64 lease_id = 4; }
+message LockOwner { WriterRef owner = 1; int64 lease_id = 2; LockToken token = 3; }
+message Delete { bytes key = 1; bool recursive = 2; LockOwner lock_owner = 3; }
+message Increment { bytes name = 1; int64 delta = 2; }
+message Multi { repeated Operation operations = 1; }
+message LeaseOpen { WriterRef owner = 1; int64 ttl_ms = 2; }
+message LeaseRenew { WriterRef owner = 1; int64 lease_id = 2; int64 ttl_ms = 3; }
+message LeaseRevoke { WriterRef owner = 1; int64 lease_id = 2; }
+message Operation {
+  oneof command {
+    Put put = 10; Create create = 11; Cas cas = 12; Delete delete = 13;
+    Increment increment = 14; Multi multi = 15;
+    LeaseOpen lease_open = 16; LeaseRenew lease_renew = 17; LeaseRevoke lease_revoke = 18;
+  }
+}
+message ClientWrite {
+  uint32 wire_version = 1; bytes group_id = 2; Role role = 3;
+  bytes fingerprint = 4; int64 retry_budget_ms = 5;
+  OperationId id = 6; Operation operation = 7; bytes digest = 8;
+}
+message AdminWrite {
+  uint32 wire_version = 1; bytes group_id = 2; bytes fingerprint = 3;
+  int64 retry_budget_ms = 4;
+  oneof action { RegisterWriter register_writer = 10; TakeoverWriter takeover_writer = 11; }
+}
+message LeaseCandidate { int64 lease_id = 1; int64 expected_last_renew_index = 2; }
+message Maintenance { LeaseCandidate expire = 1; }
+message ReplicatedEntry {
+  uint32 format_version = 1; bytes group_id = 2; bytes fingerprint = 3;
+  int64 proposed_time_ms = 4;
+  oneof content {
+    InitializeGroup initialize = 10; ClientWrite write = 11;
+    AdminWrite admin = 12; Maintenance maintenance = 13;
+  }
+}
+message MutationResult {
+  bytes key = 1; Stamp version = 2; int64 deleted_count = 3;
+  LockToken lock_token = 4; int64 counter_value = 5;
+}
+message LeaseResult {
+  int64 lease_id = 1; WriterRef owner = 2; int64 ttl_ms = 3;
+  int64 expire_at = 4; int64 last_renew_index = 5; int64 deleted_count = 6;
+}
+message WriterState { bytes writer_id = 1; Lane lane = 2; int64 generation = 3; int64 high_water = 4; }
+message MultiResult { repeated BusinessResult results = 1; uint32 fail_index = 2; Status fail_status = 3; }
+message BusinessResult {
+  Status status = 1; int64 first_revision = 2;
+  oneof identity { OperationId operation_id = 3; TakeoverId takeover_id = 4; }
+  oneof value {
+    MutationResult mutation = 10; LeaseResult lease = 11;
+    WriterState writer = 12; MultiResult multi = 13;
+  }
+}
+message WriteReply {
+  Admission admission = 1; Status admission_status = 2;
+  bytes original_business_result = 3; bool stale_generation = 4;
+  int64 current_generation = 5; int64 expected_next_sequence = 6;
+  WriterState registered_writer = 7; bytes operation_digest = 8;
+}
+message ChangeCursor { bytes group_id = 1; int64 revision = 2; uint32 ordinal = 3; }
+message PageRequest { uint32 max_entries = 1; uint32 max_bytes = 2; bytes continuation = 3; }
+enum CursorKind { CURSOR_UNSPECIFIED = 0; SCAN = 1; LEASE_SCAN = 2; }
+message PageCursor {
+  uint32 version = 1; bytes group_id = 2; Role role = 3; bytes fingerprint = 4;
+  bytes query_digest = 5; bytes last_examined_key = 6; CursorKind kind = 7;
+}
+message Get { bytes key = 1; }
+message ScanQuery { bytes start = 1; bytes end = 2; bytes tree_prefix = 3; PageRequest page = 4; }
+message ReadHold { bytes path = 1; LockOwner expected = 2; }
+message PollChanges { bytes prefix = 1; ChangeCursor after = 2; PageRequest page = 3; }
+message ReadWriter { bytes writer_id = 1; }
+message ReadResult { OperationId id = 1; bytes digest = 2; }
+message SubtreeSnapshotQuery { bytes prefix = 1; }
+message Empty {}
+message Query {
+  uint32 wire_version = 1; bytes group_id = 2; Role role = 3; bytes fingerprint = 4;
+  oneof action {
+    Get get = 10; ScanQuery scan = 11; ReadHold read_hold = 12;
+    PollChanges poll_changes = 13; ReadWriter read_writer = 14;
+    ReadResult read_result = 15; SubtreeSnapshotQuery subtree_snapshot = 16;
+    Empty revision = 17; PageRequest leases = 18;
+  }
+}
+message Node {
+  bytes key = 1; bytes value = 2; NodeKind kind = 3;
+  Stamp create_stamp = 4; Stamp modify_stamp = 5;
+  int64 lease_id = 6; WriterRef owner = 7; LockToken lock_token = 8;
+  int64 created_at = 9; int64 modified_at = 10;
+}
+enum ChangeKind { CHANGE_UNSPECIFIED = 0; NODE_CREATE = 1; NODE_UPDATE = 2; NODE_DELETE = 3; DELETE_SUBTREE = 4; }
+message ChangeEvent {
+  ChangeCursor cursor = 1; ChangeKind kind = 2; bytes path = 3;
+  bytes new_value = 4; Stamp version = 5; int64 lease_id = 6; LockToken token = 7;
+}
+message ScanPage { repeated Node nodes = 1; bytes continuation = 2; bool has_more = 3; bool values_included = 4; }
+message ChangePage {
+  repeated ChangeEvent events = 1; ChangeCursor next = 2;
+  bool has_more = 3; int64 floor_revision = 4;
+}
+message LeasePage { repeated LeaseResult leases = 1; bytes continuation = 2; bool has_more = 3; }
+message SubtreeSnapshot { repeated Node nodes = 1; ChangeCursor end = 2; }
+message QueryReply {
+  Status status = 1; int64 observed_at_least_index = 2; optional int64 snapshot_index = 3;
+  oneof value {
+    Node node = 10; ScanPage scan = 11; ChangePage changes = 12;
+    LeasePage leases = 13; WriterState writer = 14; WriteReply stored_result = 15;
+    SubtreeSnapshot subtree_snapshot = 16; bool held = 17;
+  }
+}
+// Management operations are available only through explicit server/admin assembly.
+// Single-trust-domain is not authentication. Maintenance apply still checks time/renew guards.
+message WireRequest {
+  oneof body {
+    HelloRequest hello = 1; ClientWrite write = 2; Query query = 3;
+    AdminWrite admin = 4; InitializeGroup initialize = 5; Maintenance maintenance = 6;
+  }
+}
+message WireReply { oneof body { HelloReply hello = 1; WriteReply write = 2; QueryReply query = 3; } }

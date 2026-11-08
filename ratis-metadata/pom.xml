@@ -31,6 +31,7 @@
   <packaging>pom</packaging>
 
   <modules>
+    <module>ratis-metadata-protocol</module>
     <module>ratis-metadata-client</module>
     <module>ratis-metadata-server</module>
   </modules>
