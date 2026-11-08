@@ -29,8 +29,11 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Duration;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeoutException;
 
@@ -56,7 +59,9 @@ import static org.apache.ratis.metadata.util.Preconditions.checkState;
  * server's lease-checked expiry cascade deletes the lock record for a prompt handover, and only
  * ever records bound to that lease, so a late release by an expired holder can never delete a
  * new holder's record at the same path; a crashed holder's record is deleted by the leader's
- * expiry scheduler within roughly one ttl.
+ * expiry scheduler within roughly one ttl. A caller's {@code cancel()} of the returned future
+ * is one more settle: it runs the same unwind - the settle's ownership never hinges on the
+ * future itself completing, which a cancel makes impossible.
  *
  * <p>{@link Hold#getToken()} is a fencing token: after each successful create the lock bumps a
  * counter named after the lock path, so tokens are strictly increasing across holders. The bump
@@ -88,6 +93,13 @@ public final class MetadataLock implements AutoCloseable {
 
     /** The longest gap between two watchdog wake-ups, whatever the ttl. */
     private static final long MIN_WATCHDOG_MS = 1000;
+
+    /**
+     * Runs the one handoff of the acquire future to its caller. Listeners on that future are
+     * the caller's code and may block; neither the lock's state lock nor the module's shared
+     * scheduler thread (every client's lease renewals and watcher polls) may pay for them.
+     */
+    private static final Executor COMPLETIONS = ForkJoinPool.commonPool();
 
     private static final byte[] EMPTY = new byte[0];
 
@@ -199,6 +211,13 @@ public final class MetadataLock implements AutoCloseable {
             }
             acquireAttempted = true;
             pending = future = new CompletableFuture<>();
+            // The settle paths hand the future over on COMPLETIONS, but a caller's cancel()
+            // lands inline right here: it must unwind the contender exactly like a close.
+            future.whenComplete((ignored, failure) -> {
+                if (failure instanceof CancellationException) {
+                    fail((CancellationException) failure);
+                }
+            });
             if (timeout != null) {
                 timeoutTask = AsyncDriver.schedule(() -> fail(new TimeoutException("Acquiring " + path + " timed out")),
                         timeout.toMillis());
@@ -239,7 +258,8 @@ public final class MetadataLock implements AutoCloseable {
 
     /**
      * Cancels a pending acquire (its future completes exceptionally); a no-op once settled - the
-     * {@link Hold} owns its lease. Idempotent.
+     * {@link Hold} owns its lease. Cancelling the returned future directly is the equivalent
+     * settle. Idempotent.
      */
     @Override
     public void close() {
@@ -276,17 +296,15 @@ public final class MetadataLock implements AutoCloseable {
     }
 
     /**
-     * Materializes the parent chain once, then fixes the watch position; {@code NODE_EXISTS}
-     * just means the parent is already there.
+     * Materializes the parent chain, then runs {@code next}; {@code NODE_EXISTS} just means
+     * the parent is already there. The initial acquire fixes the watch position here; a
+     * re-attempt after an external delete removed the chain mid-race re-enters the race.
      */
-    private void begin() {
-        if (settled()) {
-            return;
-        }
+    private void withParents(Runnable next) {
         final int slash = path.lastIndexOf('/');
         final String parent = slash <= 0 ? "/" : path.substring(0, slash);
         if (parent.equals("/")) {
-            takeWatchPosition();
+            next.run();
             return;
         }
         client.createAsync(parent, EMPTY, true)
@@ -298,11 +316,18 @@ public final class MetadataLock implements AutoCloseable {
                     if (failure == null
                             || isRejectionOf(
                             unwrap(failure), RaftResult.Status.NODE_EXISTS)) {
-                        takeWatchPosition();
+                        next.run();
                         return;
                     }
                     fail(unwrap(failure));
                 });
+    }
+
+    private void begin() {
+        if (settled()) {
+            return;
+        }
+        withParents(this::takeWatchPosition);
     }
 
     /**
@@ -445,6 +470,12 @@ public final class MetadataLock implements AutoCloseable {
             reopenWithFreshLease(current);
             return;
         }
+        if (isRejectionOf(failure, RaftResult.Status.NO_PARENT)) {
+            // An external delete removed a strict ancestor after the one-time parent setup;
+            // the chain is gone but the race goes on. Rebuild it (idempotent) and re-enter.
+            withParents(this::attempt);
+            return;
+        }
         // A definitive rejection (this contender's create never committed) or transport trouble
         // (its outcome is unknown, and a create may have committed anyway): either way the
         // revocation of this contender's own lease is the complete, ownership-safe unwind.
@@ -461,16 +492,19 @@ public final class MetadataLock implements AutoCloseable {
                     }
                     final MetadataWatcher toClose;
                     final ScheduledFuture<?> toCancel;
+                    final Hold hold = new HoldImpl(current, token);
                     synchronized (state) {
-                        if (!pending.complete(new HoldImpl(current, token))) {
-                            // A timeout undid this contender mid-token; its cleanup ran.
+                        if (stopped) {
+                            // Cancelled or timed out mid-token; that settle's unwind already ran.
                             return;
                         }
+                        stopped = true;
                         toClose = watcher;
                         watcher = null;
                         toCancel = timeoutTask;
                         timeoutTask = null;
                     }
+                    COMPLETIONS.execute(() -> pending.complete(hold));
                     if (toClose != null) {
                         toClose.close();
                     }
@@ -541,18 +575,21 @@ public final class MetadataLock implements AutoCloseable {
 
     /**
      * Settles the acquire with {@code failure} and unwinds it, unless it already settled - the
-     * first settler owns the unwind. The unwind retires this contender's own private lease
-     * whether or not its create committed: the lease-checked expiry cascade removes exactly the
-     * records bound to that lease, so a waiting contender (whose lease owns no record) disturbs
-     * nothing, while a contender whose create may have committed frees it - and no one else's
-     * record at the same path can ever be touched.
+     * first settler under the state lock owns the unwind. The settle's ownership must not hinge
+     * on completing the future: a caller's cancel() completes it without running any unwind,
+     * so the internal {@code stopped} flag alone decides. The unwind retires this contender's
+     * own private lease whether or not its create committed: the lease-checked expiry cascade
+     * removes exactly the records bound to that lease, so a waiting contender (whose lease owns
+     * no record) disturbs nothing, while a contender whose create may have committed frees it -
+     * and no one else's record at the same path can ever be touched.
      */
     private void fail(Throwable failure) {
         final LeaseSession toRetire;
         final MetadataWatcher watcherToClose;
+        final CompletableFuture<Hold> toSettle;
         synchronized (state) {
             closed = true;
-            if (pending == null || !pending.completeExceptionally(failure)) {
+            if (stopped) {
                 return;
             }
             stopped = true;
@@ -569,6 +606,10 @@ public final class MetadataLock implements AutoCloseable {
             session = null;
             watcherToClose = watcher;
             watcher = null;
+            toSettle = pending;
+        }
+        if (toSettle != null) {
+            COMPLETIONS.execute(() -> toSettle.completeExceptionally(failure));
         }
         if (watcherToClose != null) {
             watcherToClose.close();

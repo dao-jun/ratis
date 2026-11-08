@@ -46,6 +46,14 @@ final class InvocationResultStore {
     private static final int RECORD_HEADER_LENGTH =
             1 + 4 * Long.BYTES + MetadataLogEnvelope.DIGEST_LENGTH + Integer.BYTES;
 
+    /**
+     * One apply's share of expired-result collection. A write burst followed by an idle
+     * retention window can put the whole backlog below the cutoff at once; without a cap the
+     * first write back carries all of it - unbounded batch work and native memory on the
+     * applier. The survivors stay candidates; the next applies resume at them.
+     */
+    static final int MAX_COLLECTIONS_PER_APPLY = 1024;
+
     private final RocksDB db;
     private final ColumnFamilyHandle defaultHandle;
     private final ColumnFamilyHandle resultsHandle;
@@ -311,6 +319,8 @@ final class InvocationResultStore {
         }
         final boolean refreshing = disposition.previous != null;
         try (RocksIterator iterator = db.newIterator(resultsHandle)) {
+            int collected = 0;
+            boolean drained = true;
             // Time keys are the highest tag, so this seek lands on the first one; they sort by
             // retention time first, so iteration can stop at the first key at or above the cutoff.
             iterator.seek(new byte[]{TIME_KEY_TAG});
@@ -348,15 +358,27 @@ final class InvocationResultStore {
                 }
                 batch.delete(resultsHandle, timeKey);
                 batch.delete(resultsHandle, recordKey);
+                if (++collected >= MAX_COLLECTIONS_PER_APPLY) {
+                    drained = false;
+                    break;
+                }
                 iterator.next();
             }
+            // isValid()==false also covers a scan stopped by a storage error; only status()
+            // tells that apart from a clean end, so a collection never commits off a partial
+            // scan (the floor logic below relies on having truly seen the last candidate).
+            iterator.status();
             // Where the loop stopped - the first time key at or above the cutoff, or past the
             // time keys - no key below the cutoff survives this batch, so the floor rises to
-            // it. An exception from the loop leaves the floor untouched, still a lower bound.
-            if (iterator.isValid() && iterator.key().length > 0 && iterator.key()[0] == TIME_KEY_TAG) {
-                earliestLiveRetentionTime = sortableLong(iterator.key(), 1);
-            } else {
-                earliestLiveRetentionTime = Long.MAX_VALUE;
+            // it. A truncated or failed scan leaves the floor untouched: the uncollected
+            // candidates below the cutoff still live, and the next apply's seek lands on them
+            // (the collected keys are gone) - the floor stays a lower bound either way.
+            if (drained) {
+                if (iterator.isValid() && iterator.key().length > 0 && iterator.key()[0] == TIME_KEY_TAG) {
+                    earliestLiveRetentionTime = sortableLong(iterator.key(), 1);
+                } else {
+                    earliestLiveRetentionTime = Long.MAX_VALUE;
+                }
             }
         }
     }

@@ -913,6 +913,10 @@ public class MetadataStateMachine extends BaseStateMachine {
                 result.addEntry(new RaftResult.Entry(path, StateRecord.versionOf(iterator.value())));
                 iterator.next();
             }
+            // isValid()==false also covers a scan stopped by a storage error; only status()
+            // tells that apart from a clean end of the range. Every full-range iterator in
+            // this module carries this check.
+            iterator.status();
             result.hasMore(more);
         }
         return result;
@@ -960,6 +964,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                 accumulatedBytes += encoded.length;
                 iterator.next();
             }
+            iterator.status();
         }
         // Re-check after iterating: the iterator pins its view, so a GC committing between the
         // pre-check and it can punch a hole; the persisted line is the airtight witness.
@@ -1007,6 +1012,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                         bytesToLong(iterator.key(), 0), state.ttlMs, state.expireAtMs, state.lastRenewIndex));
                 iterator.next();
             }
+            iterator.status();
             result.hasMore(more);
         }
         return result;
@@ -1421,6 +1427,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                     }
                     iterator.next();
                 }
+                iterator.status();
             }
 
             // The root: exact delete, reverse entry, tombstone, plus the DELETE_SUBTREE event.
@@ -1469,6 +1476,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                     }
                     iterator.next();
                 }
+                iterator.status();
             }
             for (Map.Entry<String, StateRecord> staged : recordOverlay.entrySet()) {
                 if (staged.getKey().startsWith(prefix) && staged.getValue() != RECORD_TOMBSTONE) {
@@ -1593,6 +1601,7 @@ public class MetadataStateMachine extends BaseStateMachine {
                     staleReverseEntries.add(iterator.key().clone());
                     iterator.next();
                 }
+                iterator.status();
             }
             for (Map.Entry<ByteBuffer, Boolean> staged : leasePathsOverlay.entrySet()) {
                 if (staged.getValue() != Boolean.TRUE || !startsWith(staged.getKey().array(), leasePrefix)) {

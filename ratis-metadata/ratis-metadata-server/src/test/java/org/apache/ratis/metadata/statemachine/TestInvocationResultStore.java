@@ -942,6 +942,51 @@ public class TestInvocationResultStore {
         return result;
     }
 
+    /**
+     * Collection is bounded per apply: a burst of writes followed by an idle retention window
+     * leaves the whole backlog below the cutoff at once, and the first write back must not
+     * carry all of it into one native batch. The truncation must not raise the retention
+     * floor - the survivors stay candidates - so the following applies drain the rest and no
+     * expired record is ever left behind.
+     */
+    @Test
+    void testCollectionIsBoundedPerApplyAndStillDrainsTheBacklog() throws Exception {
+        final int backlog = InvocationResultStore.MAX_COLLECTIONS_PER_APPLY + 2;
+        final List<ClientInvocationId> expired = new ArrayList<>();
+        for (int i = 0; i < backlog; i++) {
+            final ClientInvocationId id = invocation(1_000L + i);
+            expired.add(id);
+            commit(
+                    lookup(id, TermIndex.valueOf(1L, 5L + i),
+                            envelope(RaftCommand.increment("backlog", 1L), 1_000L, 100L)),
+                    RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)),
+                    5L + i);
+        }
+
+        // One write past every seeded retention: its stageRetention collects the cap, no more.
+        commit(lookup(invocation(3_000L), TermIndex.valueOf(1L, 5L + backlog),
+                        envelope(RaftCommand.increment("after", 1L), 9_000L, 100L)),
+                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)),
+                5L + backlog);
+        int survivors = 0;
+        for (ClientInvocationId id : expired) {
+            survivors += db.get(resultsHandle, invocationKey(id)) != null ? 1 : 0;
+        }
+        assertEquals(
+                2,
+                survivors,
+                "the first apply past the backlog collects exactly the per-apply cap");
+
+        // The next apply resumes at the survivors and drains the backlog to the last record.
+        commit(lookup(invocation(3_001L), TermIndex.valueOf(1L, 6L + backlog),
+                        envelope(RaftCommand.increment("after2", 1L), 9_100L, 100L)),
+                RaftCommandCodec.encodeResult(RaftResult.ok(RaftCommand.Op.INCREMENT)),
+                6L + backlog);
+        for (ClientInvocationId id : expired) {
+            assertNull(db.get(resultsHandle, invocationKey(id)), "the backlog drained to the last record");
+        }
+    }
+
     private static ClientInvocationId invocation(long callId) {
         return ClientInvocationId.valueOf(CLIENT_ID, callId);
     }

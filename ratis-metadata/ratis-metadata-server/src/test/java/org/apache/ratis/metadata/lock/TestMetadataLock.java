@@ -24,6 +24,7 @@ import org.apache.ratis.metadata.protocol.ChangeEvent;
 import org.apache.ratis.metadata.protocol.RaftCommand;
 import org.apache.ratis.metadata.protocol.RaftCommandCodec;
 import org.apache.ratis.metadata.protocol.RaftResult;
+import org.apache.ratis.metadata.util.AsyncDriver;
 import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientReply;
 import org.junit.jupiter.api.AfterEach;
@@ -32,13 +33,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -166,6 +171,31 @@ public class TestMetadataLock {
         taker.release();
     }
 
+    /**
+     * Deleting a STRICT ancestor of the lock path wakes the waiter (the subtree event covers
+     * the path) but takes the parent chain with it: the re-attempt's create meets NO_PARENT.
+     * The waiter must rebuild the chain and take the freed lock, not settle with the refusal -
+     * the covering-path test deletes the lock path itself and never exercises this.
+     */
+    @Test
+    void testAWaiterRebuildsTheParentChainAfterAStrictAncestorSubtreeDelete() throws Exception {
+        final MetadataLock.Hold holder = newLock(holderClient, "/anc/child/lock").acquire();
+        final MetadataLock contender = newLock(contenderClient, "/anc/child/lock");
+        final CompletableFuture<MetadataLock.Hold> pending = contender.acquireAsync();
+        final long revisionAtIssue = adminRevisionOf(cluster);
+        waitUntil(
+                () -> adminRevisionOf(cluster) >= revisionAtIssue + 2,
+                SETTLE,
+                "The contender never parked on the held record");
+        assertFalse(pending.isDone(), "the contender waits while the record exists");
+
+        adminDelete("/anc", true);
+
+        final MetadataLock.Hold taker = pending.get(3, TimeUnit.SECONDS);
+        assertTrue(taker.getToken() > holder.getToken(), "the woken contender takes a higher token");
+        taker.release();
+    }
+
     /** A bounded acquire times out cleanly while the lock is held, and the path stays acquirable. */
     @Test
     void testAcquireTimesOutWhileTheLockIsHeld() throws Exception {
@@ -213,6 +243,90 @@ public class TestMetadataLock {
 
         final MetadataLock.Hold next = nextPending.get(SETTLE.toMillis(), TimeUnit.MILLISECONDS);
         next.release();
+    }
+
+    /**
+     * The returned future is the caller's, and cancelling it is a settle like close(): the
+     * contender's private lease must be revoked and its renewals stopped. Pre-fix the unwind's
+     * ownership hinged on completing the future - a cancelled future cannot be completed - so
+     * nothing ran, and the orphan lease kept renewing (and, had its create committed, kept the
+     * path locked) for as long as the client lived.
+     */
+    @Test
+    void testCancellingTheAcquireFutureUnwindsTheContender() throws Exception {
+        final MetadataLock.Hold holder = newLock(holderClient, "/locks/g").acquire();
+        final MetadataLock contender = newLock(contenderClient, "/locks/g");
+        final CompletableFuture<MetadataLock.Hold> pending = contender.acquireAsync();
+        final long revisionAtIssue = adminRevisionOf(cluster);
+        waitUntil(
+                () -> adminRevisionOf(cluster) >= revisionAtIssue + 2,
+                SETTLE,
+                "The contender never parked on the held record");
+        final LeaseSession session = sessionOf(contender);
+        assertTrue(session.isAlive(), "the parked contender's lease renews");
+
+        assertTrue(pending.cancel(true), "the cancel settles the acquire");
+
+        waitUntil(
+                () -> !session.isAlive(),
+                SETTLE,
+                "Cancelling the acquire never unwound the contender's lease - it keeps renewing");
+        assertTrue(holder.isHeld(), "the holder keeps its lease");
+        holder.release();
+        final MetadataLock.Hold next =
+                newLock(contenderClient, "/locks/g").acquire(Duration.ofSeconds(5));
+        assertTrue(next.getToken() > holder.getToken(), "the path is acquirable after the cancel");
+        next.release();
+    }
+
+    /**
+     * The settle hands the future to its caller off the module's shared scheduler: a listener on
+     * the acquire future is caller code and may block, while that one scheduler thread runs every
+     * client's lease renewals, watcher polls and lock watchdogs. Pre-fix the timeout settle ran
+     * the handoff inline on the scheduler thread, so one blocking listener froze them all.
+     */
+    @Test
+    void testABlockingListenerOnTheAcquireFutureCannotStallTheSharedScheduler() throws Exception {
+        final MetadataLock.Hold holder = newLock(holderClient, "/locks/h").acquire();
+        final CountDownLatch listenerEntered = new CountDownLatch(1);
+        final CountDownLatch releaseListener = new CountDownLatch(1);
+        final AtomicReference<String> listenerThread = new AtomicReference<>();
+        final CompletableFuture<MetadataLock.Hold> pending =
+                newLock(contenderClient, "/locks/h").acquireAsync(Duration.ofMillis(300));
+        pending.whenComplete((hold, error) -> {
+            listenerThread.set(Thread.currentThread().getName());
+            listenerEntered.countDown();
+            try {
+                releaseListener.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        assertTrue(
+                listenerEntered.await(SETTLE.toMillis(), TimeUnit.MILLISECONDS),
+                "the acquire timed out and ran the listener");
+        // Release the listener no matter how the assertions land: pre-fix it parks ON the
+        // shared scheduler thread, and leaving it parked would wedge the whole teardown.
+        try {
+            assertFalse(
+                    listenerThread.get().contains("ratis-metadata-scheduler"),
+                    "the listener ran on the module's shared scheduler thread: " + listenerThread.get());
+
+            final CompletableFuture<Void> unrelated = new CompletableFuture<>();
+            AsyncDriver.schedule(() -> unrelated.complete(null), 0);
+            assertDoesNotThrow(
+                    () -> unrelated.get(2, TimeUnit.SECONDS),
+                    "a blocking listener stalled the module's shared scheduler");
+        } finally {
+            releaseListener.countDown();
+        }
+        holder.release();
+    }
+
+    private static LeaseSession sessionOf(MetadataLock lock) throws Exception {
+        final Field field = MetadataLock.class.getDeclaredField("session");
+        field.setAccessible(true);
+        return (LeaseSession) field.get(lock);
     }
 
     /** Killing the leader mid-contention must not lose the handover: the retries carry it. */

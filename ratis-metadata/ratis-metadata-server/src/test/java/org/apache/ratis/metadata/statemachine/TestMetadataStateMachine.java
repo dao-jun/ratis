@@ -42,9 +42,15 @@ import org.apache.ratis.statemachine.impl.TransactionContextImpl;
 import org.apache.ratis.util.SizeInBytes;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.FlushOptions;
+import org.rocksdb.LiveFileMetaData;
+import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 
 import java.io.File;
+import java.io.RandomAccessFile;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -1348,6 +1354,69 @@ public class TestMetadataStateMachine {
             assertEquals(RaftResult.Status.OK, rebound.getStatus());
             assertEquals(leaseId, machine.query(RaftCommand.get("/lb")).getLeaseId());
         }
+    }
+
+    /**
+     * A storage error in the reverse index must fail the lease expiry, not masquerade as an
+     * expiry that deleted nothing: RocksDB surfaces an iterator's checksum/IO error through
+     * {@code status()} while {@code isValid()} alone reads as a clean end of the range. The db
+     * is flushed, closed, one data byte of the lease-paths SST is flipped, and the db reopens
+     * successfully - the error surfaces only when the scan runs.
+     */
+    @Test
+    void testAReverseIndexStorageErrorFailsTheLeaseExpiry() throws Exception {
+        try (StandaloneMachine machine = new StandaloneMachine(tempDir)) {
+            final long leaseId = 901L;
+            assertEquals(RaftResult.Status.OK,
+                    machine.apply(RaftCommand.leaseRegister(leaseId, TTL_MS, 100_000L + TTL_MS)).getStatus());
+            assertEquals(RaftResult.Status.OK,
+                    machine.apply(RaftCommand.create("/bound", bytes("v"), false, leaseId, 100_001L)).getStatus());
+
+            corruptFirstByteOfTheLeasePathsSst(machine);
+
+            final CompletionException failure =
+                    assertThrows(CompletionException.class,
+                            () -> machine.apply(RaftCommand.leaseExpire(leaseId, -1L)),
+                            "the corrupted reverse-index scan must fail the apply, not report an empty expiry");
+            Throwable cause = failure.getCause();
+            while (cause != null && !(cause instanceof RocksDBException)) {
+                cause = cause.getCause();
+            }
+            assertTrue(cause instanceof RocksDBException,
+                    "the failure carries the storage error, not " + failure.getCause());
+        }
+    }
+
+    /** Flushes the reverse index to an SST, flips its first data byte, and reopens the db. */
+    @SuppressWarnings("unchecked")
+    private static void corruptFirstByteOfTheLeasePathsSst(StandaloneMachine machine) throws Exception {
+        final MetadataStateMachine stateMachine = machine.stateMachine;
+        final RocksDB db = (RocksDB) probe(stateMachine, "db");
+        try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
+            db.flush(flushOptions, (List<ColumnFamilyHandle>) probe(stateMachine, "cfHandles"));
+        }
+        String sst = null;
+        for (LiveFileMetaData meta : db.getLiveFilesMetaData()) {
+            if ("lease-paths".equals(new String(meta.columnFamilyName(), StandardCharsets.UTF_8))) {
+                sst = meta.fileName();
+            }
+        }
+        assertNotNull(sst, "the reverse index flushed to an SST");
+        machine.close();
+        final File sstFile = new File(new File(machine.dir, "meta"), sst.replaceFirst("^/", ""));
+        try (RandomAccessFile file = new RandomAccessFile(sstFile, "rw")) {
+            file.seek(0);
+            final int old = file.read();
+            file.seek(0);
+            file.write(old ^ 0xFF);
+        }
+        machine.open();
+    }
+
+    private static Object probe(Object target, String fieldName) throws Exception {
+        final Field field = target.getClass().getDeclaredField(fieldName);
+        field.setAccessible(true);
+        return field.get(target);
     }
 
     private static List<Long> leaseIdsOf(RaftResult listing) {
